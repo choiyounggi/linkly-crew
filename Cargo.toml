@@ -5,6 +5,8 @@ members = [
     "crates/crew-proto",
     "crates/crew-bus",
     "crates/crew-agent",
+    "crates/crew-lead",
+    "crates/crew-ledger",
 ]
 
 [workspace.dependencies]
