@@ -52,11 +52,14 @@
 - `is_error`/`terminal_reason`가 실패 케이스에서 기대대로 나오는가
 - 세션 resume 후 컨텍스트가 실제로 이어지는가
 
-**환경**:
-- `cargo` 미설치 → `rustup` 필요
+**환경** (2026-08-27 갱신):
+- `rustup` 설치 완료, `cargo 1.98.0`(`rustc 1.98.0`) 사용 가능
+- Cargo 워크스페이스 시드 완료: `crates/crew-harness`, `crates/crew-proto` (아직 스텁)
 - 설치된 CLI: `claude`(/opt/homebrew/bin), `opencode`(/opt/homebrew/bin)
 - 미설치: `codex`, `gemini`, `grok`, `cursor-agent`, `amp`, `qwen`
-- 이 저장소는 아직 **git init 안 됨**
+- 이 저장소는 **git init 완료** (`crew/t-docs` 등 태스크 브랜치로 오케스트레이션 진행 중)
+
+**이번 런 진행 상황**: t-docs(문서 보강) 태스크가 `docs/RESEARCH.md` 신규 작성 + `docs/DESIGN.md` §13 보강 + §12 이름/FE 추천안을 완료했다 — 코드 태스크(crew-harness 등)와 병행 진행 중.
 
 ---
 
