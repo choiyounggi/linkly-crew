@@ -134,10 +134,84 @@ fn strip_code_fence(text: &str) -> &str {
     }
 }
 
+/// Extracts the model's contract JSON object from `text`. Tries the whole
+/// (fence-stripped) text first — the original, still-common case. If that
+/// fails, a USER-GLOBAL hook (e.g. a Stop hook) can append prose after an
+/// otherwise-valid reply inside the spawned CLI session; cwd isolation does
+/// not shield against this (review r1, Finding 1). So on failure this scans
+/// for balanced top-level `{...}` substrings — brace matching that ignores
+/// braces inside JSON string values — and returns the first candidate that
+/// parses as a JSON object.
 fn extract_json(text: &str) -> Option<Value> {
-    serde_json::from_str::<Value>(strip_code_fence(text))
-        .ok()
-        .filter(Value::is_object)
+    let stripped = strip_code_fence(text);
+
+    if let Ok(value) = serde_json::from_str::<Value>(stripped) {
+        if value.is_object() {
+            return Some(value);
+        }
+    }
+
+    balanced_brace_candidates(stripped)
+        .into_iter()
+        .find_map(|candidate| serde_json::from_str::<Value>(candidate).ok().filter(Value::is_object))
+}
+
+/// Finds every top-level `{...}` substring of `text` via brace-depth
+/// matching, treating bytes inside a JSON string literal (honoring `\"`
+/// escapes) as inert so a brace in a string value never mis-closes a
+/// candidate early. Byte-index slicing is safe here: every slice boundary
+/// falls on a `{`/`}` byte, and those are always ASCII, hence always UTF-8
+/// char-boundary-safe.
+fn balanced_brace_candidates(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut candidates = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            match matching_brace_end(bytes, i) {
+                Some(end) => {
+                    candidates.push(&text[i..=end]);
+                    i = end + 1;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        i += 1;
+    }
+    candidates
+}
+
+/// Byte index of the `}` that closes the `{` at `bytes[start]`, or `None` if
+/// the text ends before the braces balance.
+fn matching_brace_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[async_trait]
@@ -473,5 +547,60 @@ mod role_harness_behavior_tests {
             .build_prompt(&env)
             .expect_err("missing body[\"task\"] must not build a prompt");
         assert!(err.contains("task"));
+    }
+}
+
+/// review r1 Finding 1: a USER-GLOBAL Stop hook can append prose after an
+/// otherwise-valid contract reply inside the spawned CLI session (observed:
+/// the memory-loop learning-nudge hook's "Learning review: nothing to
+/// persist." tail). `extract_json` must still recover the object.
+#[cfg(test)]
+mod extract_json_tests {
+    use super::*;
+
+    #[test]
+    fn extract_json_parses_valid_json_with_trailing_hook_prose() {
+        let text = "{\"covered_req_ids\": [\"REQ-1\"], \"artifacts\": []}\n\nLearning review: nothing to persist.";
+
+        let value = extract_json(text).expect("must extract JSON despite trailing hook prose");
+
+        assert_eq!(value["covered_req_ids"], json!(["REQ-1"]));
+        assert_eq!(value["artifacts"], json!([]));
+    }
+
+    #[test]
+    fn extract_json_parses_valid_json_with_leading_prose() {
+        let text = "Sure, here is my answer:\n{\"covered_req_ids\": [\"REQ-1\"], \"artifacts\": []}";
+
+        let value = extract_json(text).expect("must extract JSON despite leading prose");
+
+        assert_eq!(value["covered_req_ids"], json!(["REQ-1"]));
+    }
+
+    #[test]
+    fn extract_json_returns_none_when_text_has_no_json_object() {
+        let text = "I cannot comply with that request right now.";
+
+        assert_eq!(extract_json(text), None);
+    }
+
+    #[test]
+    fn extract_json_still_handles_fenced_json_unchanged() {
+        let text = "```json\n{\"covered_req_ids\": [\"REQ-1\"], \"artifacts\": []}\n```";
+
+        let value = extract_json(text).expect("fenced JSON must still parse");
+
+        assert_eq!(value["covered_req_ids"], json!(["REQ-1"]));
+    }
+
+    #[test]
+    fn extract_json_ignores_braces_inside_string_values_when_brace_matching() {
+        let text = r#"noise before {"note": "a { b } c", "covered_req_ids": [], "artifacts": []} noise after"#;
+
+        let value = extract_json(text)
+            .expect("must find the balanced object despite braces inside a string value");
+
+        assert_eq!(value["note"], json!("a { b } c"));
+        assert_eq!(value["covered_req_ids"], json!([]));
     }
 }
