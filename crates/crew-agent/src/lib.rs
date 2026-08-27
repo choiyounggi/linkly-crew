@@ -10,6 +10,7 @@ mod runner;
 pub use bus::{BusConn, BusError, BusEvent};
 pub use designer::ScriptedDesigner;
 pub use harness_behavior::DesignerHarnessBehavior;
+pub use harness_behavior::RoleHarnessBehavior;
 pub use pm::{PmState, ScriptedPm};
 pub use role::RoleBehavior;
 pub use runner::{AgentRunner, RunnerError};
