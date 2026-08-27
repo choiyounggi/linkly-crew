@@ -40,6 +40,24 @@ pub(crate) fn handle_client_text(shared: &Arc<Shared>, from_agent: &str, text: &
                 );
                 return;
             }
+            // Anti-impersonation (DESIGN §9): `from_agent` is the id the
+            // upgrade handshake authenticated, not attacker-controlled.
+            if envelope.from != from_agent {
+                send_to(
+                    shared,
+                    from_agent,
+                    ServerFrame::Error {
+                        code: "from_mismatch".to_string(),
+                        message: envelope.from.clone(),
+                    },
+                );
+                let _ = shared.events.send(BusEvent::SpoofRejected {
+                    id: envelope.id.clone(),
+                    claimed_from: envelope.from.clone(),
+                    agent_id: from_agent.to_string(),
+                });
+                return;
+            }
             handle_envelope(shared, envelope);
         }
     }
