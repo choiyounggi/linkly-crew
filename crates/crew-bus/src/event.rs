@@ -10,4 +10,9 @@ pub enum BusEvent {
     DeliveryFailed { id: String },
     LoopBlocked { corr: String },
     RejectedUnknownRecipient { id: String, to: String },
+    SpoofRejected {
+        id: String,
+        claimed_from: String,
+        agent_id: String,
+    },
 }

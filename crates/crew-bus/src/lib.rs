@@ -12,7 +12,7 @@ pub mod event;
 pub use config::BusConfig;
 pub use event::BusEvent;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -23,7 +23,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot};
 
 use connection::ws_handler;
-use state::Shared;
+use state::{SeenSet, Shared};
 
 /// Builds a bus server from a fixed configuration — plan B1.
 pub struct BusServer {
@@ -45,11 +45,12 @@ impl BusServer {
 
         let (events_tx, _) = broadcast::channel(256);
         let max_rounds = self.cfg.max_rounds;
+        let seen_capacity = self.cfg.seen_capacity;
         let shared = Arc::new(Shared {
             cfg: self.cfg,
             registry: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
-            seen: Mutex::new(HashSet::new()),
+            seen: Mutex::new(SeenSet::new(seen_capacity)),
             guard: Mutex::new(CorrGuard::new(max_rounds)),
             events: events_tx.clone(),
         });
