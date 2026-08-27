@@ -47,10 +47,24 @@
   → 프로세스 상주 + 양방향 스트리밍 입력 지원. API 키 없이 구독 그대로 사용 가능.
 - `-r/--resume`, `--fork-session`, `--agents <json>`, `--include-partial-messages` 존재 확인.
 
-**미검증 (M1에서 반드시 깨야 할 전제)**:
-- 실제로 한 프로세스에 **연속 턴**을 보내고 응답을 안정적으로 받을 수 있는가
-- `is_error`/`terminal_reason`가 실패 케이스에서 기대대로 나오는가
-- 세션 resume 후 컨텍스트가 실제로 이어지는가
+**검증됨 — M1** (2026-08-27, 실측: `crates/crew-harness/SPIKE.md`):
+한 프로세스에 3연속 턴 + resume 1턴, 각 응답 구조화 이벤트 수신, 강제 실패 `Failed` 정확 분류.
+
+**검증됨 — M2** (2026-08-27, 실측: `docs/SPIKE-M2.md`):
+- 결정론 통합테스트: 실제 `BusServer` + `BusConn` 2개 + `ScriptedPm`/`ScriptedDesigner`
+  (planted `REQ-2`) → `PmState::Accepted{rounds_used:1}` 직접 단언, `DeliveryFailed`/
+  `LoopBlocked` 미발생, 워크스페이스 스위트 green (0.32s).
+- real-`claude` E2E(`--ignored`): 실제 `claude` CLI + `DesignerHarnessBehavior`로 동일
+  시나리오 완주 — 2턴, elapsed=9.836s, `rounds_used:1`.
+- `CorrGuard`는 `ChangeRequest`/`TaskResult`/`ReviewRequest`만 가드하므로(`TaskAck`/
+  `TaskAssign` 제외), 위반 1건=리워크 1라운드 시나리오는 `max_rounds=3` 예산 중 2만 사용 —
+  여유 있음.
+
+**미검증**:
+- 실제로 한 프로세스에 **연속 턴**을 보내고 응답을 안정적으로 받을 수 있는가 → M1에서 검증 완료
+- `is_error`/`terminal_reason`가 실패 케이스에서 기대대로 나오는가 → M1에서 검증 완료
+- 세션 resume 후 컨텍스트가 실제로 이어지는가 → M1에서 검증 완료
+- M3(Lead 오케스트레이션): 스펙화 → DAG → 1스프린트 실행 → 수락, 5역할 전부
 
 **환경** (2026-08-27 갱신):
 - `rustup` 설치 완료, `cargo 1.98.0`(`rustc 1.98.0`) 사용 가능
@@ -63,18 +77,18 @@
 
 ---
 
-## 4. 다음 스텝 — M1 하네스 스파이크
+## 4. 다음 스텝 — M3 Lead 오케스트레이션
 
-UI·오케스트레이터보다 **먼저** 이걸 깨야 함. 유일한 미검증 전제라서.
+M1(하네스 스파이크)·M2(버스+2에이전트 왕복)는 완료·실측 검증됨(§3, `crates/crew-harness/SPIKE.md`,
+`docs/SPIKE-M2.md`). 다음은 M3.
 
-1. `rustup` 설치
-2. `crew-harness` 크레이트: claude-code 상시 세션 어댑터 1개
-   (spawn / send / 이벤트 정규화 / is_error 판정 / resume)
-3. 테스트 3종 — 정상 / 강제 에러 / 타임아웃
+**M3 — Lead 오케스트레이션** (DESIGN.md §11):
+- 스펙화 → DAG → 1스프린트 실행 → 수락. 5역할 전부.
+- ✅ 성공 기준: "간단한 랜딩 페이지" 요청 하나가 사람 개입 0회로 QA 통과까지 도달.
 
-**성공 기준**: 한 프로세스에 3연속 턴을 보내 각 응답을 구조화 이벤트로 수신하고,
-강제 실패 케이스를 `Failed`로 정확히 분류.
-→ 통과하면 설계대로 M2(버스+2에이전트 왕복) 진행. 실패하면 §2를 갈아엎어야 함.
+M2의 PM↔Designer 왕복(`crew-agent`)과 버스(`crew-bus`)는 그대로 재사용 대상 — Lead
+에이전트가 스프린트를 쪼개 PM에게 할당하는 계층을 그 위에 얹는 구조. M1/M2에서 검증된
+`AgentRunner`/`RoleBehavior`/`BusConn` 계약을 M3에서도 그대로 소비할 것.
 
 ---
 
@@ -86,3 +100,6 @@ UI·오케스트레이터보다 **먼저** 이걸 깨야 함. 유일한 미검�
 4. 전체 스레드를 모든 에이전트에게 공유 금지 → 3스프린트째에 터짐 (§5 3계층)
 5. 병렬 에이전트 동일 파일 수정 금지 → 에이전트별 git worktree
 6. `/tmp` 사용 금지 (보안 정책) → `.crew/` 사용
+7. crew-harness 이벤트 채널(64)은 소비자가 send와 동시에 드레인해야 함 — 순차 드레인은
+   실 CLI에서 교착 (`DesignerHarnessBehavior`가 `drain_until_terminal`을 `harness.send()`
+   호출 *전에* `tokio::spawn`하는 이유. M2 real-CLI E2E로 실측: `docs/SPIKE-M2.md` 참고)

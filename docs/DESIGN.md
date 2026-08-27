@@ -366,7 +366,7 @@ decisions(id, run_id, text, rationale, made_by, ts)  -- L1 컨텍스트 소스
 - ✅ 성공 기준: 한 프로세스에 3연속 턴을 보내고 각 응답을 구조화 이벤트로 수신,
   강제 실패 케이스에서 `Failed` 로 정확히 분류. (테스트 3종: 정상/에러/타임아웃)
 
-**M2 — 버스 + 2에이전트 왕복**
+**M2 — 버스 + 2에이전트 왕복** ✅ 완료 (2026-08-27, 실측: `docs/SPIKE-M2.md`)
 - WS 버스, ack/타임아웃/재시도, PM↔Designer `change_request` 루프 1회 완주.
 - ✅ 스펙 위반을 심은 산출물에 대해 change_request가 발생하고 재작업 후 수락될 것.
 
