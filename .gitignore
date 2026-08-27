@@ -1,0 +1,7 @@
+.orchestration/
+.crew/
+target/
+node_modules/
+.env*
+.DS_Store
+.worktrees/
