@@ -1,3 +1,20 @@
 [workspace]
 resolver = "2"
-members = ["crates/crew-harness", "crates/crew-proto"]
+members = [
+    "crates/crew-harness",
+    "crates/crew-proto",
+    "crates/crew-bus",
+    "crates/crew-agent",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+futures-util = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.30"
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+tracing = "0.1"
