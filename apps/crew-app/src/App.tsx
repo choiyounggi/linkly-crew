@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 
 import Board from "./features/board";
 import Rail from "./features/rail";
+import RosterPanel from "./features/roster";
 import Thread from "./features/thread";
 import { defaultSource, useRunStore } from "./lib/store";
 import "./App.css";
@@ -52,7 +53,10 @@ export default function App() {
       <main className="layout">
         <Rail />
         <Board />
-        <Thread />
+        <div className="layout__right">
+          <Thread />
+          <RosterPanel />
+        </div>
       </main>
     </div>
   );

@@ -83,7 +83,7 @@ export interface Envelope {
 
 // --- crew-run RunEvent (C3) --------------------------------------------
 
-export type TaskStateDto = "pending" | "assigned" | "accepted" | "escalated";
+export type TaskStateDto = "pending" | "assigned" | "accepted" | "escalated" | "blocked";
 
 export type RunEvent =
   | { type: "run_started"; run_id: string; goal: string; ts: string }
@@ -91,4 +91,40 @@ export type RunEvent =
   | { type: "message"; seq: number; envelope: Envelope }
   | { type: "task_state_changed"; task_id: string; state: TaskStateDto; ts: string }
   | { type: "bus_lifecycle"; seq: number; kind: string; payload: unknown }
-  | { type: "run_finished"; outcome: "completed" | "failed"; ts: string };
+  | { type: "run_finished"; outcome: "completed" | "failed"; ts: string }
+  | { type: "sprint_started"; index: number; task_ids: string[]; ts: string }
+  | { type: "sprint_finished"; index: number; summary: string; ts: string }
+  | { type: "roster_changed"; agents: RosterAgentDto[]; ts: string };
+
+// --- crew-run/crew-proto M5 roster mirrors (C7a) -----------------------
+
+export interface RosterAgentDto {
+  id: string;
+  role: string;
+  harness: string;
+  model: string;
+}
+
+export interface HarnessInfo {
+  id: string;
+  installed: boolean;
+  path: string | null;
+  adapter: "real" | "stub" | "none";
+}
+
+export interface RosterAgent {
+  id: string;
+  role: string;
+  harness: string;
+  model: string;
+  instructions: string;
+}
+
+export interface Roster {
+  agents: RosterAgent[];
+}
+
+export interface RosterPreset {
+  name: string;
+  roster: Roster;
+}

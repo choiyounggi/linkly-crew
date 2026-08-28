@@ -53,6 +53,16 @@
   min-height: 0;
 }
 
+.layout__right {
+  display: grid;
+  grid-template-rows: 1fr auto;
+  min-height: 0;
+}
+
+.layout__right .panel {
+  border-right: none;
+}
+
 .panel {
   border-right: 1px solid var(--border);
   padding: 1rem;

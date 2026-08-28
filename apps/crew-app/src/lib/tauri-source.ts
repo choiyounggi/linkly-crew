@@ -3,7 +3,16 @@ import { listen as tauriListen } from "@tauri-apps/api/event";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import type { RunEventSource } from "./source";
-import type { Envelope, RunEvent, SpecDoc, TaskDag, TaskStateDto } from "./types";
+import type {
+  Envelope,
+  HarnessInfo,
+  Roster,
+  RosterPreset,
+  RunEvent,
+  SpecDoc,
+  TaskDag,
+  TaskStateDto,
+} from "./types";
 
 const RUN_EVENT_CHANNEL = "run://event";
 
@@ -131,6 +140,27 @@ export class TauriEventSource implements RunEventSource {
       this.unlisten = null;
     }
     await this.invoke<void>("stop_run");
+  }
+
+  /** Command names verbatim per contracts-m5.md §C6; errors reject, not swallowed. */
+  async swapHarness(agentId: string, harness: string): Promise<void> {
+    await this.invoke<void>("swap_harness", { agentId, harness });
+  }
+
+  async getRoster(): Promise<Roster> {
+    return this.invoke<Roster>("get_roster");
+  }
+
+  async setRoster(roster: Roster): Promise<void> {
+    await this.invoke<void>("set_roster", { roster });
+  }
+
+  async listPresets(): Promise<RosterPreset[]> {
+    return this.invoke<RosterPreset[]>("list_presets");
+  }
+
+  async detectHarnesses(): Promise<HarnessInfo[]> {
+    return this.invoke<HarnessInfo[]>("detect_harnesses");
   }
 
   /** A live `message` at or below `lastSeq` is already covered by the snapshot replay — dropped, not re-delivered. */

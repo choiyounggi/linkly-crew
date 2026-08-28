@@ -1,9 +1,14 @@
 import type { RunEventSource } from "./source";
 import type {
   Envelope,
+  HarnessInfo,
   MessageKind,
   Requirement,
   Role,
+  Roster,
+  RosterAgent,
+  RosterAgentDto,
+  RosterPreset,
   RunEvent,
   SpecDoc,
   TaskDag,
@@ -14,7 +19,9 @@ import type {
 // t-pm -> t-design -> t-publish -> t-dev -> t-qa, REQ-1..5, with one
 // designer rework round trip (mirrors crew-lead's `plan_dag`/`LeadBehavior`
 // shapes from contracts-m3.md / m3_sprint.rs so the mock reads like the
-// real thing).
+// real thing). M5 (plan D4) wraps this same 5-task chain into 3 sprints
+// (sprint1=[t-pm,t-design], sprint2=[t-publish,t-dev], sprint3=[t-qa]) with
+// a designer harness swap at the sprint1/sprint2 boundary.
 
 const SPRINT_ID = "sprint-1";
 
@@ -93,20 +100,92 @@ function buildSpecAndDag(goal: string): { spec: SpecDoc; dag: TaskDag } {
   return { spec, dag: { tasks } };
 }
 
+// --- roster (C7a / plan D5): lead + 5 roles, 6 slots fixed (contracts-m5 §C0) ---
+
+const ROSTER_ROLES = ["lead", "pm", "designer", "publisher", "developer", "qa"] as const;
+
+const DEFAULT_MODEL = "claude-sonnet-5";
+const SAVINGS_MODEL = "claude-opus-5";
+
+function makeAgentId(role: string): string {
+  return `agent:${role}`;
+}
+
+function buildRoster(
+  overrides: Partial<Record<(typeof ROSTER_ROLES)[number], Partial<Pick<RosterAgent, "harness" | "model">>>> = {},
+): Roster {
+  return {
+    agents: ROSTER_ROLES.map((role) => ({
+      id: makeAgentId(role),
+      role,
+      harness: overrides[role]?.harness ?? "claude-code",
+      model: overrides[role]?.model ?? DEFAULT_MODEL,
+      instructions: "",
+    })),
+  };
+}
+
+function rosterToDto(roster: Roster): RosterAgentDto[] {
+  return roster.agents.map(({ id, role, harness, model }) => ({ id, role, harness, model }));
+}
+
+function withHarness(roster: Roster, role: string, harness: string): Roster {
+  return { agents: roster.agents.map((a) => (a.role === role ? { ...a, harness } : a)) };
+}
+
+/** 내장 프리셋 3종 — 계약 C6 verbatim, 슬롯 6개 고정(배치만 다름). */
+const PRESETS: RosterPreset[] = [
+  { name: "클로드 5인팀", roster: buildRoster() },
+  {
+    name: "절약 모드",
+    roster: buildRoster({ lead: { model: SAVINGS_MODEL }, developer: { model: SAVINGS_MODEL } }),
+  },
+  {
+    name: "혼합 실험",
+    roster: buildRoster({ publisher: { harness: "opencode", model: "default" } }),
+  },
+];
+
+/** `HarnessRegistry::known()`(계약 C4b) 고정 목록의 인메모리 미러 (plan D5). */
+const KNOWN_HARNESSES: HarnessInfo[] = [
+  { id: "claude-code", installed: true, path: "/usr/local/bin/claude", adapter: "real" },
+  { id: "codex", installed: false, path: null, adapter: "none" },
+  { id: "gemini", installed: false, path: null, adapter: "none" },
+  { id: "grok", installed: false, path: null, adapter: "none" },
+  { id: "opencode", installed: true, path: "/usr/local/bin/opencode", adapter: "stub" },
+  { id: "ollama", installed: false, path: null, adapter: "none" },
+];
+
+// --- scenario ------------------------------------------------------------
+
 // Placeholder for a RunEvent/Envelope's `ts` at build time. `buildScenario`
 // runs synchronously in one burst, so any timestamp stamped here would be
-// (near-)identical across all 30+ events; `restampWithNow` overwrites this
+// (near-)identical across all events; `restampWithNow` overwrites this
 // right before each event is actually delivered, so `ts` reflects the
-// moment of delivery instead (review r1 F1).
+// moment of delivery instead (review r1 F1 / HANDOFF pitfall 12).
 const PENDING_TS = "";
 
-function buildScenario(goal: string): RunEvent[] {
+interface SprintPlan {
+  index: number;
+  taskIds: string[];
+  summary: string;
+}
+
+function buildSprintPlans(): SprintPlan[] {
+  return [
+    { index: 1, taskIds: ["t-pm", "t-design"], summary: "스프린트 1 완료: t-pm, t-design 수락" },
+    { index: 2, taskIds: ["t-publish", "t-dev"], summary: "스프린트 2 완료: t-publish, t-dev 수락" },
+    { index: 3, taskIds: ["t-qa"], summary: "스프린트 3 완료: t-qa 수락" },
+  ];
+}
+
+function buildScenario(goal: string, initialRoster: Roster, allocateSeq: () => number): RunEvent[] {
   const events: RunEvent[] = [];
-  let seq = 0;
   let envCounter = 0;
   const nextEnvId = () => `env_${++envCounter}`;
 
   events.push({ type: "run_started", run_id: "run_mock", goal, ts: PENDING_TS });
+  events.push({ type: "roster_changed", agents: rosterToDto(initialRoster), ts: PENDING_TS });
 
   const { spec, dag } = buildSpecAndDag(goal);
   const sprint = ROLE_TASKS.map((t) => t.id);
@@ -137,13 +216,12 @@ function buildScenario(goal: string): RunEvent[] {
   });
 
   const pushMessage = (envelope: Envelope) => {
-    seq += 1;
-    events.push({ type: "message", seq, envelope });
+    events.push({ type: "message", seq: allocateSeq(), envelope });
   };
 
-  for (const task of dag.tasks) {
+  const runTask = (task: TaskSpec) => {
     const roleTask = ROLE_TASKS.find((t) => t.id === task.id);
-    if (!roleTask) continue;
+    if (!roleTask) return;
 
     const assign = makeEnvelope({
       thread: task.id,
@@ -223,6 +301,46 @@ function buildScenario(goal: string): RunEvent[] {
     }
 
     events.push({ type: "task_state_changed", task_id: task.id, state: "accepted", ts: PENDING_TS });
+  };
+
+  let swappedRoster = initialRoster;
+
+  for (const plan of buildSprintPlans()) {
+    events.push({ type: "sprint_started", index: plan.index, task_ids: plan.taskIds, ts: PENDING_TS });
+
+    for (const taskId of plan.taskIds) {
+      const task = dag.tasks.find((t) => t.id === taskId);
+      if (task) runTask(task);
+    }
+
+    events.push({ type: "sprint_finished", index: plan.index, summary: plan.summary, ts: PENDING_TS });
+
+    if (plan.index === 1) {
+      // 스프린트 2 시작 전 designer 하네스 스왑 (plan D4) — 핸드오프 메시지 +
+      // roster_changed를 스프린트 경계에 박아 넣은 고정 시나리오. (별개로
+      // `swapHarness()`가 즉시 실행하는 라이브 스왑도 제공한다 — plan D5.)
+      swappedRoster = withHarness(swappedRoster, "designer", "opencode");
+      const handoff = makeEnvelope({
+        thread: "t-design",
+        from: "lead",
+        to: ["agent:designer"],
+        kind: "handoff",
+        corr: "t-design",
+        body: {
+          pack: {
+            role: "designer",
+            spec_ref: goal,
+            done: ["t-pm", "t-design"],
+            in_flight: [],
+            decisions: [],
+            open_questions: [],
+            notes: "하네스 교체: claude-code → opencode",
+          },
+        },
+      });
+      pushMessage(handoff);
+      events.push({ type: "roster_changed", agents: rosterToDto(swappedRoster), ts: PENDING_TS });
+    }
   }
 
   events.push({ type: "run_finished", outcome: "completed", ts: PENDING_TS });
@@ -232,9 +350,10 @@ function buildScenario(goal: string): RunEvent[] {
 /**
  * Replaces an event's `PENDING_TS` placeholder(s) with the current instant.
  * `message` events carry their timestamp on `envelope.ts`; every other
- * variant carries a top-level `ts`. Called right before delivery so
- * timestamps progress across the replay instead of freezing at build time
- * (review r1 F1).
+ * variant (including `sprint_started`/`sprint_finished`/`roster_changed`)
+ * carries a top-level `ts`. Called right before delivery so timestamps
+ * progress across the replay instead of freezing at build time (review r1
+ * F1).
  */
 function restampWithNow(ev: RunEvent): RunEvent {
   const now = new Date().toISOString();
@@ -250,21 +369,36 @@ function restampWithNow(ev: RunEvent): RunEvent {
 }
 
 /**
- * Demo/test default source (plan D9): replays a scripted M3-shaped run on
- * timers, `intervalMs` apart (default 300; tests pass 0 with fake timers).
+ * Demo/test default source (plan D9): replays a scripted M3-shaped,
+ * 3-sprint run (plan D4) on timers, `intervalMs` apart (default 300; tests
+ * pass 0 with fake timers). Also implements the C7a optional roster/harness
+ * methods (plan D5) as an in-memory simulation.
  */
 export class MockEventSource implements RunEventSource {
   private readonly intervalMs: number;
   private readonly listeners = new Set<(ev: RunEvent) => void>();
   private timers: ReturnType<typeof setTimeout>[] = [];
+  private roster: Roster;
+  private nextSeq = 1;
+  private swapEnvCounter = 0;
 
-  constructor(intervalMs = 300) {
+  constructor(intervalMs = 300, roster: Roster = buildRoster()) {
     this.intervalMs = intervalMs;
+    this.roster = roster;
   }
 
   async start(goal: string): Promise<void> {
     this.clearTimers();
-    const events = buildScenario(goal);
+    this.nextSeq = 1;
+    const initialRoster = this.roster;
+    const events = buildScenario(goal, initialRoster, () => this.nextSeq++);
+    // The scripted scenario always ends with the designer swapped to
+    // opencode (plan D4); reflect that on the instance roster right away
+    // rather than waiting for the delayed roster_changed to actually
+    // deliver, so getRoster() is consistent with "a run was started" even
+    // before its timers finish (simplification — acceptable for a mock).
+    this.roster = withHarness(initialRoster, "designer", "opencode");
+
     events.forEach((ev, index) => {
       const timer = setTimeout(() => {
         const stamped = restampWithNow(ev);
@@ -288,5 +422,66 @@ export class MockEventSource implements RunEventSource {
   private clearTimers(): void {
     for (const timer of this.timers) clearTimeout(timer);
     this.timers = [];
+  }
+
+  // --- C7a optional methods (plan D5) -------------------------------------
+
+  /** In-memory swap: updates the roster, then replays handoff + roster_changed immediately. */
+  async swapHarness(agentId: string, harness: string): Promise<void> {
+    const target = this.roster.agents.find((a) => a.id === agentId);
+    if (!target) {
+      throw new Error(`swapHarness: unknown agent id "${agentId}"`);
+    }
+
+    const previousHarness = target.harness;
+    this.roster = { agents: this.roster.agents.map((a) => (a.id === agentId ? { ...a, harness } : a)) };
+    const now = new Date().toISOString();
+
+    const handoffEnvelope: Envelope = {
+      id: `env_swap_${++this.swapEnvCounter}`,
+      ts: now,
+      sprint: SPRINT_ID,
+      thread: target.role,
+      from: "lead",
+      to: [agentId],
+      kind: "handoff",
+      corr: target.role,
+      body: {
+        pack: {
+          role: target.role,
+          spec_ref: "",
+          done: [],
+          in_flight: [],
+          decisions: [],
+          open_questions: [],
+          notes: `하네스 교체: ${previousHarness} → ${harness}`,
+        },
+      },
+      artifacts: [],
+      requires_ack: false,
+      deadline_ms: 60_000,
+    };
+
+    const handoffEvent: RunEvent = { type: "message", seq: this.nextSeq++, envelope: handoffEnvelope };
+    const rosterEvent: RunEvent = { type: "roster_changed", agents: rosterToDto(this.roster), ts: now };
+
+    for (const cb of this.listeners) cb(handoffEvent);
+    for (const cb of this.listeners) cb(rosterEvent);
+  }
+
+  async getRoster(): Promise<Roster> {
+    return this.roster;
+  }
+
+  async setRoster(roster: Roster): Promise<void> {
+    this.roster = roster;
+  }
+
+  async listPresets(): Promise<RosterPreset[]> {
+    return PRESETS;
+  }
+
+  async detectHarnesses(): Promise<HarnessInfo[]> {
+    return KNOWN_HARNESSES;
   }
 }
