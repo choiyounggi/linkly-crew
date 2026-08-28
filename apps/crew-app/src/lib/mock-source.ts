@@ -93,18 +93,24 @@ function buildSpecAndDag(goal: string): { spec: SpecDoc; dag: TaskDag } {
   return { spec, dag: { tasks } };
 }
 
+// Placeholder for a RunEvent/Envelope's `ts` at build time. `buildScenario`
+// runs synchronously in one burst, so any timestamp stamped here would be
+// (near-)identical across all 30+ events; `restampWithNow` overwrites this
+// right before each event is actually delivered, so `ts` reflects the
+// moment of delivery instead (review r1 F1).
+const PENDING_TS = "";
+
 function buildScenario(goal: string): RunEvent[] {
   const events: RunEvent[] = [];
   let seq = 0;
   let envCounter = 0;
   const nextEnvId = () => `env_${++envCounter}`;
-  const ts = () => new Date().toISOString();
 
-  events.push({ type: "run_started", run_id: "run_mock", goal, ts: ts() });
+  events.push({ type: "run_started", run_id: "run_mock", goal, ts: PENDING_TS });
 
   const { spec, dag } = buildSpecAndDag(goal);
   const sprint = ROLE_TASKS.map((t) => t.id);
-  events.push({ type: "spec_ready", spec, dag, sprint, ts: ts() });
+  events.push({ type: "spec_ready", spec, dag, sprint, ts: PENDING_TS });
 
   const makeEnvelope = (fields: {
     thread: string;
@@ -116,7 +122,7 @@ function buildScenario(goal: string): RunEvent[] {
     in_reply_to?: string;
   }): Envelope => ({
     id: nextEnvId(),
-    ts: ts(),
+    ts: PENDING_TS,
     sprint: SPRINT_ID,
     thread: fields.thread,
     from: fields.from,
@@ -148,7 +154,7 @@ function buildScenario(goal: string): RunEvent[] {
       body: { task },
     });
     pushMessage(assign);
-    events.push({ type: "task_state_changed", task_id: task.id, state: "assigned", ts: ts() });
+    events.push({ type: "task_state_changed", task_id: task.id, state: "assigned", ts: PENDING_TS });
 
     const ack = makeEnvelope({
       thread: task.id,
@@ -216,11 +222,31 @@ function buildScenario(goal: string): RunEvent[] {
       pushMessage(result);
     }
 
-    events.push({ type: "task_state_changed", task_id: task.id, state: "accepted", ts: ts() });
+    events.push({ type: "task_state_changed", task_id: task.id, state: "accepted", ts: PENDING_TS });
   }
 
-  events.push({ type: "run_finished", outcome: "completed", ts: ts() });
+  events.push({ type: "run_finished", outcome: "completed", ts: PENDING_TS });
   return events;
+}
+
+/**
+ * Replaces an event's `PENDING_TS` placeholder(s) with the current instant.
+ * `message` events carry their timestamp on `envelope.ts`; every other
+ * variant carries a top-level `ts`. Called right before delivery so
+ * timestamps progress across the replay instead of freezing at build time
+ * (review r1 F1).
+ */
+function restampWithNow(ev: RunEvent): RunEvent {
+  const now = new Date().toISOString();
+  switch (ev.type) {
+    case "message":
+      return { ...ev, envelope: { ...ev.envelope, ts: now } };
+    case "bus_lifecycle":
+      // No top-level `ts` on this variant, and the mock never emits it.
+      return ev;
+    default:
+      return { ...ev, ts: now };
+  }
 }
 
 /**
@@ -241,7 +267,8 @@ export class MockEventSource implements RunEventSource {
     const events = buildScenario(goal);
     events.forEach((ev, index) => {
       const timer = setTimeout(() => {
-        for (const cb of this.listeners) cb(ev);
+        const stamped = restampWithNow(ev);
+        for (const cb of this.listeners) cb(stamped);
       }, index * this.intervalMs);
       this.timers.push(timer);
     });

@@ -71,6 +71,26 @@ describe("MockEventSource", () => {
     expect(received).toHaveLength(0);
   });
 
+  it("stamps ts at delivery time, so it progresses across the replay instead of freezing (r1 F1)", async () => {
+    const source = new MockEventSource(100);
+    const received: RunEvent[] = [];
+    source.onEvent((ev) => received.push(ev));
+
+    await source.start("간단한 랜딩 페이지");
+    await vi.runAllTimersAsync();
+
+    const runStarted = received[0] as Extract<RunEvent, { type: "run_started" }>;
+    const specReady = received[1] as Extract<RunEvent, { type: "spec_ready" }>;
+    expect(specReady.ts).not.toBe(runStarted.ts);
+    expect(new Date(specReady.ts).getTime()).toBeGreaterThan(new Date(runStarted.ts).getTime());
+
+    const messages = received.filter((ev): ev is Extract<RunEvent, { type: "message" }> => ev.type === "message");
+    const firstMessageTs = messages[0].envelope.ts;
+    const lastMessageTs = messages.at(-1)!.envelope.ts;
+    expect(lastMessageTs).not.toBe(firstMessageTs);
+    expect(new Date(lastMessageTs).getTime()).toBeGreaterThan(new Date(firstMessageTs).getTime());
+  });
+
   it("unsubscribe stops a specific listener from receiving further events", async () => {
     const source = new MockEventSource(0);
     const received: RunEvent[] = [];
