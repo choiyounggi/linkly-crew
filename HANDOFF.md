@@ -1,7 +1,8 @@
 # 세션 인계 — agent-crew
 
 **한 줄**: 구독 중인 AI CLI들을 역할별 팀원으로 묶어, 요청 한 줄을 팀장 에이전트가
-스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **설계 완료, 코드 0줄**.
+스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M3 완료·실측 검증**
+(코어 백엔드 전부 동작: 하네스·버스·5역할·Lead·원장) — 다음은 **M4 UI**.
 
 ---
 
@@ -60,11 +61,23 @@
   `TaskAssign` 제외), 위반 1건=리워크 1라운드 시나리오는 `max_rounds=3` 예산 중 2만 사용 —
   여유 있음.
 
+**검증됨 — M3** (2026-08-27, 실측: `crates/crew-lead/tests/m3_sprint.rs`):
+- 결정론 3시나리오: ①해피 — 5역할(ScriptedCrewMember) 스프린트 완주, ChangeRequest 0·
+  HumanGate 0, SQLite 원장에 Delivered 행 기록 ②리워크 — planted `REQ-2` → Lead의
+  DoD 직접 판정(`dod_exec::judge`)이 uncovered 검출 → ChangeRequest 정확히 1회 → 수락
+  ③에스컬레이션 — 미등록 역할 → `human.gate` 정확히 1회, 나머지 태스크는 계속 수락.
+- real-`claude` E2E(`--ignored`): **"간단한 랜딩 페이지" 요청 → Lead 스펙화 → 5역할 전부
+  실제 claude 세션 → DoD 판정 → 전 태스크 수락, 사람 개입 0회, 136.65s** (§11 M3 기준 충족).
+- 신규 크레이트/모듈: `crew-proto`(SpecDoc/TaskSpec/TaskDag/DodCheck), `crew-ledger`
+  (append-only 원장), `crew-lead`(plan: 결정론 스펙화·5역할 DAG·스프린트 슬라이싱 /
+  dispatch·accept·dod_exec: 디스패치·수락/리워크 예산 2·에스컬레이션),
+  `crew-agent::ScriptedCrewMember`/`RoleHarnessBehavior`, 버스 스푸핑 거부+seen 프루닝.
+- Lead의 스펙화는 **M3 결정론 템플릿**(REQ-1..5 고정) — LLM 스펙화(§4.3 구조화 JSON)는
+  같은 시그니처로 후속 교체 예정.
+
 **미검증**:
-- 실제로 한 프로세스에 **연속 턴**을 보내고 응답을 안정적으로 받을 수 있는가 → M1에서 검증 완료
-- `is_error`/`terminal_reason`가 실패 케이스에서 기대대로 나오는가 → M1에서 검증 완료
-- 세션 resume 후 컨텍스트가 실제로 이어지는가 → M1에서 검증 완료
-- M3(Lead 오케스트레이션): 스펙화 → DAG → 1스프린트 실행 → 수락, 5역할 전부
+- M4(UI): 스프린트 보드 + 라이브 스레드 + 에이전트 레일
+- 멀티 스프린트 연속 실행·컨텍스트 압축(M5), Cmd/Browser DoD 실제 실행(M3는 skip 기록만)
 
 **환경** (2026-08-27 갱신):
 - `rustup` 설치 완료, `cargo 1.98.0`(`rustc 1.98.0`) 사용 가능
@@ -73,22 +86,37 @@
 - 미설치: `codex`, `gemini`, `grok`, `cursor-agent`, `amp`, `qwen`
 - 이 저장소는 **git init 완료** (`crew/t-docs` 등 태스크 브랜치로 오케스트레이션 진행 중)
 
-**이번 런 진행 상황**: t-docs(문서 보강) 태스크가 `docs/RESEARCH.md` 신규 작성 + `docs/DESIGN.md` §13 보강 + §12 이름/FE 추천안을 완료했다 — 코드 태스크(crew-harness 등)와 병행 진행 중.
+**이번 런 진행 상황**: M3 오케스트레이션 런(8태스크, run-id m3a) 완료 — 전부 `main`에
+머지됨(cac9a13). 런 기록(계약·플랜·리뷰·에스컬레이션)은 `archive-20260827-m3a/` 참조.
+특히 `archive-20260827-m3a/contracts-m3.md`가 M3 봉투 body 계약의 정본이었다
+(task.assign body=`{"task": TaskSpec}`, task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ---
 
-## 4. 다음 스텝 — M3 Lead 오케스트레이션
+## 4. 다음 스텝 — M4 UI
 
-M1(하네스 스파이크)·M2(버스+2에이전트 왕복)는 완료·실측 검증됨(§3, `crates/crew-harness/SPIKE.md`,
-`docs/SPIKE-M2.md`). 다음은 M3.
+M1(하네스)·M2(버스+왕복)·M3(Lead 오케스트레이션)는 완료·실측 검증됨(§3). 다음은 M4.
 
-**M3 — Lead 오케스트레이션** (DESIGN.md §11):
-- 스펙화 → DAG → 1스프린트 실행 → 수락. 5역할 전부.
-- ✅ 성공 기준: "간단한 랜딩 페이지" 요청 하나가 사람 개입 0회로 QA 통과까지 도달.
+**M4 — UI** (DESIGN.md §11):
+- 스프린트 보드 + 라이브 스레드 + 에이전트 레일 (DAG/타임라인은 그다음).
+- ✅ 성공 기준: 실행 중인 런을 앱만 보고 완전히 이해 가능.
 
-M2의 PM↔Designer 왕복(`crew-agent`)과 버스(`crew-bus`)는 그대로 재사용 대상 — Lead
-에이전트가 스프린트를 쪼개 PM에게 할당하는 계층을 그 위에 얹는 구조. M1/M2에서 검증된
-`AgentRunner`/`RoleBehavior`/`BusConn` 계약을 M3에서도 그대로 소비할 것.
+**M4 착수 전 결정 2건** (§2 미결, DESIGN §12에 추천안 있음): ① 프로젝트 이름
+(`agent-crew`는 가칭) ② Tauri 내부 프론트엔드(React/Svelte/순수 TS).
+
+**M4 선행 배선 작업** (테스트에만 존재하는 조립을 앱 코드로 승격):
+1. **런 컨트롤러**: 현재 버스+원장+Lead+5워커 조립은 `crates/crew-lead/tests/m3_sprint.rs`
+   안에만 있다 — 이를 재사용 가능한 런 실행기(크레이트 or `crew-app`)로 추출. Tauri 커맨드가
+   이걸 호출한다.
+2. **UI 데이터 소스**: `crew-ledger`(SQLite, `BusEvent` 원장)와 `BusHandle::subscribe()`
+   브로드캐스트가 라이브 스레드/에이전트 레일의 소스. 원장에는 봉투 kind가 없으므로 UI가
+   메시지 수준 표시를 하려면 원장 스키마 확장(DESIGN §8 방향) 또는 봉투 스트림 병행 구독 필요.
+3. **Tauri 2 셸**: 워크스페이스에 Tauri 앱 크레이트 추가 (§2 스택 결정 준수).
+   `LeadPlanner::specify`의 LLM 교체(§4.3)는 M4 범위 아님 — 결정론 템플릿 그대로 사용.
+
+M3에서 검증된 계약을 그대로 소비할 것: `AgentRunner`/`RoleBehavior`/`BusConn`,
+`LeadBehavior::new(agent_id, dag, sprint, roles, max_rework)`, `EventLedger`/`spawn_subscriber`,
+`RoleHarnessBehavior`(실 CLI), `ScriptedCrewMember`(결정론 테스트).
 
 ---
 
@@ -103,3 +131,11 @@ M2의 PM↔Designer 왕복(`crew-agent`)과 버스(`crew-bus`)는 그대로 재�
 7. crew-harness 이벤트 채널(64)은 소비자가 send와 동시에 드레인해야 함 — 순차 드레인은
    실 CLI에서 교착 (`DesignerHarnessBehavior`가 `drain_until_terminal`을 `harness.send()`
    호출 *전에* `tokio::spawn`하는 이유. M2 real-CLI E2E로 실측: `docs/SPIKE-M2.md` 참고)
+8. **cwd 격리는 유저 전역 훅을 못 막는다** (M3 real-CLI E2E 실측, 2026-08-27): 스폰된
+   claude 세션 안에서 유저 전역 Stop 훅(learning-nudge 등)이 발화해 유효한 계약 JSON 뒤에
+   프로즈 턴("Learning review: …")이 붙었고, 드레인 텍스트 전체 파싱만 하던 `extract_json`이
+   실패 → Blocked → 에스컬레이션 → 후속 태스크 영구 대기로 E2E 타임아웃. 현재 `extract_json`
+   (crew-agent/harness_behavior.rs)은 문자열 인지 균형 중괄호 스캔 폴백으로 완화되어 있다 —
+   이 폴백을 제거하지 말 것. 스폰 세션의 훅 완전 차단은 미해결 과제.
+9. 에스컬레이션(`Escalated`)된 태스크의 스프린트 내 후속 태스크는 영구 `Pending`
+   (is_done 도달 불가 가능) — M3 수용 결정. 멀티 스프린트(M5)에선 타임아웃/캐스케이드 정책 필요.
