@@ -20,6 +20,12 @@ result_line() {
 }
 
 while IFS= read -r _turn_line; do
+  # Optionally record every raw turn line verbatim, so tests can assert on
+  # what prompt text the harness actually sent per turn (M5 t-handoff D4,
+  # with_injected_context) without teaching this fixture to parse JSON.
+  if [ -n "${FAKE_CAPTURE_FILE:-}" ]; then
+    printf '%s\n' "$_turn_line" >>"$FAKE_CAPTURE_FILE"
+  fi
   case "$mode" in
     json)
       printf '%s\n' "$FAKE_ASSISTANT_1"

@@ -9,7 +9,25 @@
 set -eu
 
 mode="${FAKE_MODE:-normal}"
-session_id="${FAKE_SESSION_ID:-00000000-0000-4000-8000-000000000000}"
+
+# Mirrors the real CLI: with no override, the init line reports back the
+# `--session-id <uuid>` the caller spawned with (crew-harness's normal
+# spawn path always passes this), so a snapshot's "no report differs"
+# case is exercised by default. FAKE_SESSION_ID still wins when a test
+# wants the init line to report something else (M5 t-handoff D3).
+cli_session_id=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --session-id)
+      cli_session_id="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+session_id="${FAKE_SESSION_ID:-${cli_session_id:-00000000-0000-4000-8000-000000000000}}"
 
 printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$session_id"
 

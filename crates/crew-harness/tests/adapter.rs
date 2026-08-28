@@ -5,6 +5,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+
 use crew_harness::claude::ClaudeCodeHarness;
 use crew_harness::{AgentCfg, Harness, HarnessEvent, TurnOutcome, UserTurn};
 
@@ -156,6 +158,71 @@ async fn slow_turn_times_out_and_kills_the_child() {
         .expect("child should exit promptly once killed")
         .expect("wait should succeed");
     assert!(!exit.success(), "killed child should not report success");
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// Drains `events` until a `Started` event arrives, so the reader task has
+/// definitely already set `Session::reported_session_id` (it does so
+/// before sending the event, D3) by the time the caller proceeds — without
+/// this, calling `snapshot` right after `spawn` races the reader task.
+async fn wait_for_started(events: &mut mpsc::Receiver<HarnessEvent>) {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("Started event should arrive promptly")
+        {
+            Some(HarnessEvent::Started { .. }) => return,
+            Some(_) => continue,
+            None => panic!("events channel closed before a Started event arrived"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn snapshot_session_id_matches_spawn_uuid_when_cli_echoes_it_back() {
+    // fake-claude.sh's default (no FAKE_SESSION_ID override) echoes back
+    // the `--session-id` crew-harness spawned with, mirroring the real
+    // CLI — so the reported and spawn uuids are the same value here.
+    let harness =
+        ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap()).with_env("FAKE_MODE", "normal");
+    let cfg = agent_cfg();
+
+    let mut session = harness.spawn(&cfg).await.expect("spawn should succeed");
+    let mut events = harness.take_events(&mut session);
+    wait_for_started(&mut events).await;
+
+    let snapshot = harness.snapshot(&session).await.expect("snapshot should succeed");
+    assert_eq!(snapshot.harness, "claude-code");
+    assert_eq!(snapshot.session_id, session.session_id().to_string());
+    assert_eq!(snapshot.notes, "");
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn snapshot_prefers_the_cli_reported_session_id_over_spawn_uuid() {
+    // Boundary: the init line reports a session_id different from the
+    // spawn uuid (FAKE_SESSION_ID overrides the echoed --session-id) —
+    // snapshot must prefer the CLI's reported value (D3).
+    let reported = "22222222-2222-4222-8222-222222222222";
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_SESSION_ID", reported);
+    let cfg = agent_cfg();
+
+    let mut session = harness.spawn(&cfg).await.expect("spawn should succeed");
+    let mut events = harness.take_events(&mut session);
+    wait_for_started(&mut events).await;
+
+    assert_ne!(
+        session.session_id().to_string(),
+        reported,
+        "test setup must actually diverge from the spawn uuid"
+    );
+
+    let snapshot = harness.snapshot(&session).await.expect("snapshot should succeed");
+    assert_eq!(snapshot.session_id, reported);
 
     harness.shutdown(session).await.expect("shutdown");
 }
