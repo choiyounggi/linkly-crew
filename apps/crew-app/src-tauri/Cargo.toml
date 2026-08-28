@@ -1,0 +1,22 @@
+[package]
+name = "crew-app"
+version = "0.1.0"
+description = "linkly-crew desktop app shell"
+edition = "2021"
+
+[lib]
+name = "crew_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# standalone (contracts-m4.md §C4): this crate is NOT a member of the root
+# workspace. An empty [workspace] table here stops Cargo's upward member
+# search, so it never joins /Cargo.toml (owned by t-run).
+[workspace]
