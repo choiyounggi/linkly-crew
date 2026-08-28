@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection};
 
 use crew_bus::BusEvent;
+use crew_proto::Envelope;
 
 /// DESIGN.md §5/§8: append-only event ledger. No update/delete is exposed —
 /// the API surface itself is the append-only guarantee.
@@ -13,6 +14,13 @@ pub enum LedgerError {
     Sqlite(#[from] rusqlite::Error),
     #[error("serialize error: {0}")]
     Serialize(#[from] serde_json::Error),
+}
+
+/// A `messages` row, restored from `envelope_json` verbatim — contract §C2.
+#[derive(Debug)]
+pub struct StoredMessage {
+    pub seq: i64,
+    pub envelope: Envelope,
 }
 
 pub struct EventLedger {
@@ -38,6 +46,22 @@ impl EventLedger {
             )",
             [],
         )?;
+        // Contract §C2: structured, queryable mirror of accepted envelopes,
+        // append-only like `events` (no UPDATE/DELETE exposed).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS messages (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT NOT NULL UNIQUE,
+                ts TEXT NOT NULL,
+                sprint TEXT NOT NULL,
+                thread TEXT NOT NULL,
+                from_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                corr TEXT NOT NULL,
+                envelope_json TEXT NOT NULL
+            )",
+            [],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -46,6 +70,11 @@ impl EventLedger {
     /// Appends one `BusEvent`, returning its assigned `seq`. `kind` is the
     /// event's variant name, taken from the externally-tagged JSON's single
     /// top-level key so it never drifts out of sync with `BusEvent`'s shape.
+    ///
+    /// `EnvelopeAccepted` additionally inserts into `messages` in the same
+    /// transaction as the `events` insert (contract §C2), so a reader never
+    /// observes one table updated without the other. Duplicate envelope
+    /// `id`s (at-least-once redelivery) are ignored via `INSERT OR IGNORE`.
     pub fn append(&self, event: &BusEvent) -> Result<i64, LedgerError> {
         let payload = serde_json::to_value(event)?;
         let kind = payload
@@ -60,12 +89,39 @@ impl EventLedger {
             .as_millis()
             .to_string();
 
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO events (ts, kind, payload_json) VALUES (?1, ?2, ?3)",
             params![ts, kind, payload_json],
         )?;
-        Ok(conn.last_insert_rowid())
+        let seq = tx.last_insert_rowid();
+
+        if let BusEvent::EnvelopeAccepted { envelope } = event {
+            let kind_wire = serde_json::to_value(&envelope.kind)?
+                .as_str()
+                .expect("MessageKind always serializes to a wire string")
+                .to_string();
+            let envelope_json = serde_json::to_string(envelope)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO messages
+                    (id, ts, sprint, thread, from_id, kind, corr, envelope_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    envelope.id,
+                    envelope.ts,
+                    envelope.sprint,
+                    envelope.thread,
+                    envelope.from,
+                    kind_wire,
+                    envelope.corr,
+                    envelope_json,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(seq)
     }
 
     pub fn count(&self) -> Result<i64, LedgerError> {
@@ -84,6 +140,43 @@ impl EventLedger {
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Messages with `seq` strictly greater than the given seq, ascending —
+    /// contract §C2. Restores each envelope from `envelope_json` verbatim
+    /// (no per-column reassembly) so the reconstruction can never drift out
+    /// of sync with `Envelope`'s shape.
+    pub fn messages_since(&self, seq: i64) -> Result<Vec<StoredMessage>, LedgerError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT seq, envelope_json FROM messages WHERE seq > ?1 ORDER BY seq")?;
+        let rows = stmt.query_map(params![seq], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Self::collect_messages(rows)
+    }
+
+    /// Messages in the given thread, seq ascending — contract §C2.
+    pub fn messages_in_thread(&self, thread: &str) -> Result<Vec<StoredMessage>, LedgerError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT seq, envelope_json FROM messages WHERE thread = ?1 ORDER BY seq")?;
+        let rows = stmt.query_map(params![thread], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Self::collect_messages(rows)
+    }
+
+    fn collect_messages(
+        rows: impl Iterator<Item = rusqlite::Result<(i64, String)>>,
+    ) -> Result<Vec<StoredMessage>, LedgerError> {
+        let mut out = Vec::new();
+        for row in rows {
+            let (seq, envelope_json) = row?;
+            let envelope: Envelope = serde_json::from_str(&envelope_json)?;
+            out.push(StoredMessage { seq, envelope });
         }
         Ok(out)
     }

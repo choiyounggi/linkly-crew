@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 crew-bus = { path = "../crew-bus" }
+crew-proto = { path = "../crew-proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -13,6 +14,6 @@ thiserror = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
-crew-proto = { path = "../crew-proto" }
 futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
