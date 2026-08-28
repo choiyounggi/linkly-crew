@@ -1,0 +1,20 @@
+[package]
+name = "crew-run"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crew-proto = { path = "../crew-proto" }
+crew-bus = { path = "../crew-bus" }
+crew-agent = { path = "../crew-agent" }
+crew-lead = { path = "../crew-lead" }
+crew-ledger = { path = "../crew-ledger" }
+crew-harness = { path = "../crew-harness" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+time = { version = "0.3", features = ["formatting"] }
