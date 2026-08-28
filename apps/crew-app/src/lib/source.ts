@@ -1,5 +1,8 @@
+import { isTauri } from "@tauri-apps/api/core";
+
 import type { RunEvent } from "./types";
 import { MockEventSource } from "./mock-source";
+import { TauriEventSource } from "./tauri-source";
 
 /**
  * Verbatim per contracts-m4.md §C4. `t-bridge` implements a
@@ -14,9 +17,10 @@ export interface RunEventSource {
 }
 
 /**
- * Always returns a MockEventSource today. `t-bridge` owns swapping this to
- * detect a Tauri runtime and return `TauriEventSource` instead (plan step 4).
+ * Detects a Tauri runtime (`@tauri-apps/api/core`'s `isTauri()`, contracts-m4.md
+ * §C6 / plan D7) and returns a `TauriEventSource` against it; otherwise (plain
+ * browser dev, component tests) a `MockEventSource`.
  */
 export function createDefaultSource(): RunEventSource {
-  return new MockEventSource();
+  return isTauri() ? new TauriEventSource() : new MockEventSource();
 }
