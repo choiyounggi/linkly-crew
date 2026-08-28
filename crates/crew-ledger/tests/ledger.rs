@@ -10,6 +10,7 @@ use std::time::Duration;
 use crew_bus::{BusConfig, BusEvent, BusServer};
 use crew_ledger::{spawn_subscriber, EventLedger};
 use crew_proto::{ClientFrame, Envelope, MessageKind, ServerFrame};
+use serde_json::json;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -255,4 +256,214 @@ async fn integration_bus_events_land_in_ledger() {
 
     bus.shutdown().await;
     handle.abort();
+}
+
+/// Normal case (contract §C2): appending `EnvelopeAccepted` restores the
+/// envelope verbatim from `messages_since`.
+#[test]
+fn envelope_accepted_round_trips_verbatim_via_messages_since() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+    let env = envelope("agent:sender", "agent:receiver", "req_1");
+
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: env.clone(),
+        })
+        .expect("append EnvelopeAccepted");
+
+    let messages = ledger.messages_since(0).expect("messages_since(0)");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].envelope, env);
+}
+
+/// Idempotent case (contract §C2): re-appending the same envelope id keeps
+/// exactly one `messages` row (at-least-once delivery replay).
+#[test]
+fn envelope_accepted_with_duplicate_id_is_idempotent() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+    let env = envelope("agent:sender", "agent:receiver", "req_1");
+
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: env.clone(),
+        })
+        .expect("append EnvelopeAccepted (first)");
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: env.clone(),
+        })
+        .expect("append EnvelopeAccepted (duplicate)");
+
+    let messages = ledger.messages_since(0).expect("messages_since(0)");
+    assert_eq!(messages.len(), 1, "duplicate id must not create a second row");
+    assert_eq!(messages[0].envelope, env);
+
+    // Only `messages` dedupes; `events` is an append-only observer log and
+    // must still record both appends.
+    assert_eq!(ledger.count().unwrap(), 2);
+    assert_eq!(
+        ledger.events_of_kind("EnvelopeAccepted").unwrap().len(),
+        2,
+        "events log must record every append, duplicate or not"
+    );
+}
+
+/// Boundary case (contract §C2): a non-`EnvelopeAccepted` event is not
+/// recorded in `messages`; `messages_since` past the last seq is empty;
+/// `messages_in_thread` filters correctly across multiple threads.
+#[test]
+fn non_envelope_events_are_excluded_and_thread_filter_is_exact() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+
+    ledger
+        .append(&BusEvent::Registered {
+            agent_id: "agent:a".to_string(),
+        })
+        .expect("append Registered");
+    assert!(
+        ledger.messages_since(0).unwrap().is_empty(),
+        "non-EnvelopeAccepted events must not appear in messages"
+    );
+
+    let mut env_th1 = envelope("agent:sender", "agent:receiver", "req_1");
+    env_th1.thread = "th-1".to_string();
+    let mut env_th2 = envelope("agent:sender", "agent:receiver", "req_2");
+    env_th2.thread = "th-2".to_string();
+
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: env_th1.clone(),
+        })
+        .expect("append th-1 envelope");
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: env_th2.clone(),
+        })
+        .expect("append th-2 envelope");
+
+    let last_seq = ledger.messages_since(0).unwrap().last().unwrap().seq;
+    assert!(
+        ledger.messages_since(last_seq).unwrap().is_empty(),
+        "messages_since(last seq) must be empty"
+    );
+
+    let th1_messages = ledger.messages_in_thread("th-1").unwrap();
+    assert_eq!(th1_messages.len(), 1);
+    assert_eq!(th1_messages[0].envelope, env_th1);
+
+    let th2_messages = ledger.messages_in_thread("th-2").unwrap();
+    assert_eq!(th2_messages.len(), 1);
+    assert_eq!(th2_messages[0].envelope, env_th2);
+
+    assert!(ledger.messages_in_thread("th-nonexistent").unwrap().is_empty());
+}
+
+/// Transaction case (contract §C2): `EnvelopeAccepted` lands in both
+/// `events` (existing observer log) and `messages` (structured store) from
+/// the same `append` call.
+#[test]
+fn envelope_accepted_is_recorded_in_both_events_and_messages() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+    let env = envelope("agent:sender", "agent:receiver", "req_1");
+
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: env.clone(),
+        })
+        .expect("append EnvelopeAccepted");
+
+    assert_eq!(ledger.count().unwrap(), 1);
+    let events = ledger.events_of_kind("EnvelopeAccepted").unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].contains(&env.id));
+
+    let messages = ledger.messages_since(0).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].envelope, env);
+}
+
+/// Boundary case: a message body carrying arbitrary JSON (not just `{}`)
+/// still round-trips verbatim, proving the store does not reassemble
+/// individual columns instead of the full `envelope_json`.
+#[test]
+fn envelope_with_nontrivial_body_round_trips_verbatim() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+    let mut env = envelope("agent:sender", "agent:receiver", "req_1");
+    env.body = json!({"nested": {"list": [1, 2, 3]}, "note": "hello"});
+    env.artifacts = vec!["art:foo.png".to_string()];
+    env.in_reply_to = Some("msg_prev".to_string());
+
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: env.clone(),
+        })
+        .expect("append EnvelopeAccepted");
+
+    let messages = ledger.messages_since(0).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].envelope, env);
+}
+
+/// File-DB case (brief D7): the same behavior holds against a real SQLite
+/// file, not just `open_in_memory`. Path lives under the worktree's
+/// `.crew-test/` dir per security policy (no system temp dir); removed at
+/// the end of the test.
+#[test]
+fn file_backed_ledger_persists_messages_across_reopen() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crew-test");
+    std::fs::create_dir_all(&dir).expect("create .crew-test dir");
+    let db_path = dir.join("file_backed_ledger_persists_messages_across_reopen.sqlite");
+    let _ = std::fs::remove_file(&db_path);
+
+    let env = envelope("agent:sender", "agent:receiver", "req_1");
+    {
+        let ledger = EventLedger::open(&db_path).expect("open file-backed ledger");
+        ledger
+            .append(&BusEvent::EnvelopeAccepted {
+                envelope: env.clone(),
+            })
+            .expect("append EnvelopeAccepted");
+    }
+
+    let reopened = EventLedger::open(&db_path).expect("reopen file-backed ledger");
+    let messages = reopened.messages_since(0).expect("messages_since(0)");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].envelope, env);
+
+    std::fs::remove_file(&db_path).expect("clean up .crew-test db file");
+}
+
+/// Error case (brief D6): a corrupt `envelope_json` row surfaces as
+/// `LedgerError::Serialize` from `messages_since`, not a silent skip.
+#[test]
+fn corrupt_envelope_json_surfaces_a_serialize_error_not_silently_skipped() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".crew-test");
+    std::fs::create_dir_all(&dir).expect("create .crew-test dir");
+    let db_path =
+        dir.join("corrupt_envelope_json_surfaces_a_serialize_error_not_silently_skipped.sqlite");
+    let _ = std::fs::remove_file(&db_path);
+
+    {
+        let ledger = EventLedger::open(&db_path).expect("open file-backed ledger");
+        ledger
+            .append(&BusEvent::EnvelopeAccepted {
+                envelope: envelope("agent:sender", "agent:receiver", "req_1"),
+            })
+            .expect("append EnvelopeAccepted");
+    }
+
+    {
+        let raw = rusqlite::Connection::open(&db_path).expect("open raw connection");
+        raw.execute("UPDATE messages SET envelope_json = 'not valid json'", [])
+            .expect("corrupt the row directly");
+    }
+
+    let reopened = EventLedger::open(&db_path).expect("reopen file-backed ledger");
+    let result = reopened.messages_since(0);
+    assert!(
+        matches!(result, Err(crew_ledger::LedgerError::Serialize(_))),
+        "corrupt envelope_json must surface as LedgerError::Serialize, got {result:?}"
+    );
+
+    std::fs::remove_file(&db_path).expect("clean up .crew-test db file");
 }

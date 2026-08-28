@@ -5,5 +5,5 @@
 mod store;
 mod subscribe;
 
-pub use store::{EventLedger, LedgerError};
+pub use store::{EventLedger, LedgerError, StoredMessage};
 pub use subscribe::spawn_subscriber;
