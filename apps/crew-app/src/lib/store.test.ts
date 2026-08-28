@@ -82,6 +82,9 @@ describe("RunState.applyEvent — boundary: empty snapshot", () => {
     expect(s.messages).toEqual([]);
     expect(s.taskStates).toEqual({});
     expect(s.finished).toBeNull();
+    expect(s.sprintIndex).toBeNull();
+    expect(s.sprintSummaries).toEqual([]);
+    expect(s.roster).toEqual([]);
   });
 });
 
@@ -113,6 +116,67 @@ describe("RunState.applyEvent — error/boundary: unknown event type", () => {
     expect(warn).toHaveBeenCalled();
     expect(store.getState()).toEqual(before);
     warn.mockRestore();
+  });
+});
+
+describe("RunState.applyEvent — sprint/roster events (plan D2)", () => {
+  it("sets sprintIndex on sprint_started and appends to sprintSummaries on sprint_finished", () => {
+    const store = createRunStore(fakeSource());
+    store.getState().applyEvent({ type: "sprint_started", index: 1, task_ids: ["t-pm"], ts: "t1" });
+    expect(store.getState().sprintIndex).toBe(1);
+
+    store.getState().applyEvent({ type: "sprint_finished", index: 1, summary: "스프린트 1 완료", ts: "t2" });
+    expect(store.getState().sprintSummaries).toEqual([{ index: 1, summary: "스프린트 1 완료" }]);
+
+    store.getState().applyEvent({ type: "sprint_started", index: 2, task_ids: ["t-design"], ts: "t3" });
+    expect(store.getState().sprintIndex).toBe(2);
+  });
+
+  it("replaces the roster wholesale on roster_changed, never merging with the previous value", () => {
+    const store = createRunStore(fakeSource());
+    store.getState().applyEvent({
+      type: "roster_changed",
+      agents: [{ id: "agent:pm", role: "pm", harness: "claude-code", model: "claude-sonnet-5" }],
+      ts: "t1",
+    });
+    expect(store.getState().roster).toEqual([
+      { id: "agent:pm", role: "pm", harness: "claude-code", model: "claude-sonnet-5" },
+    ]);
+
+    store.getState().applyEvent({
+      type: "roster_changed",
+      agents: [{ id: "agent:designer", role: "designer", harness: "opencode", model: "claude-sonnet-5" }],
+      ts: "t2",
+    });
+    // Full replace: the pm slot from the first event must be gone, not merged.
+    expect(store.getState().roster).toEqual([
+      { id: "agent:designer", role: "designer", harness: "opencode", model: "claude-sonnet-5" },
+    ]);
+  });
+
+  it("ignores a re-applied sprint_finished for the same index (idempotent)", () => {
+    const store = createRunStore(fakeSource());
+    store.getState().applyEvent({ type: "sprint_finished", index: 1, summary: "첫 요약", ts: "t1" });
+    store.getState().applyEvent({ type: "sprint_finished", index: 1, summary: "첫 요약", ts: "t2" });
+    expect(store.getState().sprintSummaries).toHaveLength(1);
+  });
+
+  it("resets sprintIndex/sprintSummaries/roster on a new run_started", () => {
+    const store = createRunStore(fakeSource());
+    store.getState().applyEvent({ type: "sprint_started", index: 1, task_ids: [], ts: "t1" });
+    store.getState().applyEvent({ type: "sprint_finished", index: 1, summary: "s", ts: "t2" });
+    store.getState().applyEvent({
+      type: "roster_changed",
+      agents: [{ id: "agent:pm", role: "pm", harness: "claude-code", model: "claude-sonnet-5" }],
+      ts: "t3",
+    });
+
+    store.getState().applyEvent(runStarted);
+
+    const s = store.getState();
+    expect(s.sprintIndex).toBeNull();
+    expect(s.sprintSummaries).toEqual([]);
+    expect(s.roster).toEqual([]);
   });
 });
 
