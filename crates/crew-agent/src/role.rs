@@ -14,4 +14,16 @@ pub trait RoleBehavior {
     async fn on_envelope(&mut self, env: Envelope) -> Vec<Envelope>;
 
     fn is_done(&self) -> bool;
+
+    /// `None` (default) disables the tick branch entirely — `AgentRunner`
+    /// falls back to its original recv-only loop (contract C2).
+    fn tick_interval(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// `now_ms` is passed in (not read from the system clock) so callers
+    /// can drive this deterministically in tests (contract C2).
+    async fn on_tick(&mut self, _now_ms: u64) -> Vec<Envelope> {
+        Vec::new()
+    }
 }

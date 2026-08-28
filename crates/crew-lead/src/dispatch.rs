@@ -4,7 +4,7 @@
 //! `human.gate` escalation that blocks only the affected task while the
 //! rest of the DAG keeps moving (§4.4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use crew_agent::RoleBehavior;
@@ -17,15 +17,39 @@ use crate::dod_exec::{self, DodVerdict};
 const DEADLINE_MS: u64 = 900_000;
 const SPRINT_LABEL: &str = "sp-m3";
 
-/// One task's dispatch state within this sprint run (plan D4). `Accepted`
-/// and `Escalated` are the only terminal states — [`LeadBehavior::is_done`]
-/// (plan D7) waits for every sprint task to reach one of them.
+/// One task's dispatch state within this sprint run (plan D4). `Accepted`,
+/// `Escalated`, and `Blocked` (plan M5 D6/contract C3a) are the terminal
+/// states — [`LeadBehavior::is_done`] waits for every sprint task to reach
+/// one of them. `Blocked` is reached only via cascade (an unresolved
+/// `Escalated` task's timeout expiring, or a `with_prior_states` dep that
+/// was not `Accepted`) — a task is never dispatched directly into it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
     Pending,
     Assigned,
     Accepted,
     Escalated,
+    Blocked,
+}
+
+impl TaskState {
+    /// Single source of truth for "this task will not change state again"
+    /// (plan M5 D6) — used by `is_done`, dep-readiness, and cascade so the
+    /// terminal-state list lives in exactly one place.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TaskState::Accepted | TaskState::Escalated | TaskState::Blocked
+        )
+    }
+}
+
+/// `dep_readiness`'s per-task verdict (plan D5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepReadiness {
+    Ready,
+    Waiting,
+    Blocked,
 }
 
 /// Lead's execution-layer state (plan D4): DAG-state dispatch + per-task
@@ -44,6 +68,19 @@ pub struct LeadBehavior {
     loops: HashMap<String, AcceptanceLoop>,
     max_rework: u32,
     thread: String,
+    /// 0 = disabled (default, contract C3a) — `on_tick` and `tick_interval`
+    /// are no-ops and `pending_escalations` is never populated, so this
+    /// task's whole cascade feature is inert unless a caller opts in.
+    escalation_timeout_ms: u64,
+    /// Injected via `with_prior_states` (contract C3a) — terminal states
+    /// from an earlier sprint, consulted only for deps outside this
+    /// sprint's own `dag`/`sprint`.
+    prior_states: HashMap<String, TaskState>,
+    /// task_id -> when its `human.gate` was first observed by `on_tick`
+    /// (plan D3): `None` until the first tick after escalation, `Some(t0)`
+    /// afterward so later ticks can compare `now_ms - t0` against the
+    /// timeout. Only populated when `escalation_timeout_ms > 0`.
+    pending_escalations: HashMap<String, Option<u64>>,
 }
 
 impl LeadBehavior {
@@ -71,7 +108,25 @@ impl LeadBehavior {
             loops: HashMap::new(),
             max_rework,
             thread,
+            escalation_timeout_ms: 0,
+            prior_states: HashMap::new(),
+            pending_escalations: HashMap::new(),
         }
+    }
+
+    /// `ms = 0` (default) disables escalation-timeout cascade entirely —
+    /// existing behavior is fully preserved (contract C3a).
+    pub fn escalation_timeout_ms(mut self, ms: u64) -> Self {
+        self.escalation_timeout_ms = ms;
+        self
+    }
+
+    /// Injects the previous sprint's terminal task states (contract C3a) —
+    /// consulted by dispatch-time dep readiness for deps outside this
+    /// sprint's own DAG.
+    pub fn with_prior_states(mut self, states: HashMap<String, TaskState>) -> Self {
+        self.prior_states = states;
+        self
     }
 
     pub fn state_of(&self, task_id: &str) -> Option<TaskState> {
@@ -89,14 +144,34 @@ impl LeadBehavior {
             .map(|(_, agent)| agent.as_str())
     }
 
-    /// ready = Pending ∧ (모든 dep이 Accepted ∨ 스프린트 밖) — plan D5.
-    fn is_ready(&self, id: &str) -> bool {
+    /// dep 상태 판정 (plan D5): 스프린트 내부 dep은 원래 규칙 그대로
+    /// (`Accepted`만 충족, `Blocked`는 이 태스크도 즉시 `Blocked`로 캐스케이드
+    /// — `dispatch_ready`의 fixpoint 루프가 여러 홉을 전이적으로 처리한다).
+    /// 스프린트 밖 dep은 `prior_states` 미주입 시 기존처럼 자동 충족;
+    /// 주입돼 있으면 prior 상태로 판정한다 (`with_prior_states`, 계약 C3a).
+    fn dep_readiness(&self, id: &str) -> DepReadiness {
         let Some(task) = self.task_by_id(id) else {
-            return false;
+            return DepReadiness::Waiting;
         };
-        task.deps.iter().all(|dep| {
-            !self.sprint.contains(dep) || self.states.get(dep) == Some(&TaskState::Accepted)
-        })
+        for dep in &task.deps {
+            if self.sprint.contains(dep) {
+                match self.states.get(dep) {
+                    Some(TaskState::Accepted) => continue,
+                    Some(TaskState::Blocked) => return DepReadiness::Blocked,
+                    _ => return DepReadiness::Waiting,
+                }
+            }
+            match self.prior_states.get(dep) {
+                None | Some(TaskState::Accepted) => continue,
+                Some(TaskState::Escalated) | Some(TaskState::Blocked) => {
+                    return DepReadiness::Blocked
+                }
+                Some(TaskState::Pending) | Some(TaskState::Assigned) => {
+                    return DepReadiness::Waiting
+                }
+            }
+        }
+        DepReadiness::Ready
     }
 
     fn human_gate(&self, task_id: &str, reason: &str, corr: &str, violations: Vec<String>) -> Envelope {
@@ -117,49 +192,84 @@ impl LeadBehavior {
 
     /// Assigns every newly-ready `Pending` task (plan D5): an unregistered
     /// role escalates that single task immediately via `human.gate` instead
-    /// of assigning it, without touching any other task's state.
+    /// of assigning it, without touching any other task's state. Runs to a
+    /// fixpoint (re-scans until a pass changes nothing) so a dep-readiness
+    /// `Blocked` verdict cascades across multiple hops within this sprint
+    /// in one call, regardless of `sprint`'s iteration order — the common
+    /// case (no `Blocked` states, nothing new dispatchable) always settles
+    /// after its first dispatching pass plus one confirming no-op pass.
     fn dispatch_ready(&mut self) -> Vec<Envelope> {
         let mut envelopes = Vec::new();
-        for id in self.sprint.clone() {
-            if self.states.get(&id) != Some(&TaskState::Pending) || !self.is_ready(&id) {
-                continue;
+        loop {
+            let mut changed = false;
+            for id in self.sprint.clone() {
+                if self.states.get(&id) != Some(&TaskState::Pending) {
+                    continue;
+                }
+                match self.dep_readiness(&id) {
+                    DepReadiness::Waiting => continue,
+                    DepReadiness::Blocked => {
+                        self.states.insert(id.clone(), TaskState::Blocked);
+                        changed = true;
+                        continue;
+                    }
+                    DepReadiness::Ready => {}
+                }
+                let Some(task) = self.task_by_id(&id).cloned() else {
+                    continue;
+                };
+                changed = true;
+                let agent = self.role_agent(task.role).map(|a| a.to_string());
+                match agent {
+                    Some(agent) => {
+                        self.states.insert(id.clone(), TaskState::Assigned);
+                        self.loops
+                            .entry(id.clone())
+                            .or_insert_with(|| AcceptanceLoop::new(self.max_rework));
+                        envelopes.push(Envelope::new(
+                            SPRINT_LABEL.to_string(),
+                            self.thread.clone(),
+                            self.agent_id.clone(),
+                            vec![agent],
+                            MessageKind::TaskAssign,
+                            None,
+                            format!("corr-{id}"),
+                            json!({"task": task}),
+                            vec![],
+                            true,
+                            DEADLINE_MS,
+                        ));
+                    }
+                    None => {
+                        self.states.insert(id.clone(), TaskState::Escalated);
+                        self.track_pending_escalation(&id);
+                        envelopes.push(self.human_gate(
+                            &id,
+                            &format!("unregistered role: {:?}", task.role),
+                            &format!("corr-{id}"),
+                            vec![],
+                        ));
+                    }
+                }
             }
-            let Some(task) = self.task_by_id(&id).cloned() else {
-                continue;
-            };
-            let agent = self.role_agent(task.role).map(|a| a.to_string());
-            match agent {
-                Some(agent) => {
-                    self.states.insert(id.clone(), TaskState::Assigned);
-                    self.loops
-                        .entry(id.clone())
-                        .or_insert_with(|| AcceptanceLoop::new(self.max_rework));
-                    envelopes.push(Envelope::new(
-                        SPRINT_LABEL.to_string(),
-                        self.thread.clone(),
-                        self.agent_id.clone(),
-                        vec![agent],
-                        MessageKind::TaskAssign,
-                        None,
-                        format!("corr-{id}"),
-                        json!({"task": task}),
-                        vec![],
-                        true,
-                        DEADLINE_MS,
-                    ));
-                }
-                None => {
-                    self.states.insert(id.clone(), TaskState::Escalated);
-                    envelopes.push(self.human_gate(
-                        &id,
-                        &format!("unregistered role: {:?}", task.role),
-                        &format!("corr-{id}"),
-                        vec![],
-                    ));
-                }
+            if !changed {
+                break;
             }
         }
         envelopes
+    }
+
+    /// Starts this task's timeout clock at the first `on_tick` after its
+    /// `human.gate` was published (plan D3) — a no-op when the cascade
+    /// feature is disabled, so `pending_escalations` stays empty and
+    /// `on_tick` remains a true no-op at the default `escalation_timeout_ms
+    /// = 0` (contract C3a).
+    fn track_pending_escalation(&mut self, task_id: &str) {
+        if self.escalation_timeout_ms > 0 {
+            self.pending_escalations
+                .entry(task_id.to_string())
+                .or_insert(None);
+        }
     }
 
     /// `task.result` handling (plan D6): unmatched/unknown/non-`Assigned`
@@ -203,6 +313,7 @@ impl LeadBehavior {
             )],
             AcceptDecision::Escalate { reason } => {
                 self.states.insert(task_id.clone(), TaskState::Escalated);
+                self.track_pending_escalation(&task_id);
                 vec![self.human_gate(&task_id, &reason, &env.corr, violation_strings(&verdict))]
             }
         }
@@ -219,6 +330,7 @@ impl LeadBehavior {
             return vec![];
         }
         self.states.insert(task_id.clone(), TaskState::Escalated);
+        self.track_pending_escalation(&task_id);
         let reason = env
             .body
             .get("reason")
@@ -226,6 +338,50 @@ impl LeadBehavior {
             .unwrap_or("worker blocked")
             .to_string();
         vec![self.human_gate(&task_id, &reason, &env.corr, vec![])]
+    }
+
+    /// All sprint task ids transitively depending on any id in `roots`
+    /// (plan D4), computed by fixpoint over `self.dag.tasks` restricted to
+    /// `self.sprint` — independent of `dispatch_ready`'s pass order, so an
+    /// arbitrarily long dependency chain resolves in this one call.
+    /// `roots` themselves are included in the returned set.
+    fn transitively_blocked(&self, roots: &[String]) -> HashSet<String> {
+        let mut blocked: HashSet<String> = roots.iter().cloned().collect();
+        loop {
+            let mut added = false;
+            for task in &self.dag.tasks {
+                if !self.sprint.contains(&task.id) || blocked.contains(&task.id) {
+                    continue;
+                }
+                if task.deps.iter().any(|dep| blocked.contains(dep)) {
+                    blocked.insert(task.id.clone());
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        blocked
+    }
+
+    /// Cascades every non-terminal sprint task transitively depending on
+    /// `roots` to `Blocked` (plan D4). `roots` themselves stay `Escalated`
+    /// — an expired escalation is not retried, only its dependents are
+    /// released from limbo. Already-terminal tasks (e.g. `Accepted`) are
+    /// left untouched.
+    fn cascade_blocked(&mut self, roots: &[String]) {
+        let blocked = self.transitively_blocked(roots);
+        for id in blocked {
+            if roots.contains(&id) {
+                continue;
+            }
+            if let Some(state) = self.states.get(&id).copied() {
+                if !state.is_terminal() {
+                    self.states.insert(id, TaskState::Blocked);
+                }
+            }
+        }
     }
 }
 
@@ -262,12 +418,54 @@ impl RoleBehavior for LeadBehavior {
     }
 
     fn is_done(&self) -> bool {
-        self.sprint.iter().all(|id| {
-            matches!(
-                self.states.get(id),
-                Some(TaskState::Accepted) | Some(TaskState::Escalated)
-            )
-        })
+        self.sprint
+            .iter()
+            .all(|id| self.states.get(id).is_some_and(|s| s.is_terminal()))
+    }
+
+    /// `escalation_timeout_ms = 0` (default) disables the tick branch
+    /// entirely, preserving the original recv-only runner loop (contract
+    /// C3a). Otherwise ticks at `escalation_timeout_ms / 4`, clamped to
+    /// `[10ms, 1s]` (plan D7) — frequent enough to notice an expiry
+    /// promptly without busy-polling.
+    fn tick_interval(&self) -> Option<std::time::Duration> {
+        if self.escalation_timeout_ms == 0 {
+            return None;
+        }
+        let quarter = self.escalation_timeout_ms / 4;
+        Some(std::time::Duration::from_millis(quarter.clamp(10, 1_000)))
+    }
+
+    /// Records each pending escalation's start time on its first tick, then
+    /// cascades any that have now expired (plan D3/D4). A no-op at the
+    /// default `escalation_timeout_ms = 0` — `pending_escalations` is never
+    /// populated in that case either (`track_pending_escalation`), so this
+    /// early return is also reachable if a caller invokes `on_tick`
+    /// directly without going through `tick_interval`.
+    async fn on_tick(&mut self, now_ms: u64) -> Vec<Envelope> {
+        if self.escalation_timeout_ms == 0 {
+            return Vec::new();
+        }
+
+        let mut expired = Vec::new();
+        for (task_id, recorded_at) in self.pending_escalations.iter_mut() {
+            match recorded_at {
+                None => *recorded_at = Some(now_ms),
+                Some(started) if now_ms.saturating_sub(*started) >= self.escalation_timeout_ms => {
+                    expired.push(task_id.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        for task_id in &expired {
+            self.pending_escalations.remove(task_id);
+        }
+
+        if !expired.is_empty() {
+            self.cascade_blocked(&expired);
+        }
+
+        Vec::new()
     }
 }
 
@@ -522,5 +720,42 @@ mod tests {
         assert_eq!(envelopes[0].to, vec!["agent:human".to_string()]);
         assert_eq!(envelopes[0].body["task_id"], json!("t-pm"));
         assert_eq!(lead.state_of("t-pm"), Some(TaskState::Escalated));
+    }
+
+    #[test]
+    fn is_terminal_covers_exactly_accepted_escalated_and_blocked() {
+        assert!(!TaskState::Pending.is_terminal());
+        assert!(!TaskState::Assigned.is_terminal());
+        assert!(TaskState::Accepted.is_terminal());
+        assert!(TaskState::Escalated.is_terminal());
+        assert!(TaskState::Blocked.is_terminal());
+    }
+
+    #[test]
+    fn tick_interval_is_none_at_default_zero_timeout() {
+        let lead = lead(AcceptanceLoop::default_budget());
+
+        assert_eq!(lead.tick_interval(), None);
+    }
+
+    #[test]
+    fn tick_interval_clamps_a_quarter_of_the_timeout_into_ten_ms_to_one_s() {
+        let normal = lead(AcceptanceLoop::default_budget()).escalation_timeout_ms(400);
+        assert_eq!(
+            normal.tick_interval(),
+            Some(std::time::Duration::from_millis(100))
+        );
+
+        let below_floor = lead(AcceptanceLoop::default_budget()).escalation_timeout_ms(20);
+        assert_eq!(
+            below_floor.tick_interval(),
+            Some(std::time::Duration::from_millis(10))
+        );
+
+        let above_ceiling = lead(AcceptanceLoop::default_budget()).escalation_timeout_ms(8_000);
+        assert_eq!(
+            above_ceiling.tick_interval(),
+            Some(std::time::Duration::from_millis(1_000))
+        );
     }
 }
