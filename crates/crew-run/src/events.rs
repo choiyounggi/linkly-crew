@@ -51,6 +51,7 @@ pub enum TaskStateDto {
     Assigned,
     Accepted,
     Escalated,
+    Blocked,
 }
 
 impl From<crew_lead::dispatch::TaskState> for TaskStateDto {
@@ -60,6 +61,7 @@ impl From<crew_lead::dispatch::TaskState> for TaskStateDto {
             crew_lead::dispatch::TaskState::Assigned => TaskStateDto::Assigned,
             crew_lead::dispatch::TaskState::Accepted => TaskStateDto::Accepted,
             crew_lead::dispatch::TaskState::Escalated => TaskStateDto::Escalated,
+            crew_lead::dispatch::TaskState::Blocked => TaskStateDto::Blocked,
         }
     }
 }
