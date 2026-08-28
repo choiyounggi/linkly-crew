@@ -1,0 +1,186 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { createRunStore } from "../../lib/store";
+import { MockEventSource } from "../../lib/mock-source";
+import type { Envelope, MessageKind, TaskDag } from "../../lib/types";
+import { deriveRail } from "./derive";
+
+const TASK_A = {
+  id: "t-a",
+  role: "designer" as const,
+  title: "task A",
+  brief: "brief",
+  dod: [],
+  deps: [],
+  artifacts_expected: [],
+};
+const TASK_B = {
+  id: "t-b",
+  role: "developer" as const,
+  title: "task B",
+  brief: "brief",
+  dod: [],
+  deps: [],
+  artifacts_expected: [],
+};
+
+const DAG: TaskDag = { tasks: [TASK_A, TASK_B] };
+
+function env(
+  seq: number,
+  fields: { kind: MessageKind; corr: string; body?: unknown; to?: string[] },
+): { seq: number; envelope: Envelope } {
+  return {
+    seq,
+    envelope: {
+      id: `env_${seq}`,
+      ts: "t",
+      sprint: "sprint-1",
+      thread: fields.corr,
+      from: "lead",
+      to: fields.to ?? ["agent:designer"],
+      kind: fields.kind,
+      corr: fields.corr,
+      body: fields.body ?? {},
+      artifacts: [],
+      requires_ack: false,
+      deadline_ms: 1000,
+    },
+  };
+}
+
+function assignMsg(seq: number, taskId: string, to: string[], corr = taskId): { seq: number; envelope: Envelope } {
+  return env(seq, { kind: "task.assign", corr, body: { task: { id: taskId } }, to });
+}
+
+describe("deriveRail — normal: assign -> working -> result -> awaiting -> accepted -> idle", () => {
+  it("shows working right after task.assign, before any result", () => {
+    const messages = [assignMsg(1, "t-a", ["agent:designer"])];
+    const cards = deriveRail(DAG, { "t-a": "assigned" }, messages, "run_1", null);
+    const designer = cards.find((c) => c.role === "designer");
+    expect(designer).toEqual({
+      id: "agent:designer",
+      role: "designer",
+      status: "working",
+      currentTaskId: "t-a",
+      harness: "claude",
+    });
+  });
+
+  it("shows awaiting once task.result is sent but the task is still 'assigned'", () => {
+    const messages = [
+      assignMsg(1, "t-a", ["agent:designer"]),
+      env(2, { kind: "task.result", corr: "t-a" }),
+    ];
+    const cards = deriveRail(DAG, { "t-a": "assigned" }, messages, "run_1", null);
+    const designer = cards.find((c) => c.role === "designer");
+    expect(designer?.status).toBe("awaiting");
+    expect(designer?.currentTaskId).toBe("t-a");
+  });
+
+  it("shows idle once the task is accepted", () => {
+    const messages = [
+      assignMsg(1, "t-a", ["agent:designer"]),
+      env(2, { kind: "task.result", corr: "t-a" }),
+    ];
+    const cards = deriveRail(DAG, { "t-a": "accepted" }, messages, "run_1", null);
+    const designer = cards.find((c) => c.role === "designer");
+    expect(designer?.status).toBe("idle");
+    expect(designer?.currentTaskId).toBeNull();
+  });
+
+  it("lead is working while the sprint is in flight and idle once finished", () => {
+    const inFlight = deriveRail(DAG, {}, [], "run_1", null);
+    expect(inFlight.find((c) => c.role === "lead")?.status).toBe("working");
+
+    const finished = deriveRail(DAG, {}, [], "run_1", "completed");
+    expect(finished.find((c) => c.role === "lead")?.status).toBe("idle");
+
+    const notStarted = deriveRail(DAG, {}, [], null, null);
+    expect(notStarted.find((c) => c.role === "lead")?.status).toBe("idle");
+  });
+});
+
+describe("deriveRail — rework: change_request sends the agent back to working", () => {
+  it("goes back to working after a change_request following task.result", () => {
+    const messages = [
+      assignMsg(1, "t-a", ["agent:designer"]),
+      env(2, { kind: "task.result", corr: "t-a" }),
+      env(3, { kind: "change_request", corr: "t-a" }),
+    ];
+    const cards = deriveRail(DAG, { "t-a": "assigned" }, messages, "run_1", null);
+    const designer = cards.find((c) => c.role === "designer");
+    expect(designer?.status).toBe("working");
+    expect(designer?.currentTaskId).toBe("t-a");
+  });
+
+  it("returns to awaiting once a fresh task.result follows the change_request", () => {
+    const messages = [
+      assignMsg(1, "t-a", ["agent:designer"]),
+      env(2, { kind: "task.result", corr: "t-a" }),
+      env(3, { kind: "change_request", corr: "t-a" }),
+      env(4, { kind: "task.result", corr: "t-a" }),
+    ];
+    const cards = deriveRail(DAG, { "t-a": "assigned" }, messages, "run_1", null);
+    const designer = cards.find((c) => c.role === "designer");
+    expect(designer?.status).toBe("awaiting");
+  });
+});
+
+describe("deriveRail — boundary: empty messages / dag null / body shape mismatch", () => {
+  it("shows all cards idle with no crash when there are no messages yet", () => {
+    const cards = deriveRail(DAG, {}, [], null, null);
+    expect(cards).toHaveLength(3); // lead + 2 roles present in DAG
+    for (const card of cards) {
+      expect(card.status).toBe("idle");
+      expect(card.currentTaskId).toBeNull();
+      expect(card.harness).toBe("claude");
+    }
+  });
+
+  it("returns just the lead card with no crash when dag is null (pre-run)", () => {
+    const cards = deriveRail(null, {}, [], null, null);
+    expect(cards).toEqual([{ id: "lead", role: "lead", status: "idle", currentTaskId: null, harness: "claude" }]);
+  });
+
+  it("ignores a task.assign whose body doesn't match the {task:{id}} shape", () => {
+    const messages = [
+      env(1, { kind: "task.assign", corr: "t-a", body: { unexpected: true }, to: ["agent:designer"] }),
+    ];
+    const cards = deriveRail(DAG, { "t-a": "assigned" }, messages, "run_1", null);
+    const designer = cards.find((c) => c.role === "designer");
+    expect(designer?.status).toBe("idle");
+    expect(designer?.currentTaskId).toBeNull();
+  });
+
+  it("lists every role appearing in dag.tasks and the lead, in a stable order", () => {
+    const cards = deriveRail(DAG, {}, [], null, null);
+    expect(cards.map((c) => c.role)).toEqual(["lead", "designer", "developer"]);
+  });
+});
+
+describe("deriveRail — full mock scenario replay", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("settles every worker and the lead to idle once the mock scenario finishes", async () => {
+    const source = new MockEventSource(0);
+    const store = createRunStore(source);
+    source.onEvent(store.getState().applyEvent);
+
+    await store.getState().startRun("간단한 랜딩 페이지");
+    await vi.runAllTimersAsync();
+
+    const s = store.getState();
+    const cards = deriveRail(s.dag, s.taskStates, s.messages, s.runId, s.finished);
+    expect(cards).toHaveLength(6); // lead + pm/designer/publisher/developer/qa
+    for (const card of cards) {
+      expect(card.status).toBe("idle");
+    }
+  });
+});
