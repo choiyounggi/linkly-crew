@@ -406,6 +406,222 @@ async fn test_auth_failure_returns_401() {
     bus.shutdown().await;
 }
 
+/// Waits up to `timeout` for an `EnvelopeAccepted` BusEvent matching `id`.
+async fn wait_for_envelope_accepted(
+    events: &mut tokio::sync::broadcast::Receiver<crew_bus::BusEvent>,
+    id: &str,
+    timeout: Duration,
+) -> bool {
+    tokio::time::timeout(timeout, async {
+        loop {
+            match events.recv().await {
+                Ok(crew_bus::BusEvent::EnvelopeAccepted { envelope }) if envelope.id == id => {
+                    return true
+                }
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Normal case (contract §C1): a submitted envelope is accepted exactly
+/// once, and the broadcast `EnvelopeAccepted` carries the envelope verbatim.
+#[tokio::test]
+async fn test_envelope_accepted_emitted_once_with_verbatim_fields() {
+    let (bus, url) = start_bus(Duration::from_millis(200)).await;
+    let mut events = bus.subscribe();
+    let mut sender = connect_agent(&url, "agent:sender").await;
+    let mut receiver = connect_agent(&url, "agent:receiver").await;
+
+    let env = envelope(
+        "agent:sender",
+        "agent:receiver",
+        MessageKind::Question,
+        "req_1",
+        false,
+    );
+    send_client_frame(&mut sender, &ClientFrame::Envelope(env.clone())).await;
+    let _ = recv_frame(&mut receiver, Duration::from_secs(2))
+        .await
+        .expect("receiver should get the envelope");
+
+    let accepted = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            match events.recv().await {
+                Ok(crew_bus::BusEvent::EnvelopeAccepted { envelope }) if envelope.id == env.id => {
+                    return Some(envelope)
+                }
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+    .expect("expected an EnvelopeAccepted BusEvent");
+    // Verbatim field assertions, not just presence.
+    assert_eq!(accepted.id, env.id);
+    assert_eq!(accepted.from, env.from);
+    assert_eq!(accepted.to, env.to);
+    assert_eq!(accepted.kind, env.kind);
+    assert_eq!(accepted.corr, env.corr);
+    assert_eq!(accepted.body, env.body);
+    assert_eq!(accepted, env);
+
+    let reemitted = wait_for_envelope_accepted(&mut events, &env.id, Duration::from_millis(300)).await;
+    assert!(!reemitted, "EnvelopeAccepted should fire exactly once for a single submission");
+
+    bus.shutdown().await;
+}
+
+/// Duplicate case: resubmitting the same envelope id (client-side retry) is
+/// deduped by the seen-set and does not re-fire `EnvelopeAccepted`.
+#[tokio::test]
+async fn test_envelope_accepted_not_reemitted_on_duplicate_submission() {
+    let (bus, url) = start_bus(Duration::from_millis(200)).await;
+    let mut events = bus.subscribe();
+    let mut sender = connect_agent(&url, "agent:sender").await;
+    let mut receiver = connect_agent(&url, "agent:receiver").await;
+
+    let env = envelope(
+        "agent:sender",
+        "agent:receiver",
+        MessageKind::Question,
+        "req_1",
+        false,
+    );
+    send_client_frame(&mut sender, &ClientFrame::Envelope(env.clone())).await;
+    let _ = recv_frame(&mut receiver, Duration::from_secs(2))
+        .await
+        .expect("receiver should get the first copy");
+    assert!(
+        wait_for_envelope_accepted(&mut events, &env.id, Duration::from_secs(1)).await,
+        "expected EnvelopeAccepted for the first submission"
+    );
+
+    send_client_frame(&mut sender, &ClientFrame::Envelope(env.clone())).await;
+    let dedup_reply = recv_frame(&mut sender, Duration::from_secs(2))
+        .await
+        .expect("sender should get a Receipt for the duplicate submission");
+    assert_eq!(dedup_reply, ServerFrame::Receipt { id: env.id.clone() });
+
+    let reemitted = wait_for_envelope_accepted(&mut events, &env.id, Duration::from_millis(300)).await;
+    assert!(!reemitted, "EnvelopeAccepted must not re-fire on duplicate submission");
+
+    bus.shutdown().await;
+}
+
+/// Redelivery case: the background retry loop resending an unacked
+/// `requires_ack` envelope must not produce a second `EnvelopeAccepted` —
+/// acceptance is bound to first-seen submission, not delivery attempts.
+#[tokio::test]
+async fn test_envelope_accepted_not_reemitted_on_automatic_redelivery() {
+    let (bus, url) = start_bus(Duration::from_millis(20)).await;
+    let mut events = bus.subscribe();
+    let mut sender = connect_agent(&url, "agent:sender").await;
+    let mut receiver = connect_agent(&url, "agent:receiver").await;
+
+    let env = envelope(
+        "agent:sender",
+        "agent:receiver",
+        MessageKind::Question,
+        "req_1",
+        true,
+    );
+    send_client_frame(&mut sender, &ClientFrame::Envelope(env.clone())).await;
+
+    let _first = recv_frame(&mut receiver, Duration::from_secs(2))
+        .await
+        .expect("receiver should get the first delivery");
+    // Deliberately don't ack — force at least one automatic redelivery.
+    let _redelivered = recv_frame(&mut receiver, Duration::from_secs(2))
+        .await
+        .expect("receiver should get a redelivered copy");
+
+    let mut accepted_count = 0;
+    let _ = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match events.recv().await {
+                Ok(crew_bus::BusEvent::EnvelopeAccepted { envelope }) if envelope.id == env.id => {
+                    accepted_count += 1;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        accepted_count, 1,
+        "EnvelopeAccepted must fire exactly once despite an automatic redelivery"
+    );
+
+    send_client_frame(&mut receiver, &ClientFrame::Receipt { id: env.id.clone() }).await;
+    bus.shutdown().await;
+}
+
+/// Boundary case (contract §C1): an envelope accepted but routed to an
+/// unregistered recipient still fires `EnvelopeAccepted` — acceptance is
+/// distinct from successful delivery.
+#[tokio::test]
+async fn test_envelope_accepted_emitted_for_unknown_recipient() {
+    let (bus, url) = start_bus(Duration::from_millis(200)).await;
+    let mut events = bus.subscribe();
+    let mut sender = connect_agent(&url, "agent:sender").await;
+
+    let env = envelope(
+        "agent:sender",
+        "agent:ghost",
+        MessageKind::Question,
+        "req_1",
+        false,
+    );
+    send_client_frame(&mut sender, &ClientFrame::Envelope(env.clone())).await;
+
+    let rejected = recv_frame(&mut sender, Duration::from_secs(2))
+        .await
+        .expect("sender should get an unknown_recipient Error");
+    assert_eq!(
+        rejected,
+        ServerFrame::Error {
+            code: "unknown_recipient".to_string(),
+            message: "agent:ghost".to_string(),
+        }
+    );
+
+    assert!(
+        wait_for_envelope_accepted(&mut events, &env.id, Duration::from_secs(1)).await,
+        "EnvelopeAccepted should fire even though the recipient is unknown"
+    );
+
+    bus.shutdown().await;
+}
+
+/// Serialization (contract §C1 / crew-ledger compatibility): `EnvelopeAccepted`
+/// uses the same externally-tagged shape as every other `BusEvent`, so the
+/// ledger's single-top-level-key `kind` extraction still works unmodified.
+#[test]
+fn test_envelope_accepted_serializes_externally_tagged() {
+    let env = envelope(
+        "agent:sender",
+        "agent:receiver",
+        MessageKind::Question,
+        "req_1",
+        false,
+    );
+    let event = crew_bus::BusEvent::EnvelopeAccepted { envelope: env };
+    let value = serde_json::to_value(&event).unwrap();
+    let obj = value
+        .as_object()
+        .expect("externally-tagged enum serializes as a single-key object");
+    assert_eq!(obj.len(), 1, "expected exactly one top-level key");
+    assert!(obj.contains_key("EnvelopeAccepted"));
+}
+
 #[tokio::test]
 async fn test_duplicate_agent_id_rejected() {
     let (bus, url) = start_bus(Duration::from_millis(200)).await;

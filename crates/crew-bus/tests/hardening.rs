@@ -187,6 +187,44 @@ async fn test_spoofed_from_is_rejected_not_routed() {
     bus.shutdown().await;
 }
 
+/// Boundary case (contract §C1): a spoofed envelope is rejected in
+/// `handle_client_text` before it ever reaches `handle_envelope`, so no
+/// `EnvelopeAccepted` fires for it — only `SpoofRejected`.
+#[tokio::test]
+async fn test_envelope_accepted_not_emitted_for_spoofed_envelope() {
+    let (bus, url) = start_bus(default_cfg()).await;
+    let mut events = bus.subscribe();
+    let mut mallory = connect_agent(&url, "agent:mallory").await;
+    let _victim = connect_agent(&url, "agent:victim").await;
+
+    let spoofed = envelope("agent:victim", "agent:victim", "req_spoof");
+    let spoofed_id = spoofed.id.clone();
+    send_client_frame(&mut mallory, &ClientFrame::Envelope(spoofed.clone())).await;
+
+    let _rejection = recv_frame(&mut mallory, Duration::from_secs(2))
+        .await
+        .expect("mallory should get a from_mismatch Error");
+
+    let accepted = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            match events.recv().await {
+                Ok(crew_bus::BusEvent::EnvelopeAccepted { envelope }) if envelope.id == spoofed_id => {
+                    return true
+                }
+                Ok(_) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+    assert!(
+        accepted.is_err(),
+        "EnvelopeAccepted must not fire for a spoofed envelope"
+    );
+
+    bus.shutdown().await;
+}
+
 /// Boundary case: with `seen_capacity = 2`, submitting 3 distinct ids
 /// evicts the oldest (`id-1`). Resubmitting `id-1` afterward is outside
 /// the dedup window and gets re-routed (documented eviction behavior),

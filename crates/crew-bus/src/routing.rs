@@ -79,6 +79,12 @@ fn handle_envelope(shared: &Arc<Shared>, envelope: Envelope) {
         return;
     }
 
+    // Contract §C1: exactly one broadcast per newly-seen envelope, before
+    // any delivery attempt — acceptance is independent of delivery outcome.
+    let _ = shared.events.send(BusEvent::EnvelopeAccepted {
+        envelope: envelope.clone(),
+    });
+
     for recipient in envelope.to.clone() {
         route_one(shared, &envelope, &recipient);
     }
