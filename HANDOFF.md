@@ -1,8 +1,11 @@
-# 세션 인계 — agent-crew
+# 세션 인계 — linkly-crew
 
 **한 줄**: 구독 중인 AI CLI들을 역할별 팀원으로 묶어, 요청 한 줄을 팀장 에이전트가
-스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M3 완료·실측 검증**
-(코어 백엔드 전부 동작: 하네스·버스·5역할·Lead·원장) — 다음은 **M4 UI**.
+스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M4 완료·실측 검증**
+(코어 백엔드 + Tauri 2 UI: 스프린트 보드·라이브 스레드·에이전트 레일) — 다음은 **M5**.
+
+**이름 확정(2026-08-28, 사용자 결정)**: 프로젝트명 **linkly-crew** (구 가칭 agent-crew).
+프론트엔드 **React 19 + Vite** (DESIGN §12.6 추천안 채택).
 
 ---
 
@@ -75,9 +78,32 @@
 - Lead의 스펙화는 **M3 결정론 템플릿**(REQ-1..5 고정) — LLM 스펙화(§4.3 구조화 JSON)는
   같은 시그니처로 후속 교체 예정.
 
+**검증됨 — M4** (2026-08-28, 실측: 통합 테스트 + 브라우저 QA 3회 전체 런):
+- 데이터 파이프라인: `crew_bus::BusEvent::EnvelopeAccepted{envelope}`(수락 시 1회 브로드캐스트,
+  스푸핑 거부·중복 제거 후, 재배달 미재발행) → `crew-ledger` `messages` 테이블(events와
+  단일 트랜잭션, `INSERT OR IGNORE` 멱등) + `messages_since`/`messages_in_thread`.
+- **`crates/crew-run`** (신규): m3_sprint.rs 조립 패턴을 승격한 런 컨트롤러 —
+  `RunController::start(RunConfig{goal,mode,data_dir,max_rework}) -> RunHandle{run_id,
+  subscribe->RunEvent, snapshot, join, shutdown}`. `RunMode::Scripted{planted_violations}`
+  (결정론) / `RealCli`(타입만, 테스트 미실행). ObservingLead(RecordingLead 승격)가
+  `TaskStateChanged` 방출. 결정론 3시나리오(해피/리워크/경계) green.
+- **`apps/crew-app`** (신규, standalone — src-tauri에 자체 빈 `[workspace]`): Tauri 2 +
+  React 19 + Vite + zustand. 커맨드 바 + 스프린트 보드(칸반 5컬럼) + 라이브 스레드
+  (ack 👀 접기·change_request 강조·아티팩트 인라인) + 에이전트 레일(working/awaiting/idle
+  파생). Tauri 브리지: `start_run/stop_run/run_snapshot` 커맨드 + `"run://event"` 펌프 +
+  `TauriEventSource`(스냅샷 복원·last_seq 병합·복원 중 라이브 버퍼링). 브라우저(비 Tauri)
+  에선 MockEventSource가 M3형 랜딩페이지 런 재생.
+- 실측: Rust 워크스페이스 24스위트 + vitest 64/64 + src-tauri core 3케이스 green;
+  브라우저 QA(aside)로 목 런 시작→리워크 뱃지→완료 5/5 전 과정 시각 확인, 콘솔 에러 0
+  — §11 M4 성공 기준("앱만 보고 런 이해 가능") 충족.
+- M4 계약 정본: `archive-20260828-m4a/contracts-m4.md` (EnvelopeAccepted·messages 스키마·
+  RunEvent JSON·**seq 공간 규정(Message.seq=messages 테이블 / BusLifecycle.seq=events 테이블,
+  비교 금지)**·Tauri 커맨드/이벤트 이름·TS 인터페이스).
+
 **미검증**:
-- M4(UI): 스프린트 보드 + 라이브 스레드 + 에이전트 레일
+- 실 CLI를 UI에서 구동(RunMode::RealCli 경로 — 타입·조립만 존재, E2E 미실행)
 - 멀티 스프린트 연속 실행·컨텍스트 압축(M5), Cmd/Browser DoD 실제 실행(M3는 skip 기록만)
+- `cargo tauri dev/build` 실 GUI 구동(검증은 vite dev + 브라우저로 수행)
 
 **환경** (2026-08-27 갱신):
 - `rustup` 설치 완료, `cargo 1.98.0`(`rustc 1.98.0`) 사용 가능
@@ -86,37 +112,35 @@
 - 미설치: `codex`, `gemini`, `grok`, `cursor-agent`, `amp`, `qwen`
 - 이 저장소는 **git init 완료** (`crew/t-docs` 등 태스크 브랜치로 오케스트레이션 진행 중)
 
-**이번 런 진행 상황**: M3 오케스트레이션 런(8태스크, run-id m3a) 완료 — 전부 `main`에
-머지됨(cac9a13). 런 기록(계약·플랜·리뷰·에스컬레이션)은 `archive-20260827-m3a/` 참조.
-특히 `archive-20260827-m3a/contracts-m3.md`가 M3 봉투 body 계약의 정본이었다
-(task.assign body=`{"task": TaskSpec}`, task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
+**이번 런 진행 상황**: M4 오케스트레이션 런(8태스크, run-id m4a) 완료 — 전부 `main`에
+머지됨(530e7e2). 리워크 1라운드(t-shell: 목 타임스탬프를 배달 시점 stamp로 — 브라우저
+QA가 발견). 런 기록은 `archive-20260828-m4a/` 참조. M3 봉투 body 계약 정본은 여전히
+`archive-20260827-m3a/contracts-m3.md` (task.assign body=`{"task": TaskSpec}`,
+task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ---
 
-## 4. 다음 스텝 — M4 UI
+## 4. 다음 스텝 — M5 + 잔여 배선
 
-M1(하네스)·M2(버스+왕복)·M3(Lead 오케스트레이션)는 완료·실측 검증됨(§3). 다음은 M4.
+M1~M4 완료·실측 검증됨(§3). 다음 후보 (DESIGN.md §11 M5 + M4 잔여):
 
-**M4 — UI** (DESIGN.md §11):
-- 스프린트 보드 + 라이브 스레드 + 에이전트 레일 (DAG/타임라인은 그다음).
-- ✅ 성공 기준: 실행 중인 런을 앱만 보고 완전히 이해 가능.
+**M4 잔여 (작은 것부터)**:
+1. **실 CLI를 앱에서 구동**: UI의 scripted=false 경로(RunMode::RealCli) E2E — 코디네이터
+   수동 1회 (레이트리밋 공유, 워커/CI 금지 관행 유지). `cargo tauri dev`로 실 GUI 구동 확인.
+2. **LeadPlanner::specify의 LLM 교체** (DESIGN §4.3 구조화 JSON — 같은 시그니처로 교체).
+3. 코스메틱 백로그: 레일/보드 아바타 이니셜 충돌(PM/Publisher="P", Designer/Developer="D").
+4. DAG 뷰/타임라인 (DESIGN §7 — M4에서 의도적으로 제외).
 
-**M4 착수 전 결정 2건** (§2 미결, DESIGN §12에 추천안 있음): ① 프로젝트 이름
-(`agent-crew`는 가칭) ② Tauri 내부 프론트엔드(React/Svelte/순수 TS).
+**M5 — 스프린트 압축 + 핸드오프 + 멀티 하네스** (DESIGN §11):
+- 로스터 프리셋 UI + 하네스 자동 탐지 + 동시성 세마포어.
+- ✅ 성공 기준: 3스프린트 연속 실행에서 에이전트 컨텍스트가 한계 미만 유지,
+  하네스 강제 교체 후에도 작업 연속성 유지.
+- §5 함정 9번(에스컬레이션 스트랜딩)의 타임아웃/캐스케이드 정책이 M5 선행 과제.
 
-**M4 선행 배선 작업** (테스트에만 존재하는 조립을 앱 코드로 승격):
-1. **런 컨트롤러**: 현재 버스+원장+Lead+5워커 조립은 `crates/crew-lead/tests/m3_sprint.rs`
-   안에만 있다 — 이를 재사용 가능한 런 실행기(크레이트 or `crew-app`)로 추출. Tauri 커맨드가
-   이걸 호출한다.
-2. **UI 데이터 소스**: `crew-ledger`(SQLite, `BusEvent` 원장)와 `BusHandle::subscribe()`
-   브로드캐스트가 라이브 스레드/에이전트 레일의 소스. 원장에는 봉투 kind가 없으므로 UI가
-   메시지 수준 표시를 하려면 원장 스키마 확장(DESIGN §8 방향) 또는 봉투 스트림 병행 구독 필요.
-3. **Tauri 2 셸**: 워크스페이스에 Tauri 앱 크레이트 추가 (§2 스택 결정 준수).
-   `LeadPlanner::specify`의 LLM 교체(§4.3)는 M4 범위 아님 — 결정론 템플릿 그대로 사용.
-
-M3에서 검증된 계약을 그대로 소비할 것: `AgentRunner`/`RoleBehavior`/`BusConn`,
-`LeadBehavior::new(agent_id, dag, sprint, roles, max_rework)`, `EventLedger`/`spawn_subscriber`,
-`RoleHarnessBehavior`(실 CLI), `ScriptedCrewMember`(결정론 테스트).
+**재사용 계약**: M3 계약(§3)에 더해 M4 산출 — `crew_run::RunController/RunHandle/RunEvent`
+(계약: archive-20260828-m4a/contracts-m4.md), `EventLedger::messages_since/messages_in_thread`,
+`BusEvent::EnvelopeAccepted`, 프론트 `RunEventSource`/`useRunStore`/`features/*` 파생 함수.
+재발명 금지.
 
 ---
 
@@ -139,3 +163,11 @@ M3에서 검증된 계약을 그대로 소비할 것: `AgentRunner`/`RoleBehavio
    이 폴백을 제거하지 말 것. 스폰 세션의 훅 완전 차단은 미해결 과제.
 9. 에스컬레이션(`Escalated`)된 태스크의 스프린트 내 후속 태스크는 영구 `Pending`
    (is_done 도달 불가 가능) — M3 수용 결정. 멀티 스프린트(M5)에선 타임아웃/캐스케이드 정책 필요.
+10. **열린 SQLite 원장 밑에서 디렉토리 rename 금지** (M4 결정): SQLite는 저널/WAL을
+    연결 시점 경로 기준으로 만들므로, data_dir 이름을 나중에 run_id로 맞추려는 rename은
+    후속 저널 생성을 깨뜨릴 수 있다. 그래서 §C6는 디렉토리명=launch-id(≠run_id)로 개정됨.
+11. **RunEvent의 seq는 두 공간** (M4 계약): `Message.seq`=messages 테이블,
+    `BusLifecycle.seq`=events 테이블 — 절대 비교 금지. 스냅샷 병합은 messages seq로만.
+12. **일괄 생성 시나리오의 ts는 배달 시점에 stamp** (M4 리워크 1의 교훈): 빌드 시
+    stamp하면 전 이벤트 동일 시각 — 단위 테스트는 통과하고 화면에서만 드러난다.
+    진행성(단조 증가) 단언을 테스트에 넣을 것.
