@@ -142,7 +142,7 @@ fn strip_code_fence(text: &str) -> &str {
 /// for balanced top-level `{...}` substrings — brace matching that ignores
 /// braces inside JSON string values — and returns the first candidate that
 /// parses as a JSON object.
-fn extract_json(text: &str) -> Option<Value> {
+pub fn extract_json(text: &str) -> Option<Value> {
     let stripped = strip_code_fence(text);
 
     if let Ok(value) = serde_json::from_str::<Value>(stripped) {

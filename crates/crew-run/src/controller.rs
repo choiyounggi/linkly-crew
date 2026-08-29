@@ -16,7 +16,8 @@ use crew_bus::{BusConfig, BusEvent as BusLifecycleEvent, BusHandle, BusServer};
 use crew_harness::{AgentCfg as HarnessAgentCfg, Harness, HarnessPool, HarnessRegistry};
 use crew_lead::compress::summarize_sprint;
 use crew_lead::dispatch::{LeadBehavior, TaskState};
-use crew_lead::plan::{LeadPlanner, SprintSlicer};
+use crew_lead::plan::{LeadPlanner, PlanError, SprintSlicer};
+use crew_lead::plan_llm::LlmLeadPlanner;
 use crew_ledger::EventLedger;
 use crew_proto::{handoff_body, Envelope, HandoffPack, MessageKind, Role, Roster, RosterAgent, SpecDoc, TaskDag};
 use tokio::net::TcpListener;
@@ -256,7 +257,24 @@ pub struct RunController;
 
 impl RunController {
     pub async fn start(cfg: RunConfig) -> Result<RunHandle, RunError> {
-        let spec = LeadPlanner::specify(&cfg.goal)?;
+        let spec = match &cfg.mode {
+            RunMode::Scripted { .. } => LeadPlanner::specify(&cfg.goal)?,
+            RunMode::RealCli => {
+                // Lead slot's harness id, falling back to claude-code if the
+                // roster names an id with no adapter (contracts-m5.md §C3c
+                // controller wiring — mirrors spawn_sprint's RealCli branch).
+                let roster = cfg.roster.clone().unwrap_or_else(default_roster);
+                let harness_id = harness_id_for(&roster, "agent:lead");
+                let harness = HarnessRegistry::make(&harness_id)
+                    .or_else(|| HarnessRegistry::make("claude-code"))
+                    .ok_or_else(|| {
+                        PlanError::LlmSpecify(format!(
+                            "no harness adapter for lead harness id \"{harness_id}\" or fallback \"claude-code\""
+                        ))
+                    })?;
+                LlmLeadPlanner::specify(harness, &cfg.goal).await?
+            }
+        };
         let dag = LeadPlanner::plan_dag(&spec)?;
         let effective_max = if cfg.max_per_sprint == 0 {
             dag.tasks.len().max(1)

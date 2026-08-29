@@ -17,6 +17,11 @@ pub enum PlanError {
     InvalidSprintSize,
     #[error(transparent)]
     Dag(#[from] DagError),
+    /// `LlmLeadPlanner::specify` failure (contracts-m5.md §C3c, plan_llm.rs)
+    /// — parse/validation failure or harness error. No silent fallback to
+    /// the deterministic template.
+    #[error("llm specify failed: {0}")]
+    LlmSpecify(String),
 }
 
 /// Turns a one-line request into a [`SpecDoc`] and a 5-role [`TaskDag`].
