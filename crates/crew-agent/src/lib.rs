@@ -1,6 +1,7 @@
 //! crew-agent — WS agent-runner client + role behaviors (DESIGN.md §3/§11 M2).
 
 mod bus;
+mod control;
 mod crew_member;
 mod designer;
 mod harness_behavior;
@@ -9,6 +10,7 @@ mod role;
 mod runner;
 
 pub use bus::{BusConn, BusError, BusEvent};
+pub use control::AgentControl;
 pub use crew_member::ScriptedCrewMember;
 pub use designer::ScriptedDesigner;
 pub use harness_behavior::extract_json;

@@ -2,12 +2,16 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use crew_harness::{AgentCfg, Harness, HarnessEvent, Session, TurnOutcome, UserTurn, DEFAULT_TURN_TIMEOUT};
+use crew_harness::{
+    AgentCfg, HandoffSnapshot, Harness, HarnessEvent, Session, TurnOutcome, UserTurn,
+    DEFAULT_TURN_TIMEOUT,
+};
 use crew_proto::{Envelope, MessageKind};
 use crew_proto::{DodCheck, TaskSpec};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::control::AgentControl;
 use crate::role::RoleBehavior;
 
 const DEADLINE_MS: u64 = 900_000;
@@ -467,6 +471,43 @@ impl RoleBehavior for RoleHarnessBehavior {
 
     fn is_done(&self) -> bool {
         false
+    }
+
+    /// contracts-m6.md §D1: mid-sprint harness swap. Snapshot/shutdown run
+    /// against the *old* harness (before `self.harness` is replaced) —
+    /// either erroring propagates to `ack`, but the session is dropped via
+    /// `self.session.take()` either way (no zombie). Respawn is left to the
+    /// next turn's `ensure_session` (lazy — D5).
+    async fn on_control(&mut self, ctrl: AgentControl) -> Vec<Envelope> {
+        match ctrl {
+            AgentControl::Swap {
+                harness,
+                harness_id,
+                injected_context,
+                ack,
+            } => {
+                let snapshot = match self.session.take() {
+                    Some(session) => {
+                        let snap_result = self.harness.snapshot(&session).await;
+                        let shutdown_result = self.harness.shutdown(session).await;
+                        match (snap_result, shutdown_result) {
+                            (Ok(snap), Ok(())) => Ok(snap),
+                            (Ok(_), Err(e)) => Err(e),
+                            (Err(e), _) => Err(e),
+                        }
+                    }
+                    None => Ok(HandoffSnapshot {
+                        harness: harness_id,
+                        session_id: String::new(),
+                        notes: "no session yet".to_string(),
+                    }),
+                };
+                self.harness = harness;
+                self.injected_context = Some(injected_context);
+                let _ = ack.send(snapshot);
+            }
+        }
+        Vec::new()
     }
 }
 

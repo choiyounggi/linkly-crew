@@ -1,4 +1,5 @@
 use crate::bus::{BusConn, BusError, BusEvent};
+use crate::control::AgentControl;
 use crate::role::RoleBehavior;
 
 /// Bus-level error codes that abort the runner instead of being logged and
@@ -27,7 +28,24 @@ pub enum RunnerError {
 pub struct AgentRunner;
 
 impl AgentRunner {
-    pub async fn run<B>(mut conn: BusConn, mut behavior: B) -> Result<(), RunnerError>
+    /// Wrapper (contracts-m6.md §D1 D10): delegates to `run_with_control`
+    /// with a control channel whose sender is dropped immediately, so the
+    /// ctrl branch is disabled from the first `select!` iteration onward
+    /// (D3) — behavior and signature identical to before the control
+    /// channel existed.
+    pub async fn run<B>(conn: BusConn, behavior: B) -> Result<(), RunnerError>
+    where
+        B: RoleBehavior + Send,
+    {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        Self::run_with_control(conn, behavior, rx).await
+    }
+
+    pub async fn run_with_control<B>(
+        mut conn: BusConn,
+        mut behavior: B,
+        mut ctrl_rx: tokio::sync::mpsc::Receiver<AgentControl>,
+    ) -> Result<(), RunnerError>
     where
         B: RoleBehavior + Send,
     {
@@ -39,6 +57,11 @@ impl AgentRunner {
         }
 
         let mut ticker = behavior.tick_interval().map(tokio::time::interval);
+        // `ctrl_rx.recv()` on a closed channel returns `None` immediately,
+        // which would busy-loop this branch forever once the sender is
+        // dropped — this flag disables it for good the first time that
+        // happens (contracts-m6.md §D1: "종료 사유 아님").
+        let mut ctrl_open = true;
 
         loop {
             tokio::select! {
@@ -78,6 +101,21 @@ impl AgentRunner {
                     }
                     if behavior.is_done() {
                         return Ok(());
+                    }
+                }
+                ctrl = ctrl_rx.recv(), if ctrl_open => {
+                    match ctrl {
+                        Some(c) => {
+                            for reply in behavior.on_control(c).await {
+                                conn.send(reply).await?;
+                            }
+                            if behavior.is_done() {
+                                return Ok(());
+                            }
+                        }
+                        None => {
+                            ctrl_open = false;
+                        }
                     }
                 }
             }
@@ -346,5 +384,99 @@ mod tests {
             recv_rx.try_recv().is_err(),
             "an empty on_tick reply must not produce a second send"
         );
+    }
+
+    /// contracts-m6.md §D1: `run_with_control`'s ctrl branch must actually
+    /// invoke `on_control` and deliver its reply envelopes, while the
+    /// envelope loop keeps running to completion around it (D9 case ①,
+    /// runner level — `CountingBehavior` doesn't override `on_control`, so
+    /// this exercises the default no-op-ack path end to end through the
+    /// select loop, not just the trait method in isolation).
+    #[tokio::test]
+    async fn run_with_control_delivers_ctrl_swap_ack_and_finishes_normally() {
+        let (url, listener) = start_fake_bus().await;
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            send_welcome(&mut ws).await;
+
+            for id in ["msg_1", "msg_2"] {
+                let frame = ServerFrame::Envelope(wire_envelope(id));
+                let text = serde_json::to_string(&frame).unwrap();
+                ws.send(Message::Text(text.into())).await.unwrap();
+                let _ = ws.next().await;
+            }
+        });
+
+        let conn = BusConn::connect(&url, "tok", "agent:pm").await.unwrap();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel(4);
+        let handle = tokio::spawn(AgentRunner::run_with_control(
+            conn,
+            CountingBehavior { remaining: 2 },
+            ctrl_rx,
+        ));
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        let ctrl = AgentControl::Swap {
+            harness: Arc::new(crew_harness::claude::ClaudeCodeHarness::with_binary(
+                "/bin/false",
+            )),
+            harness_id: "harness-new".to_string(),
+            injected_context: "ctx".to_string(),
+            ack: ack_tx,
+        };
+        ctrl_tx.send(ctrl).await.expect("ctrl_rx must still be open");
+
+        let budget = Duration::from_secs(5);
+        let snapshot = tokio::time::timeout(budget, ack_rx)
+            .await
+            .expect("ack must arrive within the budget")
+            .expect("ack sender must not be dropped without sending")
+            .expect("default on_control must ack Ok");
+        assert_eq!(snapshot.notes, "no live session");
+
+        let result = tokio::time::timeout(budget, handle)
+            .await
+            .expect("runner must finish once is_done() flips true")
+            .expect("runner task must not panic");
+        assert!(result.is_ok(), "runner should end cleanly around the ctrl message: {result:?}");
+    }
+
+    /// contracts-m6.md §D1 D3: a closed `ctrl_rx` (sender dropped) is not a
+    /// termination reason — the runner must keep servicing the envelope
+    /// loop to completion (D9 case ③, runner level; `AgentRunner::run`'s
+    /// own regression tests above cover this indirectly via its internal
+    /// channel, but this exercises `run_with_control` directly with an
+    /// externally supplied, externally closed channel).
+    #[tokio::test]
+    async fn run_with_control_survives_a_closed_ctrl_channel() {
+        let (url, listener) = start_fake_bus().await;
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            send_welcome(&mut ws).await;
+
+            for id in ["msg_1", "msg_2"] {
+                let frame = ServerFrame::Envelope(wire_envelope(id));
+                let text = serde_json::to_string(&frame).unwrap();
+                ws.send(Message::Text(text.into())).await.unwrap();
+                let _ = ws.next().await;
+            }
+        });
+
+        let conn = BusConn::connect(&url, "tok", "agent:pm").await.unwrap();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel::<AgentControl>(4);
+        drop(ctrl_tx);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            AgentRunner::run_with_control(conn, CountingBehavior { remaining: 2 }, ctrl_rx),
+        )
+        .await
+        .expect("runner must not hang or busy-loop on a closed ctrl channel");
+
+        assert!(result.is_ok(), "runner should finish normally: {result:?}");
     }
 }
