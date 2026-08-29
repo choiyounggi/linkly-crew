@@ -1,0 +1,66 @@
+.dag-view {
+  height: 100%;
+  min-height: 0;
+}
+
+.dag-view--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+  padding: 1rem;
+}
+
+.dag-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.1rem;
+  min-width: 96px;
+  padding: 0.4rem 0.6rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--text);
+  background: var(--border);
+}
+
+.dag-node--critical {
+  border-width: 3px;
+}
+
+.dag-node--pending {
+  background: var(--border);
+  color: var(--text-dim);
+}
+
+.dag-node--assigned {
+  background: var(--accent);
+  color: #fff;
+}
+
+.dag-node--accepted {
+  background: #3fb950;
+  color: #fff;
+}
+
+.dag-node--escalated,
+.dag-node--blocked {
+  background: var(--danger);
+  color: #fff;
+}
+
+.dag-node__initials {
+  font-weight: 700;
+}
+
+.dag-node__id {
+  font-size: 0.7rem;
+  opacity: 0.85;
+}
+
+.dag-node__state {
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
