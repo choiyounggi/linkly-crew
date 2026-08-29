@@ -1,6 +1,9 @@
 pub mod claude;
 pub mod error;
 pub mod event;
+pub mod opencode;
+pub mod pool;
+pub mod registry;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -15,6 +18,9 @@ use tokio::task::JoinHandle;
 
 pub use error::HarnessError;
 pub use event::{judge_result, HarnessEvent, TurnOutcome};
+pub use opencode::OpencodeHarness;
+pub use pool::{HarnessPool, PoolPermit};
+pub use registry::{AdapterStatus, HarnessInfo, HarnessRegistry};
 
 /// Default turn timeout for [`Harness::send`] callers that don't need a
 /// shorter one (tests inject a short duration explicitly — see D6).
