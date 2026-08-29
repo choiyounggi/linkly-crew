@@ -24,7 +24,8 @@ async fn start_run(
     app: AppHandle,
 ) -> Result<String, String> {
     let data_root = app_runs_root();
-    core::start_run_core(&state, goal, scripted, &data_root, move |event| {
+    let roster_path = core::roster_path();
+    core::start_run_core(&state, goal, scripted, &data_root, &roster_path, move |event| {
         // Best-effort: a closed/gone window means there is nothing left to
         // notify; the pump keeps draining so the run itself is unaffected.
         let _ = app.emit("run://event", &event);
@@ -42,11 +43,53 @@ async fn run_snapshot(state: State<'_, AppState>) -> Result<serde_json::Value, S
     core::run_snapshot_core(&state).await
 }
 
+/// contracts-m5.md §C6 verbatim (t-bridge2).
+#[tauri::command]
+fn detect_harnesses() -> Result<serde_json::Value, String> {
+    core::detect_harnesses_core()
+}
+
+/// contracts-m5.md §C6 verbatim (t-bridge2).
+#[tauri::command]
+fn get_roster() -> Result<serde_json::Value, String> {
+    core::get_roster_core(&core::roster_path())
+}
+
+/// contracts-m5.md §C6 verbatim (t-bridge2).
+#[tauri::command]
+fn set_roster(roster: serde_json::Value) -> Result<(), String> {
+    core::set_roster_core(&core::roster_path(), roster)
+}
+
+/// contracts-m5.md §C6 verbatim (t-bridge2).
+#[tauri::command]
+fn list_presets() -> Result<serde_json::Value, String> {
+    core::list_presets_core()
+}
+
+/// contracts-m5.md §C6 verbatim (t-bridge2): Tauri 2 maps the frontend's
+/// camelCase invoke args (`{ agentId, harness }`, see
+/// `src/lib/tauri-source.ts`) onto these snake_case parameters
+/// automatically — no `#[serde(rename)]` needed.
+#[tauri::command]
+async fn swap_harness(agent_id: String, harness: String, state: State<'_, AppState>) -> Result<(), String> {
+    core::swap_harness_core(&state, &agent_id, &harness).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![start_run, stop_run, run_snapshot])
+        .invoke_handler(tauri::generate_handler![
+            start_run,
+            stop_run,
+            run_snapshot,
+            detect_harnesses,
+            get_roster,
+            set_roster,
+            list_presets,
+            swap_harness
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
