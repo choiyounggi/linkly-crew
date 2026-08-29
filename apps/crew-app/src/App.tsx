@@ -1,20 +1,25 @@
 import { useEffect, useState, type FormEvent } from "react";
 
+import Artifacts from "./features/artifacts";
 import Board from "./features/board";
 import DagView from "./features/dag";
+import Inbox from "./features/inbox";
 import Rail from "./features/rail";
 import RosterPanel from "./features/roster";
+import SearchBox from "./features/search";
 import Thread from "./features/thread";
 import TimelineView from "./features/timeline";
 import { defaultSource, useRunStore } from "./lib/store";
 import "./App.css";
 
-type View = "board" | "dag" | "timeline";
+type View = "board" | "dag" | "timeline" | "inbox" | "artifacts";
 
 const TABS: { key: View; label: string }[] = [
   { key: "board", label: "보드" },
   { key: "dag", label: "DAG" },
   { key: "timeline", label: "타임라인" },
+  { key: "inbox", label: "승인함" },
+  { key: "artifacts", label: "아티팩트" },
 ];
 
 export default function App() {
@@ -47,19 +52,22 @@ export default function App() {
   return (
     <div className="app">
       <header className="command-bar">
-        <form onSubmit={handleSubmit}>
-          <input
-            type="text"
-            value={goalInput}
-            onChange={(e) => setGoalInput(e.target.value)}
-            placeholder="요청을 입력하세요 (예: 간단한 랜딩 페이지)"
-            aria-label="요청"
-          />
-          <button type="submit" disabled={isRunning}>
-            {isRunning ? "실행 중…" : "시작"}
-          </button>
-        </form>
-        {error && <p className="command-bar__error">{error}</p>}
+        <div className="command-bar__main">
+          <form onSubmit={handleSubmit}>
+            <input
+              type="text"
+              value={goalInput}
+              onChange={(e) => setGoalInput(e.target.value)}
+              placeholder="요청을 입력하세요 (예: 간단한 랜딩 페이지)"
+              aria-label="요청"
+            />
+            <button type="submit" disabled={isRunning}>
+              {isRunning ? "실행 중…" : "시작"}
+            </button>
+          </form>
+          {error && <p className="command-bar__error">{error}</p>}
+        </div>
+        <SearchBox />
       </header>
       <nav className="view-tabs" aria-label="뷰 전환">
         {TABS.map((tab) => (
@@ -79,6 +87,8 @@ export default function App() {
         {view === "board" && <Board />}
         {view === "dag" && <DagView />}
         {view === "timeline" && <TimelineView />}
+        {view === "inbox" && <Inbox />}
+        {view === "artifacts" && <Artifacts />}
         <div className="layout__right">
           <Thread />
           <RosterPanel />

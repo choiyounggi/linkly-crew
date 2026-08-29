@@ -62,7 +62,8 @@ export type MessageKind =
   | "answer"
   | "blocked"
   | "handoff"
-  | "human.gate";
+  | "human.gate"
+  | "human.response";
 
 /** Rust `Envelope` — DESIGN.md §3.1. */
 export interface Envelope {

@@ -244,3 +244,37 @@ describe("TauriEventSource — C7a optional roster/harness methods", () => {
     await expect(source.swapHarness!("agent:designer", "opencode")).rejects.toThrow("command swap_harness not found");
   });
 });
+
+describe("TauriEventSource — E8 gate/search methods", () => {
+  it("invokes resolve_gate/search_messages with the C6-style camelCase args and forwards the resolved payload", async () => {
+    const { listen } = fakeListen();
+    const invoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      switch (cmd) {
+        case "resolve_gate":
+          expect(args).toEqual({ taskId: "t-qa", decision: "approve", reason: "재현 확인" });
+          return undefined;
+        case "search_messages":
+          expect(args).toEqual({ query: "handoff" });
+          return [{ seq: 1, envelope: envelope() }];
+        default:
+          throw new Error(`unexpected invoke ${cmd}`);
+      }
+    }) as unknown as Invoke;
+
+    const source = new TauriEventSource(invoke, listen);
+
+    await expect(source.resolveGate!("t-qa", "approve", "재현 확인")).resolves.toBeUndefined();
+    await expect(source.searchMessages!("handoff")).resolves.toEqual([{ seq: 1, envelope: envelope() }]);
+  });
+
+  it("propagates a rejected resolve_gate invoke instead of swallowing the error (boundary: run not found)", async () => {
+    const { listen } = fakeListen();
+    const invoke: Invoke = vi.fn(async () => {
+      throw new Error("run not found");
+    });
+
+    const source = new TauriEventSource(invoke, listen);
+
+    await expect(source.resolveGate!("t-qa", "reject", "반려")).rejects.toThrow("run not found");
+  });
+});
