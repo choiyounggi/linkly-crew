@@ -1,0 +1,66 @@
+.roster__status {
+  margin: 0 0 0.5rem;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+.roster__status--error {
+  color: var(--danger);
+}
+
+.roster__presets {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.roster__presets select {
+  flex: 1;
+}
+
+.roster__slots {
+  list-style: none;
+  margin: 0 0 0.75rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.roster__slot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+}
+
+.roster__slot-role {
+  min-width: 4.5rem;
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+
+.roster__slot-error {
+  flex-basis: 100%;
+  color: var(--danger);
+  font-size: 0.8rem;
+}
+
+.roster__save {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.roster__save-status {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+
+.roster__save-status--error {
+  color: var(--danger);
+}
