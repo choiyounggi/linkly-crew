@@ -1,8 +1,8 @@
 # 세션 인계 — linkly-crew
 
 **한 줄**: 구독 중인 AI CLI들을 역할별 팀원으로 묶어, 요청 한 줄을 팀장 에이전트가
-스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M4 완료·실측 검증**
-(코어 백엔드 + Tauri 2 UI: 스프린트 보드·라이브 스레드·에이전트 레일) — 다음은 **M5**.
+스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M5 완료·실측 검증**
+(멀티 스프린트 + 압축 + 핸드오프/스왑 + 하네스 레지스트리/세마포어 + 로스터 UI + LLM 스펙화) — 다음은 M5 잔여·3단계 후보.
 
 **이름 확정(2026-08-28, 사용자 결정)**: 프로젝트명 **linkly-crew** (구 가칭 agent-crew).
 프론트엔드 **React 19 + Vite** (DESIGN §12.6 추천안 채택).
@@ -100,10 +100,29 @@
   RunEvent JSON·**seq 공간 규정(Message.seq=messages 테이블 / BusLifecycle.seq=events 테이블,
   비교 금지)**·Tauri 커맨드/이벤트 이름·TS 인터페이스).
 
+**검증됨 — M5** (2026-08-29, 실측: 런 m5a, main=b1f7255):
+- 결정론: 멀티 스프린트(SprintSlicer 슬라이스 순차 실행 + 경계마다 `compress::summarize_sprint`
+  요약 ≤16k chars 불변식 + 세션 재시작 + `with_prior_states` 주입) 3스프린트 해피 green;
+  크로스 스프린트 캐스케이드(Escalated→prior Blocked→전이, 2스프린트 건너) green;
+  스왑(`RunHandle::swap_harness` — 로스터 즉시 갱신·handoff 봉투 원장 직접 기록·RosterChanged,
+  실효는 다음 스프린트 경계) 6시나리오 green; 에스컬레이션 타임아웃+캐스케이드(함정 9 해소,
+  timeout=0 기본 비활성) green. 워크스페이스 259 + src-tauri 10 + vitest 94/94 전부 green.
+- 실 CLI(코디네이터 수동): `LlmLeadPlanner::specify` real-`claude` 17.1s 유효 SpecDoc;
+  5역할 실 CLI 스프린트 E2E 193.2s 개입 0회. `cargo tauri dev` 실 GUI 기동·생존 확인.
+- 브라우저 QA(aside, 목 런): 7/7 PASS 콘솔 에러 0 — 3스프린트 재생, designer 배지
+  claude-code→opencode 전환, handoff 메시지, 이니셜 LD/PM/DS/PB/DV/QA 고유, 로스터
+  프리셋 3종(클로드 5인팀/절약 모드/혼합 실험) 라이브 동작.
+- 신규: crew-harness `HandoffSnapshot`/`Harness::snapshot`/`HarnessRegistry`/`HarnessPool`
+  (FIFO+백오프, claude-code=2)/`OpencodeHarness` 스텁, crew-proto `HandoffPack`/`Roster`,
+  crew-lead `compress`/`plan_llm`/`TaskState::Blocked`/on_tick, crew-run 멀티 스프린트
+  컨트롤러+스왑, Tauri 커맨드 5종+`~/.linkly-crew/roster.json`, 프론트 로스터 패널·동적 배지.
+- M5 계약 정본: `archive-20260829-m5a/contracts-m5.md` (RunEvent 3종 추가·TaskStateDto
+  "blocked"·HandoffPack/Roster 스키마·레지스트리/풀 API·Tauri 커맨드·스왑 보정 2건).
+
 **미검증**:
-- 실 CLI를 UI에서 구동(RunMode::RealCli 경로 — 타입·조립만 존재, E2E 미실행)
-- 멀티 스프린트 연속 실행·컨텍스트 압축(M5), Cmd/Browser DoD 실제 실행(M3는 skip 기록만)
-- `cargo tauri dev/build` 실 GUI 구동(검증은 vite dev + 브라우저로 수행)
+- GUI에서 scripted=false 클릭 실행(네이티브 창 — 사람 1클릭 필요; 실 CLI 경로 자체는 위
+  E2E 2건으로 증명됨). mid-sprint 즉시 세션 교체(스왑 실효는 스프린트 경계 — 계약 보정).
+- Cmd/Browser DoD 실제 실행(M3부터 skip 기록만), 멀티 스프린트 real-CLI 전체 런.
 
 **환경** (2026-08-27 갱신):
 - `rustup` 설치 완료, `cargo 1.98.0`(`rustc 1.98.0`) 사용 가능
@@ -112,35 +131,35 @@
 - 미설치: `codex`, `gemini`, `grok`, `cursor-agent`, `amp`, `qwen`
 - 이 저장소는 **git init 완료** (`crew/t-docs` 등 태스크 브랜치로 오케스트레이션 진행 중)
 
-**이번 런 진행 상황**: M4 오케스트레이션 런(8태스크, run-id m4a) 완료 — 전부 `main`에
-머지됨(530e7e2). 리워크 1라운드(t-shell: 목 타임스탬프를 배달 시점 stamp로 — 브라우저
-QA가 발견). 런 기록은 `archive-20260828-m4a/` 참조. M3 봉투 body 계약 정본은 여전히
+**이번 런 진행 상황**: M5 오케스트레이션 런(11태스크, run-id m5a) 완료 — 전부 `main`에
+머지됨(b1f7255). 리워크 0라운드, 플랜 갭 리플랜 2회(t-swap: SPRINT_LABEL 접근·RunError
+스코프 / t-specify-llm: extract_json 재수출 스코프 — 둘 다 코디네이터 플랜 수정으로 해결).
+운영 이슈 1건: 장수 tmux 서버 OAuth 만료(함정 16) → 새 소켓 서버로 전환. 런 기록은
+`archive-20260829-m5a/` 참조. M3 봉투 body 계약 정본은 여전히
 `archive-20260827-m3a/contracts-m3.md` (task.assign body=`{"task": TaskSpec}`,
 task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ---
 
-## 4. 다음 스텝 — M5 + 잔여 배선
+## 4. 다음 스텝 — M5 잔여 + 3단계 후보
 
-M1~M4 완료·실측 검증됨(§3). 다음 후보 (DESIGN.md §11 M5 + M4 잔여):
+M1~M5 완료·실측 검증됨(§3). 다음 후보:
 
-**M4 잔여 (작은 것부터)**:
-1. **실 CLI를 앱에서 구동**: UI의 scripted=false 경로(RunMode::RealCli) E2E — 코디네이터
-   수동 1회 (레이트리밋 공유, 워커/CI 금지 관행 유지). `cargo tauri dev`로 실 GUI 구동 확인.
-2. **LeadPlanner::specify의 LLM 교체** (DESIGN §4.3 구조화 JSON — 같은 시그니처로 교체).
-3. 코스메틱 백로그: 레일/보드 아바타 이니셜 충돌(PM/Publisher="P", Designer/Developer="D").
-4. DAG 뷰/타임라인 (DESIGN §7 — M4에서 의도적으로 제외).
+**M5 잔여 (작은 것부터)**:
+1. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가).
+2. **mid-sprint 즉시 스왑 실효**: 워커 핸들 레지스트리(에이전트별 세션 제어 채널) 도입 후
+   스왑 시 snapshot→shutdown→respawn 즉시 수행 (현재는 다음 스프린트 경계 실효 — 계약 보정).
+3. DAG 뷰/타임라인 (DESIGN §7 — M4·M5에서 의도적으로 제외).
+4. 가변 로스터 인원(플래너가 5역할 DAG 고정이라 프리셋은 배치만 다름 — 계약 C0),
+   적응형 세마포어(§13.1), opencode 실 어댑터.
 
-**M5 — 스프린트 압축 + 핸드오프 + 멀티 하네스** (DESIGN §11):
-- 로스터 프리셋 UI + 하네스 자동 탐지 + 동시성 세마포어.
-- ✅ 성공 기준: 3스프린트 연속 실행에서 에이전트 컨텍스트가 한계 미만 유지,
-  하네스 강제 교체 후에도 작업 연속성 유지.
-- §5 함정 9번(에스컬레이션 스트랜딩)의 타임아웃/캐스케이드 정책이 M5 선행 과제.
+**3단계(DESIGN §11 후순위)**: ed25519 서명, 원격 릴레이, 사람 참여, 모바일.
+그 외: 스폰 세션 훅 차단(함정 8), Cmd/Browser DoD 실제 실행.
 
-**재사용 계약**: M3 계약(§3)에 더해 M4 산출 — `crew_run::RunController/RunHandle/RunEvent`
-(계약: archive-20260828-m4a/contracts-m4.md), `EventLedger::messages_since/messages_in_thread`,
-`BusEvent::EnvelopeAccepted`, 프론트 `RunEventSource`/`useRunStore`/`features/*` 파생 함수.
-재발명 금지.
+**재사용 계약**: M3(archive-20260827-m3a/contracts-m3.md) + M4(archive-20260828-m4a/
+contracts-m4.md) + **M5(archive-20260829-m5a/contracts-m5.md)** — RunEvent 3종 추가,
+TaskStateDto "blocked", HandoffPack/Roster, HarnessRegistry/HarnessPool, LlmLeadPlanner,
+`RunHandle::swap_harness`, Tauri 커맨드 5종, 로스터 패널/동적 배지/이니셜 맵. 재발명 금지.
 
 ---
 
@@ -171,3 +190,16 @@ M1~M4 완료·실측 검증됨(§3). 다음 후보 (DESIGN.md §11 M5 + M4 잔�
 12. **일괄 생성 시나리오의 ts는 배달 시점에 stamp** (M4 리워크 1의 교훈): 빌드 시
     stamp하면 전 이벤트 동일 시각 — 단위 테스트는 통과하고 화면에서만 드러난다.
     진행성(단조 증가) 단언을 테스트에 넣을 것.
+13. **에스컬레이션 캐스케이드는 타임아웃 경유만** (M5 결정): 스프린트 내 Escalated dep은
+    타임아웃 전까지 후속을 Waiting으로 두고, 만료 시(또는 prior_states의 비-Accepted dep)
+    전이적으로 Blocked. timeout=0(기본)이면 M3 동작 그대로. RoleBehavior 틱은 디폴트
+    메서드라 **래퍼(ObservingLead 등)가 tick_interval/on_tick을 위임 안 하면 조용히
+    죽는다** — 새 래퍼를 만들면 반드시 위임 + on_tick 후 diff.
+14. **RosterAgent.role은 문자열** ("lead" 포함 — crew_proto::Role enum엔 Lead가 없다):
+    lead 슬롯 스왑은 HandoffPack(role: Role 타입)을 만들 수 없어 봉투 생략, RosterChanged만.
+15. **RunEvent 추가 시 seq 공간·ts stamp 규칙 승계**: SprintStarted/Finished/RosterChanged엔
+    seq가 없고(비교 대상 아님), handoff 봉투는 원장 직접 append 경유라 Message.seq
+    (messages 공간)를 정상 소비 — 버스로 보내면 "agent:lead" identity 충돌이 난다(계약 C5c 보정).
+16. **오케스트레이션 운영**: 장수 tmux 서버(수일 전 기동)의 워커는 OAuth 갱신이 불가능해
+    "Login expired"로 턴이 즉사할 수 있다 — 새 소켓(`TMUX_TMPDIR`)의 새 tmux 서버로
+    재기동하면 해결 (m5a 런 실측, 코디네이터 셸은 정상인데 tmux 자식만 실패하는 패턴).
