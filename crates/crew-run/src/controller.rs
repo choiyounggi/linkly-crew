@@ -74,6 +74,20 @@ fn role_dir_name(role: Role) -> &'static str {
     }
 }
 
+/// `RealCli` worker cwd (t-swap follow-up fix, coordinator-run real-CLI
+/// spot check): `data_dir/cli-cwd/<role>`, created best-effort — mirroring
+/// `RunController::start`'s own `create_dir_all(&cfg.data_dir)` — because
+/// `Command::current_dir` on a missing directory fails the CLI spawn with
+/// ENOENT ("failed to spawn claude process: No such file or directory"),
+/// which every worker then reports as blocked, and with the default
+/// `escalation_timeout_ms=0` the run hangs forever waiting on a human gate
+/// that never fires.
+fn role_cli_cwd(data_dir: &Path, role: Role) -> std::path::PathBuf {
+    let cwd = data_dir.join("cli-cwd").join(role_dir_name(role));
+    let _ = std::fs::create_dir_all(&cwd);
+    cwd
+}
+
 /// A roster slot's `role` string (`RosterAgent::role`) to `crew_proto::Role`
 /// — `None` for `"lead"` (and anything unrecognized), since that enum has
 /// no `Lead` variant (t-swap plan D3): `swap_harness` skips the handoff
@@ -218,7 +232,7 @@ async fn spawn_sprint(
                     continue;
                 };
                 let harness_cfg = HarnessAgentCfg {
-                    cwd: data_dir.join("cli-cwd").join(role_dir_name(role)),
+                    cwd: role_cli_cwd(data_dir, role),
                 };
                 let system_hint = format!("You are the {role:?} of a crew building: {goal}");
                 let mut behavior = RoleHarnessBehavior::new(harness, harness_cfg, role, system_hint);
@@ -1163,6 +1177,85 @@ mod live_controls_wiring_tests {
         );
 
         handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
+#[cfg(test)]
+mod role_cli_cwd_tests {
+    //! Deterministic regression coverage for the ENOENT bug the coordinator's
+    //! real-CLI spot check found (t-swap follow-up fix): `spawn_sprint`'s
+    //! `RealCli` arm builds `HarnessAgentCfg { cwd: ... }` from a directory
+    //! nothing ever created, so `Command::current_dir` failed every worker's
+    //! CLI spawn with ENOENT. `role_cli_cwd` is a pure filesystem seam — no
+    //! bus/tokio-task/real-CLI-binary needed — so this is a real, fast,
+    //! deterministic test rather than relying solely on the `#[ignore]`
+    //! real-CLI spot check (which also now exercises this fix, since it
+    //! needs the directory to exist to get past spawn at all).
+
+    use super::*;
+
+    fn test_data_dir(label: &str) -> std::path::PathBuf {
+        std::env::current_dir()
+            .unwrap()
+            .join(".crew-test")
+            .join(format!("{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Normal: the directory doesn't exist beforehand (mirrors a fresh run's
+    /// `data_dir`) — `role_cli_cwd` must create it and return the same path
+    /// `Command::current_dir` would need.
+    #[test]
+    fn creates_the_role_directory_when_it_does_not_exist() {
+        let data_dir = test_data_dir("cli-cwd-fresh");
+        assert!(!data_dir.exists(), "test setup: data_dir must not pre-exist");
+
+        let cwd = role_cli_cwd(&data_dir, Role::Designer);
+
+        assert_eq!(cwd, data_dir.join("cli-cwd").join("designer"));
+        assert!(cwd.is_dir(), "the role cwd must exist as a directory after role_cli_cwd: {cwd:?}");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Boundary: calling it again for the same role (e.g. a second sprint's
+    /// `spawn_sprint`) against an already-existing directory must not error
+    /// or disturb its contents — `create_dir_all` is idempotent, but this
+    /// pins that `role_cli_cwd` doesn't wrap it in anything that isn't.
+    #[test]
+    fn is_idempotent_and_preserves_existing_contents() {
+        let data_dir = test_data_dir("cli-cwd-idempotent");
+        let cwd = role_cli_cwd(&data_dir, Role::Qa);
+        std::fs::write(cwd.join("marker.txt"), b"sprint-0").expect("must be able to write into the created cwd");
+
+        let cwd_again = role_cli_cwd(&data_dir, Role::Qa);
+
+        assert_eq!(cwd, cwd_again);
+        assert!(cwd_again.is_dir(), "the directory must still exist: {cwd_again:?}");
+        let marker = std::fs::read_to_string(cwd_again.join("marker.txt")).expect("earlier sprint's file must survive a repeat call");
+        assert_eq!(marker, "sprint-0");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Error path: `create_dir_all` cannot create a directory *through* a
+    /// path component that is itself a regular file — `role_cli_cwd`'s
+    /// best-effort `let _ =` must not panic, and must return the intended
+    /// path regardless (the caller then hits the same pre-fix ENOENT from
+    /// the CLI spawn, not a panic from this helper — the whole point of
+    /// "best-effort" is that this failure surfaces at the harness spawn,
+    /// which already has real error handling, rather than here).
+    #[test]
+    fn does_not_panic_when_a_path_component_is_a_regular_file() {
+        let data_dir = test_data_dir("cli-cwd-blocked");
+        std::fs::create_dir_all(&data_dir).expect("test setup");
+        std::fs::write(data_dir.join("cli-cwd"), b"not a directory").expect("test setup: block the cli-cwd path segment");
+
+        let cwd = role_cli_cwd(&data_dir, Role::Publisher);
+
+        assert_eq!(cwd, data_dir.join("cli-cwd").join("publisher"));
+        assert!(!cwd.is_dir(), "creation must have failed silently (best-effort), not been magically satisfied: {cwd:?}");
+
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 }
