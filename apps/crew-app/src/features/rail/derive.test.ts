@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createRunStore } from "../../lib/store";
 import { MockEventSource } from "../../lib/mock-source";
-import type { Envelope, MessageKind, TaskDag } from "../../lib/types";
-import { deriveRail } from "./derive";
+import type { Envelope, MessageKind, RosterAgentDto, TaskDag } from "../../lib/types";
+import { AVATAR_INITIALS, avatarInitials, deriveRail } from "./derive";
 
 const TASK_A = {
   id: "t-a",
@@ -63,7 +63,7 @@ describe("deriveRail — normal: assign -> working -> result -> awaiting -> acce
       role: "designer",
       status: "working",
       currentTaskId: "t-a",
-      harness: "claude",
+      harness: "claude-code",
     });
   });
 
@@ -134,13 +134,15 @@ describe("deriveRail — boundary: empty messages / dag null / body shape mismat
     for (const card of cards) {
       expect(card.status).toBe("idle");
       expect(card.currentTaskId).toBeNull();
-      expect(card.harness).toBe("claude");
+      expect(card.harness).toBe("claude-code");
     }
   });
 
   it("returns just the lead card with no crash when dag is null (pre-run)", () => {
     const cards = deriveRail(null, {}, [], null, null);
-    expect(cards).toEqual([{ id: "lead", role: "lead", status: "idle", currentTaskId: null, harness: "claude" }]);
+    expect(cards).toEqual([
+      { id: "lead", role: "lead", status: "idle", currentTaskId: null, harness: "claude-code" },
+    ]);
   });
 
   it("ignores a task.assign whose body doesn't match the {task:{id}} shape", () => {
@@ -156,6 +158,65 @@ describe("deriveRail — boundary: empty messages / dag null / body shape mismat
   it("lists every role appearing in dag.tasks and the lead, in a stable order", () => {
     const cards = deriveRail(DAG, {}, [], null, null);
     expect(cards.map((c) => c.role)).toEqual(["lead", "designer", "developer"]);
+  });
+});
+
+describe("deriveRail — C7c avatar initials: 6 roles map to distinct 2-letter initials", () => {
+  it("has exactly 6 entries with no duplicate values (lead/pm/designer/publisher/developer/qa)", () => {
+    expect(Object.keys(AVATAR_INITIALS)).toHaveLength(6);
+    expect(new Set(Object.values(AVATAR_INITIALS)).size).toBe(6);
+    expect(AVATAR_INITIALS).toEqual({
+      lead: "LD",
+      pm: "PM",
+      designer: "DS",
+      publisher: "PB",
+      developer: "DV",
+      qa: "QA",
+    });
+  });
+
+  it("falls back to the uppercased first 2 chars for a role not in the map", () => {
+    expect(avatarInitials("scout")).toBe("SC");
+  });
+});
+
+describe("deriveRail — C7c roster harness: normal / fallback / swap", () => {
+  const roster: RosterAgentDto[] = [
+    { id: "agent:lead", role: "lead", harness: "claude-code", model: "m" },
+    { id: "agent:designer", role: "designer", harness: "opencode", model: "m" },
+    { id: "agent:developer", role: "developer", harness: "claude-code", model: "m" },
+  ];
+
+  it("fills harness from the matching roster entry's role (normal)", () => {
+    const messages = [assignMsg(1, "t-a", ["agent:designer"])];
+    const cards = deriveRail(DAG, { "t-a": "assigned" }, messages, "run_1", null, roster);
+    expect(cards.find((c) => c.role === "designer")?.harness).toBe("opencode");
+    expect(cards.find((c) => c.role === "lead")?.harness).toBe("claude-code");
+  });
+
+  it('falls back to "claude-code" when roster is empty', () => {
+    const messages = [assignMsg(1, "t-a", ["agent:designer"])];
+    const cards = deriveRail(DAG, { "t-a": "assigned" }, messages, "run_1", null, []);
+    for (const card of cards) {
+      expect(card.harness).toBe("claude-code");
+    }
+  });
+
+  it('falls back to "claude-code" for a role with no matching roster entry', () => {
+    const messages = [assignMsg(1, "t-b", ["agent:developer"])];
+    const noDeveloperRoster = roster.filter((a) => a.role !== "developer");
+    const cards = deriveRail(DAG, { "t-b": "assigned" }, messages, "run_1", null, noDeveloperRoster);
+    expect(cards.find((c) => c.role === "developer")?.harness).toBe("claude-code");
+  });
+
+  it("reflects a roster swap (roster_changed) on re-derivation without a re-render trick", () => {
+    const messages = [assignMsg(1, "t-a", ["agent:designer"])];
+    const before = deriveRail(DAG, { "t-a": "assigned" }, messages, "run_1", null, roster);
+    expect(before.find((c) => c.role === "designer")?.harness).toBe("opencode");
+
+    const swappedRoster = roster.map((a) => (a.role === "designer" ? { ...a, harness: "gemini-cli" } : a));
+    const after = deriveRail(DAG, { "t-a": "assigned" }, messages, "run_1", null, swappedRoster);
+    expect(after.find((c) => c.role === "designer")?.harness).toBe("gemini-cli");
   });
 });
 

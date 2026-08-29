@@ -63,6 +63,14 @@
   flex-shrink: 0;
 }
 
+.board-card__block-label {
+  color: var(--danger);
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  flex-shrink: 0;
+}
+
 .board-avatar {
   flex-shrink: 0;
   display: inline-flex;
