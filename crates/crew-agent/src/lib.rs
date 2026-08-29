@@ -11,6 +11,7 @@ mod runner;
 pub use bus::{BusConn, BusError, BusEvent};
 pub use crew_member::ScriptedCrewMember;
 pub use designer::ScriptedDesigner;
+pub use harness_behavior::extract_json;
 pub use harness_behavior::DesignerHarnessBehavior;
 pub use harness_behavior::RoleHarnessBehavior;
 pub use pm::{PmState, ScriptedPm};
