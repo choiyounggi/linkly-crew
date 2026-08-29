@@ -32,3 +32,25 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "시작" })).not.toBeDisabled();
   });
 });
+
+describe("App — tab switching (plan D1/D2)", () => {
+  it("shows the board by default", () => {
+    render(<App />);
+    expect(screen.getByLabelText("스프린트 보드")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "보드" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("switches to the DAG stub when the DAG tab is clicked", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "DAG" }));
+    expect(screen.getByText("DAG 뷰 준비 중")).toBeInTheDocument();
+    expect(screen.queryByLabelText("스프린트 보드")).not.toBeInTheDocument();
+  });
+
+  it("switches to the timeline stub when the timeline tab is clicked", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "타임라인" }));
+    expect(screen.getByText("타임라인 준비 중")).toBeInTheDocument();
+    expect(screen.queryByLabelText("스프린트 보드")).not.toBeInTheDocument();
+  });
+});

@@ -47,6 +47,30 @@
   font-size: 0.85rem;
 }
 
+.view-tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-panel);
+  padding: 0.5rem 1rem 0;
+}
+
+.view-tabs__button {
+  background: transparent;
+  color: var(--text-dim);
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.view-tabs__button--active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
 .layout {
   display: grid;
   grid-template-columns: 240px 1fr 360px;
