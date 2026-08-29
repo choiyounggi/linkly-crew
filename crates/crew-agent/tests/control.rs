@@ -22,7 +22,8 @@ use async_trait::async_trait;
 use crew_agent::{AgentControl, RoleBehavior, RoleHarnessBehavior};
 use crew_harness::claude::ClaudeCodeHarness;
 use crew_harness::{
-    AgentCfg, HandoffSnapshot, Harness, HarnessError, HarnessEvent, Session, TurnOutcome, UserTurn,
+    AgentCfg, HandoffSnapshot, Harness, HarnessError, HarnessEvent, HarnessPool, Session, TurnOutcome,
+    UserTurn,
 };
 use crew_proto::{ArtifactContract, DodCheck, Envelope, MessageKind, ReqId, Role, TaskSpec};
 use serde_json::json;
@@ -376,4 +377,80 @@ async fn swap_with_no_session_yet_acks_ok_without_touching_any_harness() {
     let replies = behavior.on_envelope(task_assign(&task)).await;
     assert_eq!(replies[1].kind, MessageKind::TaskResult);
     assert_eq!(replies[1].body["covered_req_ids"], json!(["NEW"]));
+}
+
+// ---------------------------------------------------------------------
+// Case (4) with_pool (contracts-m6.md §D2d): the actual CLI-interaction
+// span of each turn is gated on a `HarnessPool` permit, held only for that
+// span — not the whole behavior's lifetime (the M5 deadlock this fixes) —
+// so a second behavior sharing the same limit-1 bucket genuinely blocks
+// while the first's turn is in flight, and unblocks once it ends.
+// ---------------------------------------------------------------------
+
+fn slow_harness(session_id: &str, sleep_seconds: &str) -> Arc<dyn Harness> {
+    let text = r#"{"covered_req_ids": ["SLOW"], "artifacts": []}"#;
+    Arc::new(
+        ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+            .with_env("FAKE_MODE", "slow")
+            .with_env("FAKE_SESSION_ID", session_id)
+            .with_env("FAKE_SLEEP_SECONDS", sleep_seconds)
+            .with_env("FAKE_ASSISTANT_1", assistant_line(text)),
+    )
+}
+
+#[tokio::test]
+async fn with_pool_serializes_turns_under_a_limit_1_bucket_without_deadlock() {
+    let pool = HarnessPool::new(std::collections::HashMap::from([("claude-code".to_string(), 1)]));
+
+    let mut behavior_slow = RoleHarnessBehavior::new(
+        slow_harness("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "0.3"),
+        agent_cfg(),
+        Role::Developer,
+        "You are the Developer.".to_string(),
+    )
+    .with_pool(pool.clone(), "claude-code".to_string());
+
+    let mut behavior_fast = RoleHarnessBehavior::new(
+        harness_with("ffffffff-ffff-4fff-8fff-ffffffffffff", "FAST"),
+        agent_cfg(),
+        Role::Developer,
+        "You are the Developer.".to_string(),
+    )
+    .with_pool(pool.clone(), "claude-code".to_string());
+
+    let task = make_task_spec();
+    let assign_slow = task_assign(&task);
+    let assign_fast = task_assign(&task);
+
+    let slow_task = tokio::spawn(async move { behavior_slow.on_envelope(assign_slow).await });
+    // Give the slow turn a chance to actually acquire the pool's only
+    // permit (its ensure_session spawn) before the fast turn is spawned.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let fast_task = tokio::spawn(async move { behavior_fast.on_envelope(assign_fast).await });
+    // The fast turn must still be blocked on `pool.acquire` while the slow
+    // turn holds the only permit — under the old M5 bug (permit held for
+    // the whole runner lifetime), this would never unblock at all.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !fast_task.is_finished(),
+        "fast turn must be blocked on the pool while the slow turn holds the only permit"
+    );
+
+    let slow_replies = tokio::time::timeout(Duration::from_secs(5), slow_task)
+        .await
+        .expect("slow turn must not deadlock")
+        .expect("slow turn task must not panic");
+    assert_eq!(slow_replies[1].kind, MessageKind::TaskResult);
+    assert_eq!(slow_replies[1].body["covered_req_ids"], json!(["SLOW"]));
+
+    // Once the slow turn's permit is released (turn ended), the fast turn
+    // must complete promptly — proving the permit is returned between
+    // turns, not held indefinitely.
+    let fast_replies = tokio::time::timeout(Duration::from_secs(5), fast_task)
+        .await
+        .expect("fast turn must complete once the slow turn releases its permit")
+        .expect("fast turn task must not panic");
+    assert_eq!(fast_replies[1].kind, MessageKind::TaskResult);
+    assert_eq!(fast_replies[1].body["covered_req_ids"], json!(["FAST"]));
 }
