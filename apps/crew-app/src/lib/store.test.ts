@@ -85,6 +85,7 @@ describe("RunState.applyEvent — boundary: empty snapshot", () => {
     expect(s.sprintIndex).toBeNull();
     expect(s.sprintSummaries).toEqual([]);
     expect(s.roster).toEqual([]);
+    expect(s.sprintWindows).toEqual([]);
   });
 });
 
@@ -177,6 +178,51 @@ describe("RunState.applyEvent — sprint/roster events (plan D2)", () => {
     expect(s.sprintIndex).toBeNull();
     expect(s.sprintSummaries).toEqual([]);
     expect(s.roster).toEqual([]);
+  });
+});
+
+describe("RunState.applyEvent — sprintWindows (plan D3/D4)", () => {
+  it("creates a window with endTs=null on sprint_started", () => {
+    const store = createRunStore(fakeSource());
+    store.getState().applyEvent({ type: "sprint_started", index: 1, task_ids: ["t-pm"], ts: "t1" });
+    expect(store.getState().sprintWindows).toEqual([{ index: 1, startTs: "t1", endTs: null }]);
+  });
+
+  it("sets endTs on sprint_finished for an existing window", () => {
+    const store = createRunStore(fakeSource());
+    store.getState().applyEvent({ type: "sprint_started", index: 1, task_ids: ["t-pm"], ts: "t1" });
+    store.getState().applyEvent({ type: "sprint_finished", index: 1, summary: "완료", ts: "t2" });
+    expect(store.getState().sprintWindows).toEqual([{ index: 1, startTs: "t1", endTs: "t2" }]);
+  });
+
+  it("is idempotent: re-applying the same sprint_started/sprint_finished pair yields the same state", () => {
+    const store = createRunStore(fakeSource());
+    const started: RunEvent = { type: "sprint_started", index: 1, task_ids: ["t-pm"], ts: "t1" };
+    const finished: RunEvent = { type: "sprint_finished", index: 1, summary: "완료", ts: "t2" };
+
+    store.getState().applyEvent(started);
+    store.getState().applyEvent(finished);
+    const after1 = store.getState().sprintWindows;
+
+    store.getState().applyEvent(started);
+    store.getState().applyEvent(finished);
+    const after2 = store.getState().sprintWindows;
+
+    expect(after2).toEqual(after1);
+    expect(after2).toEqual([{ index: 1, startTs: "t1", endTs: "t2" }]);
+  });
+
+  it("boundary: sprint_finished with no prior sprint_started creates a window with startTs=endTs", () => {
+    const store = createRunStore(fakeSource());
+    store.getState().applyEvent({ type: "sprint_finished", index: 3, summary: "요약", ts: "t5" });
+    expect(store.getState().sprintWindows).toEqual([{ index: 3, startTs: "t5", endTs: "t5" }]);
+  });
+
+  it("resets sprintWindows on a new run_started", () => {
+    const store = createRunStore(fakeSource());
+    store.getState().applyEvent({ type: "sprint_started", index: 1, task_ids: [], ts: "t1" });
+    store.getState().applyEvent(runStarted);
+    expect(store.getState().sprintWindows).toEqual([]);
   });
 });
 

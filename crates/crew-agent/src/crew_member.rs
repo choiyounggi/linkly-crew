@@ -426,4 +426,32 @@ mod tests {
         let member = ScriptedCrewMember::new("agent:worker", Role::Qa, vec![]);
         assert!(!member.is_done());
     }
+
+    #[tokio::test]
+    async fn default_on_control_no_op_acks_a_sessionless_behavior() {
+        // contracts-m6.md §D1: a behavior with no live session (ScriptedCrewMember
+        // doesn't override on_control) must ack Ok with "no live session" and
+        // reply with no envelopes, rather than erroring or panicking.
+        let mut member = ScriptedCrewMember::new("agent:worker", Role::Pm, vec![]);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let ctrl = crate::AgentControl::Swap {
+            harness: std::sync::Arc::new(crew_harness::claude::ClaudeCodeHarness::with_binary(
+                "/bin/false",
+            )),
+            harness_id: "harness-new".to_string(),
+            injected_context: "ctx".to_string(),
+            ack: tx,
+        };
+
+        let replies = member.on_control(ctrl).await;
+
+        assert!(replies.is_empty(), "default on_control must not emit envelopes");
+        let snapshot = rx
+            .await
+            .expect("ack sender must not be dropped without sending")
+            .expect("default on_control must ack Ok");
+        assert_eq!(snapshot.harness, "harness-new");
+        assert_eq!(snapshot.session_id, "");
+        assert_eq!(snapshot.notes, "no live session");
+    }
 }

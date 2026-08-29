@@ -65,4 +65,13 @@ pub enum RunError {
     /// event is emitted when this is returned.
     #[error("swap rejected: {0}")]
     SwapRejected(String),
+    /// `RunHandle::swap_harness` step 3 (mid-sprint immediate effectuation,
+    /// contracts-m6.md §D2b, t-swap plan D4) failed to reach the live
+    /// worker: send failure, ack timeout, worker-dropped ack, or a harness
+    /// error from the swap itself. The roster mutation, handoff envelope,
+    /// and `RosterChanged` from steps 1-2 are unaffected — this only means
+    /// the swap falls back to taking effect at the next sprint boundary
+    /// (M5 semantics), not that it failed outright.
+    #[error("swap incomplete, falls back to next sprint boundary: {0}")]
+    SwapIncomplete(String),
 }

@@ -38,6 +38,14 @@ while IFS= read -r _turn_line; do
     turn_error)
       printf '{"type":"result","subtype":"success","is_error":true,"terminal_reason":"api_error","session_id":"%s","error":"forced failure"}\n' "$session_id"
       ;;
+    slow)
+      # M6 t-ctrl D2d pool test: sleeps before replying like `json`, so a
+      # test can observe another turn genuinely blocked on the pool's
+      # permit for this turn's whole duration (not just a race).
+      sleep "${FAKE_SLEEP_SECONDS:-0.3}"
+      printf '%s\n' "$FAKE_ASSISTANT_1"
+      result_line
+      ;;
     *)
       echo "fake-role-claude.sh: unknown FAKE_MODE '$mode'" >&2
       exit 1

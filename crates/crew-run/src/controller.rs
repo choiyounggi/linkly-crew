@@ -10,10 +10,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use crew_agent::{AgentRunner, BusConn, RoleHarnessBehavior, RunnerError, ScriptedCrewMember};
+use crew_agent::{AgentControl, AgentRunner, BusConn, RoleHarnessBehavior, RunnerError, ScriptedCrewMember};
 use crew_bus::{BusConfig, BusEvent as BusLifecycleEvent, BusHandle, BusServer};
-use crew_harness::{AgentCfg as HarnessAgentCfg, Harness, HarnessPool, HarnessRegistry};
+use crew_harness::{AgentCfg as HarnessAgentCfg, HandoffSnapshot, Harness, HarnessPool, HarnessRegistry};
 use crew_lead::compress::summarize_sprint;
 use crew_lead::dispatch::{LeadBehavior, TaskState};
 use crew_lead::plan::{LeadPlanner, PlanError, SprintSlicer};
@@ -29,6 +30,15 @@ use crate::events::{now_ts, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot
 use crate::observe::{ObservingLead, TaskStateChange};
 
 const CHANNEL_CAPACITY: usize = 256;
+
+/// `RunHandle::swap_harness` step 3's ack wait (contracts-m6.md §D2b,
+/// 2026-08-29 보정: the control channel is only serviced *between* turns —
+/// t-ctrl's `run_with_control` select loop — so a mid-turn swap's ack waits
+/// for the current turn to finish. Real CLI turns measured 17-193s (m5a
+/// E2E), so a short timeout would misreport a normal in-flight turn as
+/// `SwapIncomplete`. Deterministic tests ack immediately regardless of this
+/// value.
+pub(crate) const SWAP_ACK_TIMEOUT_MS: u64 = 120_000;
 
 /// L1 assembly budget for `summarize_sprint` (contracts-m5.md §C5a plan
 /// D6) — ≈4k tokens, per backend/common/llm/context-window-budget.md's
@@ -62,6 +72,20 @@ fn role_dir_name(role: Role) -> &'static str {
         Role::Developer => "developer",
         Role::Qa => "qa",
     }
+}
+
+/// `RealCli` worker cwd (t-swap follow-up fix, coordinator-run real-CLI
+/// spot check): `data_dir/cli-cwd/<role>`, created best-effort — mirroring
+/// `RunController::start`'s own `create_dir_all(&cfg.data_dir)` — because
+/// `Command::current_dir` on a missing directory fails the CLI spawn with
+/// ENOENT ("failed to spawn claude process: No such file or directory"),
+/// which every worker then reports as blocked, and with the default
+/// `escalation_timeout_ms=0` the run hangs forever waiting on a human gate
+/// that never fires.
+fn role_cli_cwd(data_dir: &Path, role: Role) -> std::path::PathBuf {
+    let cwd = data_dir.join("cli-cwd").join(role_dir_name(role));
+    let _ = std::fs::create_dir_all(&cwd);
+    cwd
 }
 
 /// A roster slot's `role` string (`RosterAgent::role`) to `crew_proto::Role`
@@ -141,10 +165,14 @@ struct SnapshotState {
     last_seq: i64,
 }
 
-/// One sprint's just-spawned workers/lead (plan D1/D5/D6).
+/// One sprint's just-spawned workers/lead (plan D1/D5/D6), plus this
+/// sprint's worker control-channel registry (t-swap plan D1/D2:
+/// `agent_id` -> the `mpsc::Sender` `AgentRunner::run_with_control` reads
+/// from — lead is never a key here, contracts-m6.md §D2a).
 struct SpawnedSprint {
     worker_aborts: Vec<AbortHandle>,
     lead_task: JoinHandle<Result<(), RunnerError>>,
+    controls: HashMap<String, mpsc::Sender<AgentControl>>,
 }
 
 /// Connects this sprint's five workers plus its `ObservingLead`-wrapped
@@ -172,8 +200,14 @@ async fn spawn_sprint(
     ts_tx: mpsc::UnboundedSender<TaskStateChange>,
 ) -> Result<SpawnedSprint, RunError> {
     let mut worker_aborts = Vec::new();
+    let mut controls: HashMap<String, mpsc::Sender<AgentControl>> = HashMap::new();
     for (agent_id, role) in roles_all() {
         let conn = BusConn::connect(url, token, agent_id).await?;
+        // Every worker (Scripted included, plan D3) gets a control channel
+        // so `swap_harness` step 3 has a real send target to test against;
+        // the default `RoleBehavior::on_control` no-op-acks for behaviors
+        // with no live session.
+        let (ctrl_tx, ctrl_rx) = mpsc::channel::<AgentControl>(4);
         match mode {
             RunMode::Scripted { planted_violations } => {
                 let planted = planted_violations
@@ -182,8 +216,9 @@ async fn spawn_sprint(
                     .map(|(_, v)| v.clone())
                     .unwrap_or_default();
                 let member = ScriptedCrewMember::new(agent_id, role, planted);
-                let task = tokio::spawn(AgentRunner::run(conn, member));
+                let task = tokio::spawn(AgentRunner::run_with_control(conn, member, ctrl_rx));
                 worker_aborts.push(task.abort_handle());
+                controls.insert(agent_id.to_string(), ctrl_tx);
             }
             RunMode::RealCli => {
                 let harness_id = harness_id_for(roster, agent_id);
@@ -197,20 +232,25 @@ async fn spawn_sprint(
                     continue;
                 };
                 let harness_cfg = HarnessAgentCfg {
-                    cwd: data_dir.join("cli-cwd").join(role_dir_name(role)),
+                    cwd: role_cli_cwd(data_dir, role),
                 };
                 let system_hint = format!("You are the {role:?} of a crew building: {goal}");
-                let mut behavior = RoleHarnessBehavior::new(harness, harness_cfg, role, system_hint);
+                // Permit is scoped to each CLI interaction (turn), not the
+                // runner's lifetime (contracts-m6.md §D2d) — a runner-
+                // lifetime `pool.acquire` plus `RoleHarnessBehavior`'s
+                // never-`is_done()` loop meant only `claude-code`'s default
+                // limit-2 workers could ever start their bus loop, so the
+                // 3rd `task.assign` onward hung forever (real-CLI spot
+                // check). `with_pool` acquires/drops the permit around each
+                // turn's spawn+send instead.
+                let mut behavior = RoleHarnessBehavior::new(harness, harness_cfg, role, system_hint)
+                    .with_pool(pool.clone(), harness_id.clone());
                 if let Some(text) = l1 {
                     behavior = behavior.with_injected_context(text.to_string());
                 }
-                let pool = pool.clone();
-                let acquire_id = harness_id.clone();
-                let task = tokio::spawn(async move {
-                    let _permit = pool.acquire(&acquire_id).await;
-                    AgentRunner::run(conn, behavior).await
-                });
+                let task = tokio::spawn(AgentRunner::run_with_control(conn, behavior, ctrl_rx));
                 worker_aborts.push(task.abort_handle());
+                controls.insert(agent_id.to_string(), ctrl_tx);
             }
         }
     }
@@ -227,9 +267,11 @@ async fn spawn_sprint(
     .with_prior_states(prior_states)
     .escalation_timeout_ms(escalation_timeout_ms);
     let observing = ObservingLead::new(lead_behavior, sprint_tasks.to_vec(), ts_tx, cumulative);
+    // Lead never gets a control channel (contracts-m6.md §D2a, plan D2/plan
+    // D6, pitfall 14) — lead swaps stay M5 boundary-only via `AgentRunner::run`.
     let lead_task = tokio::spawn(AgentRunner::run(lead_conn, observing));
 
-    Ok(SpawnedSprint { worker_aborts, lead_task })
+    Ok(SpawnedSprint { worker_aborts, lead_task, controls })
 }
 
 /// The abort handles for whichever sprint's workers/lead are currently
@@ -240,6 +282,15 @@ async fn spawn_sprint(
 struct LiveHandles {
     worker_aborts: Vec<AbortHandle>,
     lead_abort: AbortHandle,
+    /// This sprint's worker control-channel registry (t-swap plan D1) —
+    /// `swap_harness` step 3 reads this to reach a live worker immediately.
+    /// Cleared (not just left stale) the moment this sprint's workers are
+    /// aborted, before the next sprint's `spawn_sprint` has produced a
+    /// fresh map: a sender whose receiving task was just aborted would
+    /// otherwise still be present here, and sending to it races the
+    /// runtime's cancellation instead of cleanly falling back to the
+    /// sender-absent path (contracts-m6.md §D2b step 3's "sender 부재" case).
+    controls: HashMap<String, mpsc::Sender<AgentControl>>,
 }
 
 /// Drains the subscription loop's already-buffered bus-event backlog
@@ -328,6 +379,12 @@ impl RunController {
         // `roster` in (t-swap plan D1) — `RunHandle::swap_harness` needs its
         // own handle on the same `Arc<Mutex<Roster>>` the sprint loop reads.
         let roster_for_handle = roster.clone();
+        // Every sprint's summary text, in order (t-swap plan D7) —
+        // `swap_harness` step 3 assembles the same L1 injected-context text
+        // sprint boundaries inject (`l1_context`), which needs this list;
+        // it isn't otherwise reachable from `RunHandle`.
+        let shared_summaries: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let summaries_for_handle = shared_summaries.clone();
 
         // Best-effort: if this fails, `EventLedger::open` below fails for
         // the same reason and surfaces as `RunError::Ledger`.
@@ -393,6 +450,7 @@ impl RunController {
         let live = Arc::new(Mutex::new(LiveHandles {
             worker_aborts: spawned0.worker_aborts.clone(),
             lead_abort: spawned0.lead_task.abort_handle(),
+            controls: spawned0.controls.clone(),
         }));
 
         // Controller is the single `RunEvent` emission point (plan D4):
@@ -406,6 +464,7 @@ impl RunController {
         let max_rework = cfg.max_rework;
         let escalation_timeout_ms = cfg.escalation_timeout_ms;
         let finisher_live = live.clone();
+        let finisher_shared_summaries = shared_summaries.clone();
         let finisher: JoinHandle<RunOutcomeDto> = tokio::spawn(async move {
             let mut current_worker_aborts = spawned0.worker_aborts;
             let mut current_lead_task = spawned0.lead_task;
@@ -445,6 +504,7 @@ impl RunController {
                             *finisher_live.lock().expect("live handles mutex poisoned") = LiveHandles {
                                 worker_aborts: spawned.worker_aborts.clone(),
                                 lead_abort: spawned.lead_task.abort_handle(),
+                                controls: spawned.controls,
                             };
                             current_worker_aborts = spawned.worker_aborts;
                             current_lead_task = spawned.lead_task;
@@ -461,6 +521,17 @@ impl RunController {
                 for handle in &current_worker_aborts {
                     handle.abort();
                 }
+                // These workers are gone the instant they're aborted (t-swap
+                // plan D1/D6) — clear their control senders now rather than
+                // leaving them until the next sprint's spawn overwrites
+                // `finisher_live` wholesale, so a `swap_harness` call landing
+                // in this boundary window sees "sender absent" (§D2b step 3
+                // Ok fallback) instead of racing the aborted task's teardown.
+                finisher_live
+                    .lock()
+                    .expect("live handles mutex poisoned")
+                    .controls
+                    .clear();
 
                 drain_subscription_backlog(&drain_tx).await;
 
@@ -477,6 +548,10 @@ impl RunController {
                     L1_BUDGET_CHARS,
                 );
                 summaries.push(summary.text.clone());
+                finisher_shared_summaries
+                    .lock()
+                    .expect("summaries mutex poisoned")
+                    .push(summary.text.clone());
                 let _ = finisher_run_tx.send(RunEvent::SprintFinished {
                     index: index as u32,
                     summary: summary.text,
@@ -519,6 +594,7 @@ impl RunController {
             finisher: Some(finisher),
             joined_outcome: None,
             roster: roster_for_handle,
+            summaries: summaries_for_handle,
         })
     }
 }
@@ -682,6 +758,41 @@ pub struct RunHandle {
     /// every sprint boundary (t-swap plan D1) — `swap_harness` mutates it
     /// directly; the next `spawn_sprint` call picks up the change.
     roster: Arc<Mutex<Roster>>,
+    /// The same `Arc<Mutex<Vec<String>>>` the finisher appends each sprint's
+    /// summary text to (t-swap plan D7) — `swap_harness` step 3 reads a
+    /// snapshot to assemble the swapped-in worker's injected context.
+    summaries: Arc<Mutex<Vec<String>>>,
+}
+
+/// One control-channel swap attempt against a specific worker's sender —
+/// factored out of `swap_harness` (t-swap plan D9 scenario ⑤) so the
+/// "channel closed" failure path is unit-testable without racing a real
+/// sprint boundary's task teardown. `harness`/`harness_id` mirror
+/// `AgentControl::Swap`'s fields (contracts-m6.md §D1, verbatim, D8: the
+/// already-built `Arc<dyn Harness>` from `swap_harness`'s validation step,
+/// never re-`make`'d).
+async fn send_swap_control(
+    tx: &mpsc::Sender<AgentControl>,
+    harness: Arc<dyn Harness>,
+    harness_id: String,
+    injected_context: String,
+) -> Result<HandoffSnapshot, String> {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    let ctrl = AgentControl::Swap {
+        harness,
+        harness_id,
+        injected_context,
+        ack: ack_tx,
+    };
+    if tx.send(ctrl).await.is_err() {
+        return Err("worker control channel closed".to_string());
+    }
+    match tokio::time::timeout(Duration::from_millis(SWAP_ACK_TIMEOUT_MS), ack_rx).await {
+        Ok(Ok(Ok(snapshot))) => Ok(snapshot),
+        Ok(Ok(Err(harness_err))) => Err(harness_err.to_string()),
+        Ok(Err(_recv_err)) => Err("worker dropped ack".to_string()),
+        Err(_elapsed) => Err("ack timeout".to_string()),
+    }
 }
 
 impl RunHandle {
@@ -722,17 +833,27 @@ impl RunHandle {
     }
 
     /// Swaps the harness assigned to `agent_id`'s roster slot — contract
-    /// §C5c (2026-08-29 보정판, t-swap plan). Validates both arguments
-    /// before touching anything: an unknown `agent_id` or a `harness` id
-    /// `HarnessRegistry::make` can't build (`opencode`'s Stub adapter is
-    /// accepted) returns `RunError::SwapRejected` with the roster untouched
-    /// and zero events emitted. On success: the roster slot's harness is
-    /// updated immediately, a `handoff` envelope is appended straight to
-    /// the ledger and broadcast as `Message` (skipped for the `lead` slot —
-    /// plan D3, `crew_proto::Role` has no `Lead` variant), then
-    /// `RosterChanged` broadcasts the updated roster. No running session is
-    /// touched here — the swap takes effect at the next sprint boundary,
-    /// when `spawn_sprint` reads a fresh roster snapshot (plan D5).
+    /// §D2b (2026-08-29 보정판, t-swap plan), extending contracts-m5.md
+    /// §C5c with immediate mid-sprint effectuation. Validates both
+    /// arguments before touching anything: an unknown `agent_id` or a
+    /// `harness` id `HarnessRegistry::make` can't build (`opencode`'s Stub
+    /// adapter is accepted) returns `RunError::SwapRejected` with the
+    /// roster untouched and zero events emitted.
+    ///
+    /// On success: steps 1-2 always run and their effects always stick —
+    /// the roster slot's harness is updated immediately, a `handoff`
+    /// envelope is appended straight to the ledger and broadcast as
+    /// `Message` (skipped for the `lead` slot — plan D3, `crew_proto::Role`
+    /// has no `Lead` variant), then `RosterChanged` broadcasts the updated
+    /// roster. Step 3 then tries to reach the live worker directly: if
+    /// `agent_id` has no live control-channel sender (not in this sprint,
+    /// mid-boundary, or the lead slot, which is never registered — §D2a),
+    /// that's `Ok(())` too, since the swap will still take effect at the
+    /// next sprint boundary (M5's existing fallback path, plan D5/D6). Only
+    /// a genuine step-3 failure (send failure, ack timeout, worker-dropped
+    /// ack, or a harness error) returns `Err(RunError::SwapIncomplete)` —
+    /// steps 1-2's effects are **not** rolled back when that happens; the
+    /// same boundary fallback still applies.
     pub async fn swap_harness(&self, agent_id: &str, harness: &str) -> Result<(), RunError> {
         {
             let roster = self.roster.lock().expect("roster mutex poisoned");
@@ -740,9 +861,12 @@ impl RunHandle {
                 return Err(RunError::SwapRejected(format!("unknown agent id: {agent_id}")));
             }
         }
-        if HarnessRegistry::make(harness).is_none() {
-            return Err(RunError::SwapRejected(format!("unknown harness id: {harness}")));
-        }
+        // D8: keep the built `Arc<dyn Harness>` for step 3 — `make` is only
+        // ever called once per swap.
+        let harness_arc = match HarnessRegistry::make(harness) {
+            Some(h) => h,
+            None => return Err(RunError::SwapRejected(format!("unknown harness id: {harness}"))),
+        };
 
         let (old_harness, role_str) = {
             let mut roster = self.roster.lock().expect("roster mutex poisoned");
@@ -755,6 +879,12 @@ impl RunHandle {
             (old_harness, slot.role.clone())
         };
 
+        // Carried past this block for step 3 (below, after RosterChanged —
+        // contracts-m6.md §D2b orders roster+envelope+RosterChanged strictly
+        // before the control-channel attempt): `None` for the lead slot,
+        // which has no `HandoffPack` role and is never in `controls` anyway
+        // (§D2a), so step 3 is a no-op for it either way.
+        let mut pack_for_control: Option<(HandoffPack, String)> = None;
         if let Some(role) = role_from_str(&role_str) {
             let (goal, done, in_flight) = {
                 let snap = self.snapshot.lock().unwrap();
@@ -774,7 +904,7 @@ impl RunHandle {
             };
             let pack = HandoffPack {
                 role,
-                spec_ref: goal,
+                spec_ref: goal.clone(),
                 done,
                 in_flight,
                 decisions: Vec::new(),
@@ -804,10 +934,36 @@ impl RunHandle {
                 &self.snapshot,
                 BusLifecycleEvent::EnvelopeAccepted { envelope },
             );
+            pack_for_control = Some((pack, goal));
         }
 
         let agents = roster_to_dto(&self.roster.lock().expect("roster mutex poisoned"));
         let _ = self.run_tx.send(RunEvent::RosterChanged { agents, ts: now_ts() });
+
+        // Step 3 (§D2b, new): reach the live worker directly, if there is
+        // one. `pack_for_control` is `None` for the lead slot only, which
+        // is never in `controls` either, so this whole block is exercised
+        // for every non-lead slot regardless of whether a sender is found.
+        if let Some((pack, goal)) = pack_for_control {
+            let sender = {
+                let live = self.live.lock().expect("live handles mutex poisoned");
+                live.controls.get(agent_id).cloned()
+            };
+            if let Some(tx) = sender {
+                let l1 = {
+                    let summaries_so_far = self.summaries.lock().expect("summaries mutex poisoned").clone();
+                    l1_context(&goal, &summaries_so_far)
+                };
+                let pack_json = serde_json::to_string_pretty(&pack)
+                    .unwrap_or_else(|e| format!("{{\"error\":\"pack serialize failed: {e}\"}}"));
+                let injected_context = format!("{l1}\n\n[handoff]\n{pack_json}");
+                if let Err(reason) =
+                    send_swap_control(&tx, harness_arc, harness.to_string(), injected_context).await
+                {
+                    return Err(RunError::SwapIncomplete(reason));
+                }
+            }
+        }
 
         Ok(())
     }
@@ -852,5 +1008,258 @@ impl RunHandle {
         self.sub_task.abort();
         self.relay_abort.abort();
         self.bus.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod send_swap_control_tests {
+    //! `send_swap_control` unit-level coverage (t-swap plan D9 scenario ⑤):
+    //! the "control channel closed" failure path is exercised directly
+    //! against a real (receiver-dropped) `mpsc::Sender` instead of racing a
+    //! live sprint boundary's task teardown, per the plan's stated fallback
+    //! when the integration-level race isn't reproducible deterministically
+    //! — which the `LiveHandles.controls.clear()` fix (this task) made true
+    //! by design, closing exactly that race.
+
+    use super::*;
+
+    fn fake_harness() -> Arc<dyn Harness> {
+        Arc::new(crew_harness::claude::ClaudeCodeHarness::with_binary("/bin/false"))
+    }
+
+    /// Normal: a live receiver acks Ok and `send_swap_control` returns the
+    /// snapshot untouched.
+    #[tokio::test]
+    async fn acks_ok_returns_the_snapshot() {
+        let (tx, mut rx) = mpsc::channel::<AgentControl>(4);
+        tokio::spawn(async move {
+            if let Some(AgentControl::Swap { ack, harness_id, .. }) = rx.recv().await {
+                let _ = ack.send(Ok(HandoffSnapshot {
+                    harness: harness_id,
+                    session_id: "s-1".to_string(),
+                    notes: "ok".to_string(),
+                }));
+            }
+        });
+
+        let result = send_swap_control(&tx, fake_harness(), "claude-code".to_string(), "ctx".to_string()).await;
+
+        let snapshot = result.expect("a live receiver's Ok ack must come back as Ok");
+        assert_eq!(snapshot.session_id, "s-1");
+    }
+
+    /// Error: the worker's harness-level snapshot/shutdown itself failed —
+    /// the `HarnessError`'s `Display` text must surface as the reason.
+    #[tokio::test]
+    async fn acks_harness_err_surfaces_its_display_text() {
+        let (tx, mut rx) = mpsc::channel::<AgentControl>(4);
+        tokio::spawn(async move {
+            if let Some(AgentControl::Swap { ack, .. }) = rx.recv().await {
+                let _ = ack.send(Err(crew_harness::HarnessError::ProcessExited));
+            }
+        });
+
+        let result = send_swap_control(&tx, fake_harness(), "claude-code".to_string(), "ctx".to_string()).await;
+
+        let reason = result.expect_err("a harness-level ack error must come back as Err");
+        assert_eq!(reason, crew_harness::HarnessError::ProcessExited.to_string());
+    }
+
+    /// Boundary (D9 ⑤): the receiver is already gone (dropped, as it is the
+    /// instant a sprint's worker is aborted) — `send` itself fails, with no
+    /// wait for the `SWAP_ACK_TIMEOUT_MS` budget.
+    #[tokio::test]
+    async fn closed_channel_fails_fast_without_waiting_for_the_ack_timeout() {
+        let (tx, rx) = mpsc::channel::<AgentControl>(4);
+        drop(rx);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_swap_control(&tx, fake_harness(), "claude-code".to_string(), "ctx".to_string()),
+        )
+        .await
+        .expect("a closed channel must fail immediately, not wait out the ack timeout");
+
+        assert_eq!(result, Err("worker control channel closed".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod live_controls_wiring_tests {
+    //! White-box coverage (test-quality-auditor finding on this task): the
+    //! integration-level "mid-sprint swap reaches the live worker" test in
+    //! tests/m5_swap.rs cannot, on its own, tell "found a live sender in
+    //! `LiveHandles.controls` and completed a real channel round-trip" apart
+    //! from "found no sender and took the §D2b/D6 sender-absent Ok
+    //! fallback" — `ScriptedCrewMember` never overrides `on_control`, so its
+    //! default no-op ack (role.rs) produces zero externally observable
+    //! difference between the two paths. These tests reach into
+    //! `RunHandle`'s private `live` field (same module tree — a `crew-run`-
+    //! internal white-box test, still within this task's scope) to pin the
+    //! two structural facts an event-stream-only test can't: (a) every
+    //! non-lead role is actually registered, and (b) `swap_harness`
+    //! genuinely *uses* whatever sender is registered rather than always
+    //! taking the Ok path regardless of what's in the map.
+
+    use super::*;
+    use crew_lead::accept::AcceptanceLoop;
+
+    fn scripted_config(data_dir: std::path::PathBuf) -> RunConfig {
+        RunConfig {
+            goal: "간단한 랜딩 페이지".to_string(),
+            mode: RunMode::Scripted { planted_violations: vec![] },
+            data_dir,
+            max_rework: AcceptanceLoop::default_budget(),
+            max_per_sprint: 0,
+            escalation_timeout_ms: 0,
+            roster: None,
+        }
+    }
+
+    fn test_data_dir(label: &str) -> std::path::PathBuf {
+        std::env::current_dir()
+            .unwrap()
+            .join(".crew-test")
+            .join(format!("{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// (a) Wiring: every non-lead role is registered the instant the first
+    /// sprint spawns, lead is never registered (§D2a) — guards exactly the
+    /// regression class the auditor named: `spawn_sprint` reverting to
+    /// `AgentRunner::run` for a role, or an `agent_id` key mismatch between
+    /// `roles_all()` and the roster.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_non_lead_role_is_registered_in_live_controls_lead_is_not() {
+        let data_dir = test_data_dir("live-controls-wiring");
+        let handle = RunController::start(scripted_config(data_dir.clone()))
+            .await
+            .expect("start must succeed");
+
+        let registered: std::collections::HashSet<String> = {
+            let live = handle.live.lock().expect("live handles mutex poisoned");
+            live.controls.keys().cloned().collect()
+        };
+
+        for id in ["agent:pm", "agent:designer", "agent:publisher", "agent:developer", "agent:qa"] {
+            assert!(registered.contains(id), "{id} must be registered in live controls: {registered:?}");
+        }
+        assert!(
+            !registered.contains("agent:lead"),
+            "the lead slot must never be registered (§D2a): {registered:?}"
+        );
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// (b) Genuine use, not a coincidental fallback: with a sender
+    /// *present* in `controls` but its receiver already dropped (simulating
+    /// a stale registration — distinct from the D6 "absent" case, where the
+    /// key itself is missing), `swap_harness` must still attempt the send
+    /// and surface the resulting failure as `SwapIncomplete`. If
+    /// `swap_harness` ever stopped reading `controls` at all (e.g. a future
+    /// edit accidentally always took the D6 fallback), this test would
+    /// wrongly see `Ok(())` and fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn swap_harness_uses_a_present_sender_and_reports_incomplete_when_it_is_dead() {
+        let data_dir = test_data_dir("live-controls-dead-sender");
+        let handle = RunController::start(scripted_config(data_dir.clone()))
+            .await
+            .expect("start must succeed");
+
+        {
+            let (dead_tx, dead_rx) = mpsc::channel::<AgentControl>(4);
+            drop(dead_rx);
+            let mut live = handle.live.lock().expect("live handles mutex poisoned");
+            live.controls.insert("agent:designer".to_string(), dead_tx);
+        }
+
+        let result = handle.swap_harness("agent:designer", "opencode").await;
+        assert!(
+            matches!(result, Err(RunError::SwapIncomplete(_))),
+            "a present-but-dead sender must produce SwapIncomplete, not the sender-absent Ok fallback: {result:?}"
+        );
+
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+}
+
+#[cfg(test)]
+mod role_cli_cwd_tests {
+    //! Deterministic regression coverage for the ENOENT bug the coordinator's
+    //! real-CLI spot check found (t-swap follow-up fix): `spawn_sprint`'s
+    //! `RealCli` arm builds `HarnessAgentCfg { cwd: ... }` from a directory
+    //! nothing ever created, so `Command::current_dir` failed every worker's
+    //! CLI spawn with ENOENT. `role_cli_cwd` is a pure filesystem seam — no
+    //! bus/tokio-task/real-CLI-binary needed — so this is a real, fast,
+    //! deterministic test rather than relying solely on the `#[ignore]`
+    //! real-CLI spot check (which also now exercises this fix, since it
+    //! needs the directory to exist to get past spawn at all).
+
+    use super::*;
+
+    fn test_data_dir(label: &str) -> std::path::PathBuf {
+        std::env::current_dir()
+            .unwrap()
+            .join(".crew-test")
+            .join(format!("{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Normal: the directory doesn't exist beforehand (mirrors a fresh run's
+    /// `data_dir`) — `role_cli_cwd` must create it and return the same path
+    /// `Command::current_dir` would need.
+    #[test]
+    fn creates_the_role_directory_when_it_does_not_exist() {
+        let data_dir = test_data_dir("cli-cwd-fresh");
+        assert!(!data_dir.exists(), "test setup: data_dir must not pre-exist");
+
+        let cwd = role_cli_cwd(&data_dir, Role::Designer);
+
+        assert_eq!(cwd, data_dir.join("cli-cwd").join("designer"));
+        assert!(cwd.is_dir(), "the role cwd must exist as a directory after role_cli_cwd: {cwd:?}");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Boundary: calling it again for the same role (e.g. a second sprint's
+    /// `spawn_sprint`) against an already-existing directory must not error
+    /// or disturb its contents — `create_dir_all` is idempotent, but this
+    /// pins that `role_cli_cwd` doesn't wrap it in anything that isn't.
+    #[test]
+    fn is_idempotent_and_preserves_existing_contents() {
+        let data_dir = test_data_dir("cli-cwd-idempotent");
+        let cwd = role_cli_cwd(&data_dir, Role::Qa);
+        std::fs::write(cwd.join("marker.txt"), b"sprint-0").expect("must be able to write into the created cwd");
+
+        let cwd_again = role_cli_cwd(&data_dir, Role::Qa);
+
+        assert_eq!(cwd, cwd_again);
+        assert!(cwd_again.is_dir(), "the directory must still exist: {cwd_again:?}");
+        let marker = std::fs::read_to_string(cwd_again.join("marker.txt")).expect("earlier sprint's file must survive a repeat call");
+        assert_eq!(marker, "sprint-0");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Error path: `create_dir_all` cannot create a directory *through* a
+    /// path component that is itself a regular file — `role_cli_cwd`'s
+    /// best-effort `let _ =` must not panic, and must return the intended
+    /// path regardless (the caller then hits the same pre-fix ENOENT from
+    /// the CLI spawn, not a panic from this helper — the whole point of
+    /// "best-effort" is that this failure surfaces at the harness spawn,
+    /// which already has real error handling, rather than here).
+    #[test]
+    fn does_not_panic_when_a_path_component_is_a_regular_file() {
+        let data_dir = test_data_dir("cli-cwd-blocked");
+        std::fs::create_dir_all(&data_dir).expect("test setup");
+        std::fs::write(data_dir.join("cli-cwd"), b"not a directory").expect("test setup: block the cli-cwd path segment");
+
+        let cwd = role_cli_cwd(&data_dir, Role::Publisher);
+
+        assert_eq!(cwd, data_dir.join("cli-cwd").join("publisher"));
+        assert!(!cwd.is_dir(), "creation must have failed silently (best-effort), not been magically satisfied: {cwd:?}");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

@@ -2,12 +2,16 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use crew_harness::{AgentCfg, Harness, HarnessEvent, Session, TurnOutcome, UserTurn, DEFAULT_TURN_TIMEOUT};
+use crew_harness::{
+    AgentCfg, HandoffSnapshot, Harness, HarnessEvent, Session, TurnOutcome, UserTurn,
+    DEFAULT_TURN_TIMEOUT,
+};
 use crew_proto::{Envelope, MessageKind};
 use crew_proto::{DodCheck, TaskSpec};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use crate::control::AgentControl;
 use crate::role::RoleBehavior;
 
 const DEADLINE_MS: u64 = 900_000;
@@ -278,6 +282,14 @@ pub struct RoleHarnessBehavior {
     /// `build_prompt` guarantees it is consumed exactly once, so later
     /// turns are unaffected without any extra bookkeeping.
     injected_context: Option<String>,
+    /// contracts-m6.md §D2d: when set, the actual CLI-interaction span of
+    /// each turn (`ensure_session`'s spawn + the send call) runs under a
+    /// permit from this pool for `pool_harness_id`, held only for that span
+    /// — never for the runner's whole lifetime (the M5 deadlock this fixes:
+    /// holding a permit per-worker for the whole run starves later workers
+    /// once the harness's concurrency limit is exceeded).
+    pool: Option<Arc<crew_harness::HarnessPool>>,
+    pool_harness_id: Option<String>,
 }
 
 impl RoleHarnessBehavior {
@@ -290,6 +302,8 @@ impl RoleHarnessBehavior {
             session: None,
             events: None,
             injected_context: None,
+            pool: None,
+            pool_harness_id: None,
         }
     }
 
@@ -298,6 +312,15 @@ impl RoleHarnessBehavior {
     /// caller.
     pub fn with_injected_context(mut self, text: String) -> Self {
         self.injected_context = Some(text);
+        self
+    }
+
+    /// contracts-m6.md §D2d: gate each turn's actual harness interaction on
+    /// `pool`'s per-harness concurrency limit for `harness_id`. Unset (the
+    /// default) leaves turn behavior exactly as before this existed.
+    pub fn with_pool(mut self, pool: Arc<crew_harness::HarnessPool>, harness_id: String) -> Self {
+        self.pool = Some(pool);
+        self.pool_harness_id = Some(harness_id);
         self
     }
 
@@ -432,6 +455,14 @@ impl RoleBehavior for RoleHarnessBehavior {
             Err(reason) => return self.blocked(&env, reason),
         };
 
+        // contracts-m6.md §D2d: hold the permit only across this turn's
+        // actual CLI interaction (spawn + send), not the runner's whole
+        // lifetime — dropped explicitly right after `send` returns, below.
+        let permit = match (self.pool.as_ref(), self.pool_harness_id.as_ref()) {
+            (Some(pool), Some(harness_id)) => Some(pool.acquire(harness_id).await),
+            _ => None,
+        };
+
         if let Err(e) = self.ensure_session().await {
             return self.blocked(&env, format!("spawn failed: {e}"));
         }
@@ -447,6 +478,7 @@ impl RoleBehavior for RoleHarnessBehavior {
             .harness
             .send(session, UserTurn { text: prompt }, DEFAULT_TURN_TIMEOUT)
             .await;
+        drop(permit);
 
         let (events_rx, text) = drain
             .await
@@ -467,6 +499,48 @@ impl RoleBehavior for RoleHarnessBehavior {
 
     fn is_done(&self) -> bool {
         false
+    }
+
+    /// contracts-m6.md §D1: mid-sprint harness swap. Snapshot/shutdown run
+    /// against the *old* harness (before `self.harness` is replaced) —
+    /// either erroring propagates to `ack`, but the session is dropped via
+    /// `self.session.take()` either way (no zombie). Respawn is left to the
+    /// next turn's `ensure_session` (lazy — D5). §D2d: the pool's stored
+    /// harness_id is updated to the new one, so a turn after the swap
+    /// consumes the new harness's own concurrency limit.
+    async fn on_control(&mut self, ctrl: AgentControl) -> Vec<Envelope> {
+        match ctrl {
+            AgentControl::Swap {
+                harness,
+                harness_id,
+                injected_context,
+                ack,
+            } => {
+                if self.pool.is_some() {
+                    self.pool_harness_id = Some(harness_id.clone());
+                }
+                let snapshot = match self.session.take() {
+                    Some(session) => {
+                        let snap_result = self.harness.snapshot(&session).await;
+                        let shutdown_result = self.harness.shutdown(session).await;
+                        match (snap_result, shutdown_result) {
+                            (Ok(snap), Ok(())) => Ok(snap),
+                            (Ok(_), Err(e)) => Err(e),
+                            (Err(e), _) => Err(e),
+                        }
+                    }
+                    None => Ok(HandoffSnapshot {
+                        harness: harness_id,
+                        session_id: String::new(),
+                        notes: "no session yet".to_string(),
+                    }),
+                };
+                self.harness = harness;
+                self.injected_context = Some(injected_context);
+                let _ = ack.send(snapshot);
+            }
+        }
+        Vec::new()
     }
 }
 

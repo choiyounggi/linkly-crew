@@ -119,10 +119,37 @@
 - M5 계약 정본: `archive-20260829-m5a/contracts-m5.md` (RunEvent 3종 추가·TaskStateDto
   "blocked"·HandoffPack/Roster 스키마·레지스트리/풀 API·Tauri 커맨드·스왑 보정 2건).
 
+**검증됨 — M6** (2026-08-29, 실측: 통합 브랜치 ea5fd4a):
+- 스코프: mid-sprint 즉시 스왑(t-ctrl 제어 채널 + t-swapnow 3단계) + DAG 뷰(t-dag) +
+  타임라인 스윔레인(t-timeline) 3건 (가변 로스터 인원·적응형 세마포어·opencode 실 어댑터는
+  D0로 스코프 아웃).
+- 스왑 의미론 보정(M5 대비): 스왑은 **즉시 실효**(로스터·봉투·`RosterChanged` 즉시 +
+  라이브 워커 snapshot→shutdown→lazy respawn, ack 대기 `SWAP_ACK_TIMEOUT_MS=120_000`);
+  3단계 실패 시 `SwapIncomplete` 반환하되 1~2단계(로스터·봉투)는 유지되어 다음 스프린트
+  경계에서 실효(M5 폴백 유지) — `crates/crew-run/tests/m5_swap.rs`.
+  `AgentControl`/`run_with_control`/`on_control`: `crates/crew-agent/src/control.rs·
+  runner.rs·role.rs·harness_behavior.rs`.
+- 결정론: 워크스페이스 31 스위트 green(rc=0), src-tauri 10/10, vitest 119/119, vite build
+  green. 리워크 0라운드.
+- 통합 이음새 1건: `App.test.tsx`가 t-ui-shell 스텁 문구를 직접 단언 → t-dag/t-timeline
+  머지로 문구 교체되며 깨짐 → 루트 클래스 계약 단언으로 수정(commit `de8c07c`).
+- 신규: `features/dag`(`buildDagView`·크리티컬 패스·`@xyflow/react` 렌더),
+  `features/timeline`(`buildTimeline`·레인·마커), `LiveHandles.controls`.
+- real-CLI 스팟체크 **PASS** — 2스프린트 `RealCli` 런에서 mid-sprint designer 스왑
+  ack `Ok` + 개입 0회 완주, 178.97s (`crates/crew-run/tests/m5_swap.rs` `#[ignore]`
+  테스트, 코디네이터 실행). 이 검증이 M5 잠재 결함 2건을 발견·수정함: ① `RealCli`
+  워커 cli-cwd 미생성 → spawn ENOENT 행 (`e761ed3`) ② `HarnessPool` 퍼밋을 러너
+  수명 내내 보유 → claude-code=2 리밋에서 3번째 워커부터 영구 대기 — 퍼밋을 턴 단위로
+  보정 (`with_pool`, `b25ff04` + `656d763`, 계약 D2d).
+- M6 커밋: `9eb368d`(t-ctrl) `de8c07c`(이음새 수정) `312bfd6`(t-swapnow) `a56338f`(t-dag)
+  `e5fa4fa`(t-timeline).
+- M6 계약 정본: `archive-20260829-m6a/contracts-m6.md`(예정) — 현재는
+  `.orchestration/contracts-m6.md`. D1(제어 채널) D2(스왑 3단계) D7(문서).
+
 **미검증**:
 - GUI에서 scripted=false 클릭 실행(네이티브 창 — 사람 1클릭 필요; 실 CLI 경로 자체는 위
-  E2E 2건으로 증명됨). mid-sprint 즉시 세션 교체(스왑 실효는 스프린트 경계 — 계약 보정).
-- Cmd/Browser DoD 실제 실행(M3부터 skip 기록만), 멀티 스프린트 real-CLI 전체 런.
+  E2E 2건으로 증명됨) — Gate 2에서 확인 예정.
+- Cmd/Browser DoD 실제 실행(M3부터 skip 기록만).
 
 **환경** (2026-08-27 갱신):
 - `rustup` 설치 완료, `cargo 1.98.0`(`rustc 1.98.0`) 사용 가능
@@ -141,25 +168,29 @@ task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ---
 
-## 4. 다음 스텝 — M5 잔여 + 3단계 후보
+## 4. 다음 스텝 — M6 완료 후 잔여
 
-M1~M5 완료·실측 검증됨(§3). 다음 후보:
+M1~M6 완료·실측 검증됨(§3). 다음 후보:
 
-**M5 잔여 (작은 것부터)**:
-1. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가).
-2. **mid-sprint 즉시 스왑 실효**: 워커 핸들 레지스트리(에이전트별 세션 제어 채널) 도입 후
-   스왑 시 snapshot→shutdown→respawn 즉시 수행 (현재는 다음 스프린트 경계 실효 — 계약 보정).
-3. DAG 뷰/타임라인 (DESIGN §7 — M4·M5에서 의도적으로 제외).
-4. 가변 로스터 인원(플래너가 5역할 DAG 고정이라 프리셋은 배치만 다름 — 계약 C0),
-   적응형 세마포어(§13.1), opencode 실 어댑터.
+**M6 완료 후 잔여 (작은 것부터)**:
+1. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가;
+   현재 코디네이터 수동 진행 중).
+2. 가변 로스터 인원(플래너가 5역할 DAG 고정이라 프리셋은 배치만 다름 — 계약 C0),
+   적응형 세마포어(§13.1), opencode 실 어댑터 — M6 D0로 스코프 아웃, 여전히 미착수.
+3. §7 잔여 뷰: 승인함(`human.gate` 대기 목록), 아티팩트/디프(산출물 미리보기 + 커밋 디프
+   + REQ-id 커버리지 매트릭스), 전역 검색(SQLite FTS5). DAG 뷰·타임라인은 M6에서 구현됨.
+4. 스폰 세션 훅 완전 차단(함정 8, 아직 미해결).
+5. Cmd/Browser DoD 실제 실행 (M3부터 skip 기록만).
 
 **3단계(DESIGN §11 후순위)**: ed25519 서명, 원격 릴레이, 사람 참여, 모바일.
-그 외: 스폰 세션 훅 차단(함정 8), Cmd/Browser DoD 실제 실행.
 
 **재사용 계약**: M3(archive-20260827-m3a/contracts-m3.md) + M4(archive-20260828-m4a/
-contracts-m4.md) + **M5(archive-20260829-m5a/contracts-m5.md)** — RunEvent 3종 추가,
-TaskStateDto "blocked", HandoffPack/Roster, HarnessRegistry/HarnessPool, LlmLeadPlanner,
-`RunHandle::swap_harness`, Tauri 커맨드 5종, 로스터 패널/동적 배지/이니셜 맵. 재발명 금지.
+contracts-m4.md) + M5(archive-20260829-m5a/contracts-m5.md) + **M6(archive-20260829-m6a/
+contracts-m6.md 예정, 현재 .orchestration/contracts-m6.md)** — RunEvent 3종, TaskStateDto
+"blocked", HandoffPack/Roster, HarnessRegistry/HarnessPool, LlmLeadPlanner,
+`RunHandle::swap_harness`(즉시 실효 + 경계 폴백), `AgentControl`/`on_control`,
+`features/dag`/`features/timeline`, Tauri 커맨드 5종, 로스터 패널/동적 배지/이니셜 맵.
+재발명 금지.
 
 ---
 
@@ -203,3 +234,17 @@ TaskStateDto "blocked", HandoffPack/Roster, HarnessRegistry/HarnessPool, LlmLead
 16. **오케스트레이션 운영**: 장수 tmux 서버(수일 전 기동)의 워커는 OAuth 갱신이 불가능해
     "Login expired"로 턴이 즉사할 수 있다 — 새 소켓(`TMUX_TMPDIR`)의 새 tmux 서버로
     재기동하면 해결 (m5a 런 실측, 코디네이터 셸은 정상인데 tmux 자식만 실패하는 패턴).
+17. **제어 채널은 턴 사이에만 처리** (M6 결정, `AgentControl`/`on_control`): 하네스가
+    현재 턴을 스트리밍하는 도중엔 스왑 명령을 끼워 넣지 않고 턴 경계까지 대기 후 처리한다
+    (ack 대기 상한 `SWAP_ACK_TIMEOUT_MS=120_000`의 근거 — 진행 중인 턴이 길면 그만큼
+    ack가 늦어질 수 있음을 전제).
+18. **셸 태스크 테스트가 스텁 문구를 단언하면 후속 교체에서 깨진다** (M6 통합 이음새 1건,
+    `de8c07c`): `App.test.tsx`가 t-ui-shell이 심은 플레이스홀더 문구를 직접 문자열
+    단언했다가, t-dag/t-timeline이 실제 뷰로 교체하며 실패 — 크로스 태스크 스텁을
+    단언할 땐 문구가 아니라 **루트 클래스/구조 계약**(안정적으로 유지되는 것)을
+    단언할 것.
+19. **`RealCli` 멀티워커 경로는 결정론 테스트로는 안 잡히는 실환경 결함이 있다** (M6
+    real-CLI 스팟체크 실측): cwd 부재로 인한 spawn ENOENT, 세마포어 퍼밋 스코프(러너
+    수명 전체 보유 시 리밋 초과 워커 영구 대기) 둘 다 결정론(`Scripted`) 스위트는
+    통과했지만 실 CLI 2스프린트 런에서만 드러났다 — 새 `RealCli` 경로를 만들면 반드시
+    실 CLI 스팟체크 1회를 코디네이터 수동으로 돌릴 것.
