@@ -16,6 +16,7 @@ export interface RunState {
   finished: "completed" | "failed" | null;
   sprintIndex: number | null;
   sprintSummaries: { index: number; summary: string }[];
+  sprintWindows: { index: number; startTs: string; endTs: string | null }[];
   roster: RosterAgentDto[];
   startRun(goal: string): Promise<void>;
   applyEvent(ev: RunEvent): void;
@@ -43,6 +44,7 @@ export function createRunStore(source: RunEventSource) {
     finished: null,
     sprintIndex: null,
     sprintSummaries: [],
+    sprintWindows: [],
     roster: [],
 
     async startRun(goal) {
@@ -64,6 +66,7 @@ export function createRunStore(source: RunEventSource) {
             finished: null,
             sprintIndex: null,
             sprintSummaries: [],
+            sprintWindows: [],
             roster: [],
           });
           return;
@@ -92,6 +95,24 @@ export function createRunStore(source: RunEventSource) {
 
         case "sprint_started":
           set({ sprintIndex: ev.index });
+          // D3/D4: upsert into sprintWindows — startTs set/refreshed, endTs
+          // left as-is if the window already exists (a finished window must
+          // not be reopened by a re-applied sprint_started).
+          set((s) => {
+            const existing = s.sprintWindows.find((w) => w.index === ev.index);
+            if (existing) {
+              return {
+                sprintWindows: s.sprintWindows.map((w) =>
+                  w.index === ev.index ? { ...w, startTs: ev.ts } : w,
+                ),
+              };
+            }
+            return {
+              sprintWindows: [...s.sprintWindows, { index: ev.index, startTs: ev.ts, endTs: null }].sort(
+                (a, b) => a.index - b.index,
+              ),
+            };
+          });
           return;
 
         case "sprint_finished":
@@ -101,6 +122,23 @@ export function createRunStore(source: RunEventSource) {
               ? {}
               : { sprintSummaries: [...s.sprintSummaries, { index: ev.index, summary: ev.summary }] },
           );
+          // D3/D4: upsert into sprintWindows — set endTs if the window exists,
+          // else create one with startTs=endTs=ev.ts (finished-before-started).
+          set((s) => {
+            const existing = s.sprintWindows.find((w) => w.index === ev.index);
+            if (existing) {
+              return {
+                sprintWindows: s.sprintWindows.map((w) =>
+                  w.index === ev.index ? { ...w, endTs: ev.ts } : w,
+                ),
+              };
+            }
+            return {
+              sprintWindows: [...s.sprintWindows, { index: ev.index, startTs: ev.ts, endTs: ev.ts }].sort(
+                (a, b) => a.index - b.index,
+              ),
+            };
+          });
           return;
 
         case "roster_changed":

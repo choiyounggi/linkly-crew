@@ -1,15 +1,26 @@
 import { useEffect, useState, type FormEvent } from "react";
 
 import Board from "./features/board";
+import DagView from "./features/dag";
 import Rail from "./features/rail";
 import RosterPanel from "./features/roster";
 import Thread from "./features/thread";
+import TimelineView from "./features/timeline";
 import { defaultSource, useRunStore } from "./lib/store";
 import "./App.css";
+
+type View = "board" | "dag" | "timeline";
+
+const TABS: { key: View; label: string }[] = [
+  { key: "board", label: "보드" },
+  { key: "dag", label: "DAG" },
+  { key: "timeline", label: "타임라인" },
+];
 
 export default function App() {
   const [goalInput, setGoalInput] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<View>("board");
   const applyEvent = useRunStore((s) => s.applyEvent);
   const startRun = useRunStore((s) => s.startRun);
   const runId = useRunStore((s) => s.runId);
@@ -50,9 +61,24 @@ export default function App() {
         </form>
         {error && <p className="command-bar__error">{error}</p>}
       </header>
+      <nav className="view-tabs" aria-label="뷰 전환">
+        {TABS.map((tab) => (
+          <button
+            key={tab.key}
+            type="button"
+            aria-pressed={view === tab.key}
+            className={view === tab.key ? "view-tabs__button view-tabs__button--active" : "view-tabs__button"}
+            onClick={() => setView(tab.key)}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </nav>
       <main className="layout">
         <Rail />
-        <Board />
+        {view === "board" && <Board />}
+        {view === "dag" && <DagView />}
+        {view === "timeline" && <TimelineView />}
         <div className="layout__right">
           <Thread />
           <RosterPanel />
