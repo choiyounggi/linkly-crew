@@ -338,6 +338,82 @@ async fn swap_handoff_message_seq_is_monotonic_with_prior_messages() {
     cleanup(&data_dir);
 }
 
+/// New (t-swap plan D9 scenario ①): a swap called *while* a sprint's
+/// workers are still live — not after `SprintFinished` like the M5 test
+/// above — exercises the new mid-sprint immediate-effect path
+/// (contracts-m6.md §D2b step 3): `swap_harness` sends `AgentControl::Swap`
+/// straight to the live worker and waits for its ack, rather than only
+/// falling back to the sprint-boundary path. Single sprint
+/// (`max_per_sprint=0`) keeps the worker set alive for the whole run — no
+/// boundary to race, isolating this from `swap_between_sprints_...`'s
+/// boundary-fallback path.
+#[tokio::test(flavor = "multi_thread")]
+async fn swap_mid_sprint_reaches_the_live_worker_ack_ok_and_run_completes() {
+    let data_dir = test_data_dir("swap-mid-sprint");
+    let mut handle = start(config(data_dir.clone(), 0)).await;
+    let mut rx = handle.subscribe();
+    drain(&mut rx); // start()'s own RunStarted/SpecReady/RosterChanged/SprintStarted/Registered noise.
+
+    handle
+        .swap_harness("agent:designer", "opencode")
+        .await
+        .expect("a mid-sprint swap against a live worker must ack Ok");
+
+    join_ok(&mut handle).await;
+    let after = drain(&mut rx);
+
+    let handoff = after.iter().any(|ev| {
+        matches!(ev, RunEvent::Message { envelope, .. }
+            if envelope.kind == MessageKind::Handoff && envelope.to == vec!["agent:designer".to_string()])
+    });
+    assert!(handoff, "a handoff Message addressed to agent:designer must be observed: {after:?}");
+    assert!(
+        after.iter().any(|ev| matches!(ev, RunEvent::RosterChanged { .. })),
+        "a RosterChanged must be observed: {after:?}"
+    );
+    assert!(
+        matches!(after.last(), Some(RunEvent::RunFinished { outcome: RunOutcomeDto::Completed, .. })),
+        "the run must complete normally after a mid-sprint swap (continuity): {:?}",
+        after.last()
+    );
+
+    handle.shutdown().await;
+    cleanup(&data_dir);
+}
+
+/// Boundary (t-swap plan D9 scenario ④): a swap called after the run has
+/// already finished still succeeds. `swap_harness` never checked run state
+/// even before this task (M5) — steps 1-2 (roster mutation, handoff
+/// envelope, `RosterChanged`) never depended on it — and after every
+/// sprint's workers are aborted `controls` is cleared (this task's
+/// `LiveHandles.controls.clear()` fix), so step 3 takes the sender-absent
+/// `Ok` fallback (§D2b step 3 / D6) exactly like M5's boundary-only path.
+#[tokio::test(flavor = "multi_thread")]
+async fn swap_after_run_finished_still_succeeds_via_the_sender_absent_fallback() {
+    let data_dir = test_data_dir("swap-after-finish");
+    let mut handle = start(config(data_dir.clone(), 0)).await;
+    let mut rx = handle.subscribe();
+    drain(&mut rx);
+
+    join_ok(&mut handle).await;
+    drain(&mut rx); // drain whatever ran to completion before the swap.
+
+    let result = handle.swap_harness("agent:qa", "opencode").await;
+    assert!(
+        result.is_ok(),
+        "a swap after the run finished must still succeed (M5 behavior preserved): {result:?}"
+    );
+
+    let after = drain(&mut rx);
+    assert!(
+        after.iter().any(|ev| matches!(ev, RunEvent::RosterChanged { .. })),
+        "steps 1-2 must still apply after the run has finished: {after:?}"
+    );
+
+    handle.shutdown().await;
+    cleanup(&data_dir);
+}
+
 /// DoD's explicit "opencode(Stub)는 허용" case: `HarnessRegistry::make`
 /// returns `Some` for `opencode` (a Stub adapter, not `None`/real), so it
 /// must be accepted as a swap target.
@@ -350,6 +426,56 @@ async fn swap_to_opencode_stub_adapter_is_accepted() {
     assert!(result.is_ok(), "opencode (Stub adapter) must be an accepted swap target: {result:?}");
 
     join_ok(&mut handle).await;
+    handle.shutdown().await;
+    cleanup(&data_dir);
+}
+
+// --- real CLI spot check (contracts-m6.md §D2b step 5 / §D6 — add only,
+// coordinator runs manually, never here) -------------------------------
+
+/// t-swap plan D10: a two-sprint `RealCli` run with `agent:designer` swapped
+/// claude-code -> claude-code mid-sprint-1 — exercising the real
+/// snapshot -> shutdown -> lazy-respawn path end to end (`RoleHarnessBehavior
+/// ::on_control`) against the real CLI, not a fixture. Asserts the swap acks
+/// Ok and the run completes with zero interventions. Same "add only" pattern
+/// as crew-lead's `m5_plan_llm.rs::real_cli_specify_via_lead_harness_slot`.
+/// `max_per_sprint=2` is a best-effort split for a typical landing-page
+/// spec's requirement count — this test is `#[ignore]`d and never runs in
+/// CI, so it doesn't need a deterministic sprint count.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn real_cli_mid_sprint_designer_swap_completes_two_sprints() {
+    let data_dir = test_data_dir("swap-real-cli");
+    let cfg = RunConfig {
+        goal: "간단한 랜딩 페이지".to_string(),
+        mode: RunMode::RealCli,
+        data_dir: data_dir.clone(),
+        max_rework: AcceptanceLoop::default_budget(),
+        max_per_sprint: 2,
+        escalation_timeout_ms: 0,
+        roster: None,
+    };
+
+    // Real CLI turns measured 17-193s (m5a E2E) — far past the deterministic
+    // helpers' 30s budgets above, so this test uses its own generous ones.
+    let real_start_timeout = Duration::from_secs(300);
+    let real_join_timeout = Duration::from_secs(1800);
+
+    let mut handle = tokio::time::timeout(real_start_timeout, RunController::start(cfg))
+        .await
+        .expect("real-CLI start must finish within the budget")
+        .expect("real-CLI start must succeed");
+
+    handle
+        .swap_harness("agent:designer", "claude-code")
+        .await
+        .expect("a mid-sprint-1 real-CLI swap must ack Ok");
+
+    tokio::time::timeout(real_join_timeout, handle.join())
+        .await
+        .expect("real-CLI run must finish within the budget")
+        .expect("the run must complete with zero interventions after the mid-sprint swap");
+
     handle.shutdown().await;
     cleanup(&data_dir);
 }
