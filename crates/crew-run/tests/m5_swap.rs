@@ -441,7 +441,18 @@ async fn swap_to_opencode_stub_adapter_is_accepted() {
 /// as crew-lead's `m5_plan_llm.rs::real_cli_specify_via_lead_harness_slot`.
 /// `max_per_sprint=2` is a best-effort split for a typical landing-page
 /// spec's requirement count — this test is `#[ignore]`d and never runs in
-/// CI, so it doesn't need a deterministic sprint count.
+/// CI, so it doesn't need a deterministic sprint count. This is also the
+/// only integration-level coverage of the `role_cli_cwd` ENOENT fix
+/// (controller.rs — a worker's `Command::current_dir` needs its `cli-cwd`
+/// directory to actually exist): every worker here would fail to spawn and
+/// report blocked without it, which is exactly how the coordinator's run of
+/// this test first surfaced the bug. `role_cli_cwd`'s own unit tests
+/// (controller.rs `role_cli_cwd_tests`) cover the directory-creation logic
+/// deterministically; a full deterministic `RunController::start` test
+/// under `RunMode::RealCli` isn't feasible without a fake-CLI-script fixture
+/// (crew-run has none — unlike crew-lead's `m5_plan_llm.rs`), since
+/// `LlmLeadPlanner::specify` runs a real CLI turn before any `spawn_sprint`
+/// call even happens; adding that fixture is out of scope for this fix.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn real_cli_mid_sprint_designer_swap_completes_two_sprints() {
