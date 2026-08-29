@@ -42,6 +42,50 @@ pub enum RunEvent {
         outcome: RunOutcomeDto,
         ts: String,
     },
+    /// Emitted at the start of each sprint slice (contracts-m5.md §C5a),
+    /// before that sprint's workers/Lead are spawned.
+    SprintStarted {
+        index: u32,
+        task_ids: Vec<String>,
+        ts: String,
+    },
+    /// Emitted once a sprint's Lead reaches `is_done()`, carrying
+    /// `compress::summarize_sprint`'s deterministic text (contracts-m5.md
+    /// §C5a).
+    SprintFinished {
+        index: u32,
+        summary: String,
+        ts: String,
+    },
+    /// Emitted once right after `RunStarted` (initial roster) and again on
+    /// every future successful `swap_harness` (contracts-m5.md §C5a — the
+    /// swap side is t-swap's responsibility, not emitted here).
+    RosterChanged {
+        agents: Vec<RosterAgentDto>,
+        ts: String,
+    },
+}
+
+/// One roster slot, without `instructions` (contracts-m5.md §C5a,
+/// verbatim).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RosterAgentDto {
+    pub id: String,
+    pub role: String,
+    pub harness: String,
+    pub model: String,
+}
+
+impl From<&crew_proto::RosterAgent> for RosterAgentDto {
+    fn from(agent: &crew_proto::RosterAgent) -> Self {
+        RosterAgentDto {
+            id: agent.id.clone(),
+            role: agent.role.clone(),
+            harness: agent.harness.clone(),
+            model: agent.model.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,5 +287,101 @@ mod tests {
         assert_eq!(json["last_seq"], 1);
         assert_eq!(json["messages"][0]["seq"], 1);
         assert!(json["spec"].is_null());
+    }
+
+    #[test]
+    fn sprint_started_serializes_with_snake_case_type_and_task_ids() {
+        let ev = RunEvent::SprintStarted {
+            index: 0,
+            task_ids: vec!["t-pm".to_string(), "t-design".to_string()],
+            ts: "2026-08-28T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "sprint_started");
+        assert_eq!(json["index"], 0);
+        assert_eq!(json["task_ids"], serde_json::json!(["t-pm", "t-design"]));
+    }
+
+    #[test]
+    fn sprint_finished_carries_summary_text() {
+        let ev = RunEvent::SprintFinished {
+            index: 2,
+            summary: "## 스프린트 2 요약".to_string(),
+            ts: "2026-08-28T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "sprint_finished");
+        assert_eq!(json["index"], 2);
+        assert_eq!(json["summary"], "## 스프린트 2 요약");
+    }
+
+    #[test]
+    fn roster_changed_serializes_agents_without_instructions() {
+        let ev = RunEvent::RosterChanged {
+            agents: vec![RosterAgentDto {
+                id: "agent:lead".to_string(),
+                role: "lead".to_string(),
+                harness: "claude-code".to_string(),
+                model: "default".to_string(),
+            }],
+            ts: "2026-08-28T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "roster_changed");
+        let agent = &json["agents"][0];
+        assert_eq!(agent["id"], "agent:lead");
+        assert_eq!(agent["harness"], "claude-code");
+        assert!(
+            agent.get("instructions").is_none(),
+            "RosterAgentDto must exclude instructions (contracts-m5.md §C5a)"
+        );
+    }
+
+    #[test]
+    fn sprint_started_with_empty_task_ids_round_trips_as_boundary() {
+        let ev = RunEvent::SprintStarted {
+            index: 0,
+            task_ids: vec![],
+            ts: "2026-08-28T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["task_ids"], serde_json::json!([]));
+        let back: RunEvent = serde_json::from_value(json).unwrap();
+        match back {
+            RunEvent::SprintStarted { task_ids, .. } => assert!(task_ids.is_empty()),
+            other => panic!("expected SprintStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sprint_finished_missing_summary_field_fails_to_deserialize() {
+        let malformed = serde_json::json!({
+            "type": "sprint_finished",
+            "index": 0,
+            "ts": "2026-08-28T00:00:00Z",
+        });
+        let err = serde_json::from_value::<RunEvent>(malformed).unwrap_err();
+        assert!(
+            err.to_string().contains("summary"),
+            "deserialize error must name the missing field, got: {err}"
+        );
+    }
+
+    #[test]
+    fn roster_agent_dto_from_roster_agent_drops_instructions() {
+        let agent = crew_proto::RosterAgent {
+            id: "agent:pm".to_string(),
+            role: "pm".to_string(),
+            harness: "claude-code".to_string(),
+            model: "sonnet".to_string(),
+            instructions: "be terse".to_string(),
+        };
+
+        let dto = RosterAgentDto::from(&agent);
+
+        assert_eq!(dto.id, "agent:pm");
+        assert_eq!(dto.role, "pm");
+        assert_eq!(dto.harness, "claude-code");
+        assert_eq!(dto.model, "sonnet");
     }
 }

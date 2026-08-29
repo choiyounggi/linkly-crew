@@ -62,6 +62,11 @@ where
         mode,
         data_dir: data_root.join(launch_id),
         max_rework: AcceptanceLoop::default_budget(),
+        // contracts-m5.md §C5a defaults: single sprint, escalation cascade
+        // off, default roster — current bridge behavior unchanged.
+        max_per_sprint: 0,
+        escalation_timeout_ms: 0,
+        roster: None,
     };
 
     let handle = RunController::start(cfg).await.map_err(|e| e.to_string())?;

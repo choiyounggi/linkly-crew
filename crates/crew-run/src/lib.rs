@@ -9,4 +9,4 @@ mod observe;
 
 pub use config::{RunConfig, RunError, RunMode};
 pub use controller::{RunController, RunHandle};
-pub use events::{RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};
+pub use events::{RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};
