@@ -1,8 +1,27 @@
 import type { Envelope, TaskDag, TaskSpec, TaskStateDto } from "../../lib/types";
 
+/** 계약 C7c verbatim (rail·board 공통) — 아바타 이니셜 충돌(P/D) 해소. */
+export const AVATAR_INITIALS: Record<string, string> = {
+  lead: "LD",
+  pm: "PM",
+  designer: "DS",
+  publisher: "PB",
+  developer: "DV",
+  qa: "QA",
+};
+
+/** 계약 C7c에 없는 role은 대문자 첫 2자로 폴백. */
+export function avatarInitials(role: string): string {
+  return AVATAR_INITIALS[role] ?? role.slice(0, 2).toUpperCase();
+}
+
+/** 차단 컬럼(escalated ∪ blocked) 카드에만 설정 — 컬럼 내 두 상태를 텍스트 라벨로 구분(C7c). */
+export type BlockReason = "escalated" | "blocked";
+
 export interface BoardCard {
   task: TaskSpec;
   reworkCount: number;
+  blockReason?: BlockReason;
 }
 
 export interface BoardColumns {
@@ -75,7 +94,10 @@ export function deriveBoard(
         columns.accepted.push(card);
         break;
       case "escalated":
-        columns.escalated.push(card);
+        columns.escalated.push({ ...card, blockReason: "escalated" });
+        break;
+      case "blocked":
+        columns.escalated.push({ ...card, blockReason: "blocked" });
         break;
       case "assigned":
         if (corr !== null && isAwaitingReview(corr, messages)) columns.review.push(card);

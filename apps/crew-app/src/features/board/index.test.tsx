@@ -19,6 +19,29 @@ const DAG: TaskDag = {
   ],
 };
 
+const BLOCKED_DAG: TaskDag = {
+  tasks: [
+    {
+      id: "t-escalated",
+      role: "developer",
+      title: "에스컬레이션된 작업",
+      brief: "brief",
+      dod: [],
+      deps: [],
+      artifacts_expected: [],
+    },
+    {
+      id: "t-blocked",
+      role: "qa",
+      title: "차단된 작업",
+      brief: "brief",
+      dod: [],
+      deps: [],
+      artifacts_expected: [],
+    },
+  ],
+};
+
 describe("Board (smoke)", () => {
   afterEach(() => {
     act(() => {
@@ -46,5 +69,30 @@ describe("Board (smoke)", () => {
     });
     render(<Board />);
     expect(screen.getByLabelText("스프린트 보드")).toBeInTheDocument();
+  });
+
+  it("shows the avatar initial (not a colliding single letter) for a designer card", () => {
+    act(() => {
+      useRunStore.setState({ dag: DAG, taskStates: { "t-design": "pending" }, messages: [] });
+    });
+    render(<Board />);
+    expect(screen.getByTitle("designer")).toHaveTextContent("DS");
+  });
+
+  it("shows escalated and blocked cards in 차단, each labeled with its own text", () => {
+    act(() => {
+      useRunStore.setState({
+        dag: BLOCKED_DAG,
+        taskStates: { "t-escalated": "escalated", "t-blocked": "blocked" },
+        messages: [],
+      });
+    });
+    render(<Board />);
+
+    const blocked = screen.getByLabelText("차단");
+    expect(blocked).toHaveTextContent("에스컬레이션된 작업");
+    expect(blocked).toHaveTextContent("차단된 작업");
+    expect(screen.getByText("escalated")).toBeInTheDocument();
+    expect(screen.getByText("blocked")).toBeInTheDocument();
   });
 });

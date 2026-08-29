@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createRunStore } from "../../lib/store";
 import { MockEventSource } from "../../lib/mock-source";
 import type { Envelope, MessageKind, TaskDag, TaskStateDto } from "../../lib/types";
-import { deriveBoard } from "./derive";
+import { AVATAR_INITIALS, avatarInitials, deriveBoard } from "./derive";
 
 const TASK_A = {
   id: "t-a",
@@ -70,6 +70,51 @@ describe("deriveBoard — boundary: no run / unknown ids", () => {
     const taskStates: Record<string, TaskStateDto> = { "t-a": "escalated", "t-b": "pending" };
     const board = deriveBoard(DAG, taskStates, []);
     expect(board.escalated.map((c) => c.task.id)).toEqual(["t-a"]);
+    expect(board.escalated[0].blockReason).toBe("escalated");
+  });
+});
+
+describe("deriveBoard — C7c blocked: blocked tasks join the 차단 column, distinguished from escalated", () => {
+  it("places a blocked task in the same 차단 column as escalated, tagged blockReason=blocked", () => {
+    const taskStates: Record<string, TaskStateDto> = { "t-a": "blocked", "t-b": "pending" };
+    const board = deriveBoard(DAG, taskStates, []);
+    expect(board.escalated.map((c) => c.task.id)).toEqual(["t-a"]);
+    expect(board.escalated[0].blockReason).toBe("blocked");
+  });
+
+  it("keeps escalated and blocked tasks distinguishable by blockReason within the same column", () => {
+    const taskStates: Record<string, TaskStateDto> = { "t-a": "escalated", "t-b": "blocked" };
+    const board = deriveBoard(DAG, taskStates, []);
+    expect(board.escalated).toHaveLength(2);
+    const reasons = new Map(board.escalated.map((c) => [c.task.id, c.blockReason]));
+    expect(reasons.get("t-a")).toBe("escalated");
+    expect(reasons.get("t-b")).toBe("blocked");
+  });
+
+  it("leaves blockReason unset for non-차단 columns", () => {
+    const taskStates: Record<string, TaskStateDto> = { "t-a": "pending", "t-b": "accepted" };
+    const board = deriveBoard(DAG, taskStates, []);
+    expect(board.pending[0].blockReason).toBeUndefined();
+    expect(board.accepted[0].blockReason).toBeUndefined();
+  });
+});
+
+describe("deriveBoard — C7c avatar initials: 6 roles map to distinct 2-letter initials", () => {
+  it("has exactly 6 entries with no duplicate values, matching contract verbatim", () => {
+    expect(Object.keys(AVATAR_INITIALS)).toHaveLength(6);
+    expect(new Set(Object.values(AVATAR_INITIALS)).size).toBe(6);
+    expect(AVATAR_INITIALS).toEqual({
+      lead: "LD",
+      pm: "PM",
+      designer: "DS",
+      publisher: "PB",
+      developer: "DV",
+      qa: "QA",
+    });
+  });
+
+  it("falls back to the uppercased first 2 chars for a role not in the map", () => {
+    expect(avatarInitials("scout")).toBe("SC");
   });
 });
 
