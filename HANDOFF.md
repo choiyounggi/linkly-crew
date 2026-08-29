@@ -135,8 +135,12 @@
   머지로 문구 교체되며 깨짐 → 루트 클래스 계약 단언으로 수정(commit `de8c07c`).
 - 신규: `features/dag`(`buildDagView`·크리티컬 패스·`@xyflow/react` 렌더),
   `features/timeline`(`buildTimeline`·레인·마커), `LiveHandles.controls`.
-- real-CLI mid-sprint 스왑 스팟체크, GUI scripted=false 1클릭: **코디네이터 수동 진행
-  중 — 머지 전 결과 갱신 예정**.
+- real-CLI 스팟체크 **PASS** — 2스프린트 `RealCli` 런에서 mid-sprint designer 스왑
+  ack `Ok` + 개입 0회 완주, 178.97s (`crates/crew-run/tests/m5_swap.rs` `#[ignore]`
+  테스트, 코디네이터 실행). 이 검증이 M5 잠재 결함 2건을 발견·수정함: ① `RealCli`
+  워커 cli-cwd 미생성 → spawn ENOENT 행 (`e761ed3`) ② `HarnessPool` 퍼밋을 러너
+  수명 내내 보유 → claude-code=2 리밋에서 3번째 워커부터 영구 대기 — 퍼밋을 턴 단위로
+  보정 (`with_pool`, `b25ff04` + `656d763`, 계약 D2d).
 - M6 커밋: `9eb368d`(t-ctrl) `de8c07c`(이음새 수정) `312bfd6`(t-swapnow) `a56338f`(t-dag)
   `e5fa4fa`(t-timeline).
 - M6 계약 정본: `archive-20260829-m6a/contracts-m6.md`(예정) — 현재는
@@ -144,9 +148,8 @@
 
 **미검증**:
 - GUI에서 scripted=false 클릭 실행(네이티브 창 — 사람 1클릭 필요; 실 CLI 경로 자체는 위
-  E2E 2건으로 증명됨) — 코디네이터 수동 진행 중.
-- real-CLI mid-sprint 스왑 스팟체크 — 코디네이터 수동 진행 중.
-- Cmd/Browser DoD 실제 실행(M3부터 skip 기록만), 멀티 스프린트 real-CLI 전체 런.
+  E2E 2건으로 증명됨) — Gate 2에서 확인 예정.
+- Cmd/Browser DoD 실제 실행(M3부터 skip 기록만).
 
 **환경** (2026-08-27 갱신):
 - `rustup` 설치 완료, `cargo 1.98.0`(`rustc 1.98.0`) 사용 가능
@@ -240,3 +243,8 @@ contracts-m6.md 예정, 현재 .orchestration/contracts-m6.md)** — RunEvent 3�
     단언했다가, t-dag/t-timeline이 실제 뷰로 교체하며 실패 — 크로스 태스크 스텁을
     단언할 땐 문구가 아니라 **루트 클래스/구조 계약**(안정적으로 유지되는 것)을
     단언할 것.
+19. **`RealCli` 멀티워커 경로는 결정론 테스트로는 안 잡히는 실환경 결함이 있다** (M6
+    real-CLI 스팟체크 실측): cwd 부재로 인한 spawn ENOENT, 세마포어 퍼밋 스코프(러너
+    수명 전체 보유 시 리밋 초과 워커 영구 대기) 둘 다 결정론(`Scripted`) 스위트는
+    통과했지만 실 CLI 2스프린트 런에서만 드러났다 — 새 `RealCli` 경로를 만들면 반드시
+    실 CLI 스팟체크 1회를 코디네이터 수동으로 돌릴 것.
