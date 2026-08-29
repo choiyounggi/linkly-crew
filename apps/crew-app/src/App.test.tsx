@@ -53,4 +53,26 @@ describe("App — tab switching (plan D1/D2)", () => {
     expect(container.querySelector("section.timeline-view")).toBeInTheDocument();
     expect(screen.queryByLabelText("스프린트 보드")).not.toBeInTheDocument();
   });
+
+  it("switches to the inbox stub when the 승인함 tab is clicked", () => {
+    const { container } = render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "승인함" }));
+    expect(container.querySelector("section.inbox-view")).toBeInTheDocument();
+    expect(screen.queryByLabelText("스프린트 보드")).not.toBeInTheDocument();
+  });
+
+  it("switches to the artifacts stub when the 아티팩트 tab is clicked", () => {
+    const { container } = render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "아티팩트" }));
+    expect(container.querySelector("section.artifacts-view")).toBeInTheDocument();
+    expect(screen.queryByLabelText("스프린트 보드")).not.toBeInTheDocument();
+  });
+});
+
+describe("App — search widget (plan D2)", () => {
+  it("mounts the search stub in the header, alongside the command bar", () => {
+    const { container } = render(<App />);
+    const commandBar = container.querySelector(".command-bar");
+    expect(commandBar?.querySelector(".search-box")).toBeInTheDocument();
+  });
 });
