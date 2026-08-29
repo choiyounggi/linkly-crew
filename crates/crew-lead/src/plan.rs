@@ -22,6 +22,13 @@ pub enum PlanError {
     /// the deterministic template.
     #[error("llm specify failed: {0}")]
     LlmSpecify(String),
+    /// `plan_dag_for` requires at least one role (contracts-m7.md §E1).
+    #[error("roles must not be empty")]
+    EmptyRoles,
+    /// `plan_dag_for` rejects a role appearing more than once in `roles`
+    /// (contracts-m7.md §E1).
+    #[error("duplicate role in roles: {0:?}")]
+    DuplicateRole(Role),
 }
 
 /// Turns a one-line request into a [`SpecDoc`] and a 5-role [`TaskDag`].
@@ -59,76 +66,79 @@ impl LeadPlanner {
     }
 
     /// Builds the 5-role linear chain t-pm → t-design → t-publish → t-dev →
-    /// t-qa (DESIGN.md §4.2 role table), each requiring coverage of every
-    /// requirement in `spec` and expecting exactly the artifact contracted
-    /// for its role, then self-validates via [`TaskDag::validate`].
+    /// t-qa (DESIGN.md §4.2 role table) by delegating to [`Self::plan_dag_for`]
+    /// with every role in canonical order — output unchanged from before
+    /// `plan_dag_for` existed (contracts-m7.md §E1).
     pub fn plan_dag(spec: &SpecDoc) -> Result<TaskDag, PlanError> {
+        Self::plan_dag_for(spec, &ROLE_ORDER)
+    }
+
+    /// Builds a task DAG covering exactly `roles` (a non-empty, duplicate-free
+    /// subset of the canonical order `[Pm, Designer, Publisher, Developer,
+    /// Qa]`), chained in that canonical order regardless of `roles`' input
+    /// order: each task depends on the nearest preceding role that is present
+    /// (contracts-m7.md §E1). Per-role id/title/brief/dod/artifacts_expected
+    /// are verbatim the same as `plan_dag`'s historical output for that role.
+    pub fn plan_dag_for(spec: &SpecDoc, roles: &[Role]) -> Result<TaskDag, PlanError> {
+        if roles.is_empty() {
+            return Err(PlanError::EmptyRoles);
+        }
+        for (i, role) in roles.iter().enumerate() {
+            if roles[..i].contains(role) {
+                return Err(PlanError::DuplicateRole(*role));
+            }
+        }
+
         let req_ids: Vec<ReqId> = spec.requirements.iter().map(|r| r.id.clone()).collect();
         let dod = vec![DodCheck::ReqCover {
             ids: req_ids.clone(),
         }];
 
-        let tasks = vec![
-            role_task(
-                "t-pm",
-                Role::Pm,
-                "PM 스펙 정리",
+        let mut tasks = Vec::with_capacity(roles.len());
+        let mut prev_id: Option<String> = None;
+        for role in ROLE_ORDER.iter().copied().filter(|r| roles.contains(r)) {
+            let (id, duty, artifact_name, artifact_kind) = role_meta(role);
+            let deps = prev_id.clone().into_iter().collect();
+            tasks.push(role_task(
+                id,
+                role,
+                duty,
                 &spec.goal,
                 &dod,
-                vec![],
-                "spec.md",
-                "doc",
+                deps,
+                artifact_name,
+                artifact_kind,
                 &req_ids,
-            ),
-            role_task(
-                "t-design",
-                Role::Designer,
-                "디자인",
-                &spec.goal,
-                &dod,
-                vec!["t-pm".to_string()],
-                "design.md",
-                "doc",
-                &req_ids,
-            ),
-            role_task(
-                "t-publish",
-                Role::Publisher,
-                "퍼블리싱",
-                &spec.goal,
-                &dod,
-                vec!["t-design".to_string()],
-                "index.html",
-                "markup",
-                &req_ids,
-            ),
-            role_task(
-                "t-dev",
-                Role::Developer,
-                "개발",
-                &spec.goal,
-                &dod,
-                vec!["t-publish".to_string()],
-                "app.js",
-                "code",
-                &req_ids,
-            ),
-            role_task(
-                "t-qa",
-                Role::Qa,
-                "QA",
-                &spec.goal,
-                &dod,
-                vec!["t-dev".to_string()],
-                "qa-report.md",
-                "report",
-                &req_ids,
-            ),
-        ];
+            ));
+            prev_id = Some(id.to_string());
+        }
 
         let dag = TaskDag { tasks };
         dag.validate()?;
         Ok(dag)
+    }
+}
+
+/// Canonical role order (contracts-m7.md §E1) — the fixed order `plan_dag_for`
+/// chains its `roles` subset in, independent of that slice's input order.
+const ROLE_ORDER: [Role; 5] = [
+    Role::Pm,
+    Role::Designer,
+    Role::Publisher,
+    Role::Developer,
+    Role::Qa,
+];
+
+/// Per-role task id/duty/artifact contract — the single source `plan_dag`
+/// and `plan_dag_for` both build tasks from (contracts-m7.md §E1: "기존
+/// plan_dag의 해당 역할 항목과 동일(verbatim 재사용)").
+fn role_meta(role: Role) -> (&'static str, &'static str, &'static str, &'static str) {
+    match role {
+        Role::Pm => ("t-pm", "PM 스펙 정리", "spec.md", "doc"),
+        Role::Designer => ("t-design", "디자인", "design.md", "doc"),
+        Role::Publisher => ("t-publish", "퍼블리싱", "index.html", "markup"),
+        Role::Developer => ("t-dev", "개발", "app.js", "code"),
+        Role::Qa => ("t-qa", "QA", "qa-report.md", "report"),
     }
 }
 
@@ -292,6 +302,59 @@ mod tests {
     fn slice_accepts_empty_dag_as_boundary() {
         let dag = TaskDag { tasks: vec![] };
         assert_eq!(SprintSlicer::slice(&dag, 3), Ok(vec![]));
+    }
+
+    #[test]
+    fn plan_dag_for_equals_plan_dag_when_given_all_five_roles_in_canonical_order() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let via_wrapper = LeadPlanner::plan_dag(&spec).unwrap();
+        let via_plan_dag_for = LeadPlanner::plan_dag_for(&spec, &ROLE_ORDER).unwrap();
+        assert_eq!(via_wrapper, via_plan_dag_for);
+    }
+
+    #[test]
+    fn plan_dag_for_chains_a_subset_of_roles_in_canonical_order_regardless_of_input_order() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let dag = LeadPlanner::plan_dag_for(&spec, &[Role::Qa, Role::Designer]).unwrap();
+
+        assert_eq!(dag.tasks.len(), 2);
+        assert_eq!(dag.tasks[0].id, "t-design");
+        assert_eq!(dag.tasks[0].role, Role::Designer);
+        assert_eq!(dag.tasks[0].deps, Vec::<String>::new());
+        assert_eq!(dag.tasks[1].id, "t-qa");
+        assert_eq!(dag.tasks[1].role, Role::Qa);
+        assert_eq!(dag.tasks[1].deps, vec!["t-design".to_string()]);
+
+        assert_eq!(dag.validate().unwrap(), vec!["t-design", "t-qa"]);
+    }
+
+    #[test]
+    fn plan_dag_for_builds_a_single_role_with_no_deps() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let dag = LeadPlanner::plan_dag_for(&spec, &[Role::Developer]).unwrap();
+
+        assert_eq!(dag.tasks.len(), 1);
+        assert_eq!(dag.tasks[0].id, "t-dev");
+        assert_eq!(dag.tasks[0].role, Role::Developer);
+        assert_eq!(dag.tasks[0].deps, Vec::<String>::new());
+    }
+
+    #[test]
+    fn plan_dag_for_rejects_empty_roles() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        assert_eq!(
+            LeadPlanner::plan_dag_for(&spec, &[]),
+            Err(PlanError::EmptyRoles)
+        );
+    }
+
+    #[test]
+    fn plan_dag_for_rejects_duplicate_roles() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        assert_eq!(
+            LeadPlanner::plan_dag_for(&spec, &[Role::Pm, Role::Qa, Role::Pm]),
+            Err(PlanError::DuplicateRole(Role::Pm))
+        );
     }
 
     #[test]
