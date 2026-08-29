@@ -36,6 +36,11 @@ fn scripted_config(data_dir: PathBuf, planted_violations: Vec<(Role, Vec<String>
         mode: RunMode::Scripted { planted_violations },
         data_dir,
         max_rework: AcceptanceLoop::default_budget(),
+        // contracts-m5.md §C5a defaults: single sprint, escalation cascade
+        // off, default roster — preserves this file's pre-M5 behavior.
+        max_per_sprint: 0,
+        escalation_timeout_ms: 0,
+        roster: None,
     }
 }
 
@@ -72,6 +77,9 @@ fn event_type_name(ev: &RunEvent) -> &'static str {
         RunEvent::TaskStateChanged { .. } => "task_state_changed",
         RunEvent::BusLifecycle { .. } => "bus_lifecycle",
         RunEvent::RunFinished { .. } => "run_finished",
+        RunEvent::SprintStarted { .. } => "sprint_started",
+        RunEvent::SprintFinished { .. } => "sprint_finished",
+        RunEvent::RosterChanged { .. } => "roster_changed",
     }
 }
 

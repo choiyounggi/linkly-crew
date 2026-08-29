@@ -1,4 +1,5 @@
-//! Run configuration and error types — contract §C3 verbatim.
+//! Run configuration and error types — contract §C3 verbatim, extended by
+//! contracts-m5.md §C5a (multi-sprint fields).
 
 use std::path::PathBuf;
 
@@ -6,7 +7,8 @@ use crew_agent::BusError;
 use crew_ledger::LedgerError;
 use crew_lead::plan::PlanError;
 
-/// One run's configuration (contract §C3).
+/// One run's configuration (contract §C3, extended by contracts-m5.md
+/// §C5a).
 pub struct RunConfig {
     pub goal: String,
     pub mode: RunMode,
@@ -18,9 +20,23 @@ pub struct RunConfig {
     /// (contracts-m3.md layering rule: Lead's budget must exhaust before
     /// CorrGuard's separate max_rounds would).
     pub max_rework: u32,
+    /// Sprint size cap (contracts-m5.md §C5a). `0` = every task in one
+    /// sprint (current single-sprint behavior, unchanged).
+    pub max_per_sprint: usize,
+    /// `Lead`'s escalation-cascade timeout, forwarded verbatim to
+    /// `LeadBehavior::escalation_timeout_ms` (contracts-m5.md §C5a). `0` =
+    /// disabled (default).
+    pub escalation_timeout_ms: u64,
+    /// Agent roster (contracts-m5.md §C5a). `None` = the default 6-slot
+    /// roster (lead + 5 roles, all `claude-code`/`"default"`).
+    pub roster: Option<crew_proto::Roster>,
 }
 
-/// How the run's five crew-member workers behave (contract §C3).
+/// How the run's five crew-member workers behave (contract §C3). `Clone`
+/// so the multi-sprint loop (contracts-m5.md §C5a) can hold one `RunConfig`
+/// value while re-spawning fresh workers from the same `mode` at every
+/// sprint boundary.
+#[derive(Clone)]
 pub enum RunMode {
     /// Deterministic demo/test: five `ScriptedCrewMember`s. `planted_violations`
     /// maps a role to the REQ ids it omits from coverage on its first attempt.
