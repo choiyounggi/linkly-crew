@@ -59,4 +59,10 @@ pub enum RunError {
     Ledger(#[from] LedgerError),
     #[error("lead runner failed: {0}")]
     Join(String),
+    /// `RunHandle::swap_harness` validation failure (contracts-m5.md §C5c,
+    /// t-swap plan D2) — unknown `agent_id` or unknown `harness` id, message
+    /// text distinguishes the two. The roster is left unchanged and no
+    /// event is emitted when this is returned.
+    #[error("swap rejected: {0}")]
+    SwapRejected(String),
 }

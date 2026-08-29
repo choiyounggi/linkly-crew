@@ -18,7 +18,7 @@ use crew_lead::compress::summarize_sprint;
 use crew_lead::dispatch::{LeadBehavior, TaskState};
 use crew_lead::plan::{LeadPlanner, SprintSlicer};
 use crew_ledger::EventLedger;
-use crew_proto::{Envelope, Role, Roster, RosterAgent, SpecDoc, TaskDag};
+use crew_proto::{handoff_body, Envelope, HandoffPack, MessageKind, Role, Roster, RosterAgent, SpecDoc, TaskDag};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -60,6 +60,21 @@ fn role_dir_name(role: Role) -> &'static str {
         Role::Publisher => "publisher",
         Role::Developer => "developer",
         Role::Qa => "qa",
+    }
+}
+
+/// A roster slot's `role` string (`RosterAgent::role`) to `crew_proto::Role`
+/// — `None` for `"lead"` (and anything unrecognized), since that enum has
+/// no `Lead` variant (t-swap plan D3): `swap_harness` skips the handoff
+/// envelope for the lead slot.
+fn role_from_str(role: &str) -> Option<Role> {
+    match role {
+        "pm" => Some(Role::Pm),
+        "designer" => Some(Role::Designer),
+        "publisher" => Some(Role::Publisher),
+        "developer" => Some(Role::Developer),
+        "qa" => Some(Role::Qa),
+        _ => None,
     }
 }
 
@@ -291,6 +306,10 @@ impl RunController {
             agents: roster_to_dto(&roster.lock().expect("roster mutex poisoned")),
             ts: now_ts(),
         });
+        // Cloned before the finisher's `async move` block below moves
+        // `roster` in (t-swap plan D1) — `RunHandle::swap_harness` needs its
+        // own handle on the same `Arc<Mutex<Roster>>` the sprint loop reads.
+        let roster_for_handle = roster.clone();
 
         // Best-effort: if this fails, `EventLedger::open` below fails for
         // the same reason and surfaces as `RunError::Ledger`.
@@ -481,6 +500,7 @@ impl RunController {
             relay_abort,
             finisher: Some(finisher),
             joined_outcome: None,
+            roster: roster_for_handle,
         })
     }
 }
@@ -546,11 +566,18 @@ fn handle_bus_event(
     };
 
     if let BusLifecycleEvent::EnvelopeAccepted { .. } = &event {
-        let prev_last_seq = snapshot.lock().unwrap().last_seq;
+        // Locked for the whole read-query-update section, not just the
+        // initial read (t-swap plan D4): `RunHandle::swap_harness` is a
+        // second caller of this function alongside `subscription_loop`, so
+        // two concurrent calls reading the same `prev_last_seq` before
+        // either updates it could otherwise both see (and double-broadcast)
+        // the same freshly-committed row.
+        let mut snap = snapshot.lock().unwrap();
+        let prev_last_seq = snap.last_seq;
         match ledger.messages_since(prev_last_seq) {
             Ok(messages) => {
                 for message in messages {
-                    snapshot.lock().unwrap().last_seq = message.seq;
+                    snap.last_seq = message.seq;
                     let _ = run_tx.send(RunEvent::Message {
                         seq: message.seq,
                         envelope: message.envelope,
@@ -633,6 +660,10 @@ pub struct RunHandle {
     relay_abort: AbortHandle,
     finisher: Option<JoinHandle<RunOutcomeDto>>,
     joined_outcome: Option<RunOutcomeDto>,
+    /// The same `Arc<Mutex<Roster>>` the sprint loop reads a snapshot of at
+    /// every sprint boundary (t-swap plan D1) — `swap_harness` mutates it
+    /// directly; the next `spawn_sprint` call picks up the change.
+    roster: Arc<Mutex<Roster>>,
 }
 
 impl RunHandle {
@@ -670,6 +701,97 @@ impl RunHandle {
             last_seq: snap.last_seq,
             ts: now_ts(),
         }
+    }
+
+    /// Swaps the harness assigned to `agent_id`'s roster slot — contract
+    /// §C5c (2026-08-29 보정판, t-swap plan). Validates both arguments
+    /// before touching anything: an unknown `agent_id` or a `harness` id
+    /// `HarnessRegistry::make` can't build (`opencode`'s Stub adapter is
+    /// accepted) returns `RunError::SwapRejected` with the roster untouched
+    /// and zero events emitted. On success: the roster slot's harness is
+    /// updated immediately, a `handoff` envelope is appended straight to
+    /// the ledger and broadcast as `Message` (skipped for the `lead` slot —
+    /// plan D3, `crew_proto::Role` has no `Lead` variant), then
+    /// `RosterChanged` broadcasts the updated roster. No running session is
+    /// touched here — the swap takes effect at the next sprint boundary,
+    /// when `spawn_sprint` reads a fresh roster snapshot (plan D5).
+    pub async fn swap_harness(&self, agent_id: &str, harness: &str) -> Result<(), RunError> {
+        {
+            let roster = self.roster.lock().expect("roster mutex poisoned");
+            if !roster.agents.iter().any(|a| a.id == agent_id) {
+                return Err(RunError::SwapRejected(format!("unknown agent id: {agent_id}")));
+            }
+        }
+        if HarnessRegistry::make(harness).is_none() {
+            return Err(RunError::SwapRejected(format!("unknown harness id: {harness}")));
+        }
+
+        let (old_harness, role_str) = {
+            let mut roster = self.roster.lock().expect("roster mutex poisoned");
+            let slot = roster
+                .agents
+                .iter_mut()
+                .find(|a| a.id == agent_id)
+                .expect("agent_id presence was just checked above");
+            let old_harness = std::mem::replace(&mut slot.harness, harness.to_string());
+            (old_harness, slot.role.clone())
+        };
+
+        if let Some(role) = role_from_str(&role_str) {
+            let (goal, done, in_flight) = {
+                let snap = self.snapshot.lock().unwrap();
+                let done = snap
+                    .task_states
+                    .iter()
+                    .filter(|(_, state)| *state == TaskStateDto::Accepted)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let in_flight = snap
+                    .task_states
+                    .iter()
+                    .filter(|(_, state)| *state == TaskStateDto::Assigned)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                (snap.goal.clone(), done, in_flight)
+            };
+            let pack = HandoffPack {
+                role,
+                spec_ref: goal,
+                done,
+                in_flight,
+                decisions: Vec::new(),
+                open_questions: Vec::new(),
+                notes: format!("harness swap: {old_harness} -> {harness}"),
+            };
+            let envelope = Envelope::new(
+                // Literal duplicate of crew-lead::dispatch's private
+                // `SPRINT_LABEL` (t-swap plan D4) — that crate is out of
+                // scope for this task so the constant can't be imported;
+                // unifying the two is a separate, scoped-out refactor.
+                "sp-m3".to_string(),
+                format!("th-swap-{agent_id}"),
+                "agent:lead".to_string(),
+                vec![agent_id.to_string()],
+                MessageKind::Handoff,
+                None,
+                format!("swap-{}", uuid::Uuid::new_v4()),
+                handoff_body(&pack),
+                Vec::new(),
+                false,
+                900_000,
+            );
+            handle_bus_event(
+                &self.ledger,
+                &self.run_tx,
+                &self.snapshot,
+                BusLifecycleEvent::EnvelopeAccepted { envelope },
+            );
+        }
+
+        let agents = roster_to_dto(&self.roster.lock().expect("roster mutex poisoned"));
+        let _ = self.run_tx.send(RunEvent::RosterChanged { agents, ts: now_ts() });
+
+        Ok(())
     }
 
     /// Waits for the Lead runner to finish (contract §C3). Idempotent: a
