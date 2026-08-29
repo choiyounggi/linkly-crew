@@ -433,6 +433,139 @@ fn file_backed_ledger_persists_messages_across_reopen() {
     std::fs::remove_file(&db_path).expect("clean up .crew-test db file");
 }
 
+/// Normal case (contract §E6): a message whose body/thread text contains a
+/// query token is matched by `search_messages`; a message that does not
+/// contain it is excluded from the results.
+#[test]
+fn search_messages_matches_body_text_and_excludes_non_matches() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+    let mut matching = envelope("agent:sender", "agent:receiver", "req_1");
+    matching.body = json!({"note": "please review the widget design"});
+    let mut other = envelope("agent:sender", "agent:receiver", "req_2");
+    other.body = json!({"note": "unrelated status update"});
+
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: matching.clone(),
+        })
+        .expect("append matching envelope");
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: other.clone(),
+        })
+        .expect("append other envelope");
+
+    let results = ledger.search_messages("widget", 10).expect("search_messages");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].envelope, matching);
+}
+
+/// Boundary case (contract §E6): FTS5 special-syntax characters in the
+/// query (quotes, `*`, `-`, `NEAR(`) do not produce a MATCH syntax error —
+/// each token is quote-escaped before being combined.
+#[test]
+fn search_messages_with_fts5_special_characters_does_not_error() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+    let mut env = envelope("agent:sender", "agent:receiver", "req_1");
+    env.body = json!({"note": "widget design review"});
+    ledger
+        .append(&BusEvent::EnvelopeAccepted { envelope: env })
+        .expect("append envelope");
+
+    for query in ["\"a\"b", "widget*", "-widget", "NEAR(widget design)"] {
+        let result = ledger.search_messages(query, 10);
+        assert!(
+            result.is_ok(),
+            "query {query:?} should not error, got {result:?}"
+        );
+    }
+}
+
+/// Boundary case (contract §E6): an empty or whitespace-only query returns
+/// an empty result without touching sqlite's MATCH syntax at all.
+#[test]
+fn search_messages_with_empty_or_whitespace_query_returns_empty() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+    let mut env = envelope("agent:sender", "agent:receiver", "req_1");
+    env.body = json!({"note": "widget design review"});
+    ledger
+        .append(&BusEvent::EnvelopeAccepted { envelope: env })
+        .expect("append envelope");
+
+    assert!(ledger.search_messages("", 10).unwrap().is_empty());
+    assert!(ledger.search_messages("   ", 10).unwrap().is_empty());
+}
+
+/// Idempotent case (contract §E6): re-appending the same envelope id (at-
+/// least-once redelivery) must not create a second `messages_fts` row —
+/// the search result stays at exactly one hit.
+#[test]
+fn search_messages_after_duplicate_redelivery_returns_one_result() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+    let mut env = envelope("agent:sender", "agent:receiver", "req_1");
+    env.body = json!({"note": "widget design review"});
+
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: env.clone(),
+        })
+        .expect("append EnvelopeAccepted (first)");
+    ledger
+        .append(&BusEvent::EnvelopeAccepted {
+            envelope: env.clone(),
+        })
+        .expect("append EnvelopeAccepted (duplicate)");
+
+    let results = ledger.search_messages("widget", 10).expect("search_messages");
+    assert_eq!(
+        results.len(),
+        1,
+        "duplicate redelivery must not create a second fts row"
+    );
+    assert_eq!(results[0].envelope, env);
+}
+
+/// Boundary case (contract §E6): results are matched against `thread` text
+/// too (not just body), and `limit` caps the number of rows returned.
+#[test]
+fn search_messages_matches_thread_text_and_respects_limit() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+    for i in 0..3 {
+        let mut env = envelope("agent:sender", "agent:receiver", &format!("req_{i}"));
+        env.thread = "th-searchable-topic".to_string();
+        env.id = format!("msg_{i}");
+        ledger
+            .append(&BusEvent::EnvelopeAccepted { envelope: env })
+            .expect("append envelope");
+    }
+
+    let results = ledger
+        .search_messages("searchable", 2)
+        .expect("search_messages");
+    assert_eq!(results.len(), 2, "limit must cap the number of results");
+}
+
+/// Error case (brief D6 pattern used across this file, contract §E6): a
+/// non-`EnvelopeAccepted` event is never indexed into `messages_fts`, so a
+/// query for its content finds nothing.
+#[test]
+fn search_messages_does_not_index_non_envelope_events() {
+    let ledger = EventLedger::open_in_memory().expect("open in-memory ledger");
+    ledger
+        .append(&BusEvent::Registered {
+            agent_id: "agent:widget-owner".to_string(),
+        })
+        .expect("append Registered");
+
+    let results = ledger
+        .search_messages("widget", 10)
+        .expect("search_messages");
+    assert!(
+        results.is_empty(),
+        "non-EnvelopeAccepted events must not be indexed into messages_fts"
+    );
+}
+
 /// Error case (brief D6): a corrupt `envelope_json` row surfaces as
 /// `LedgerError::Serialize` from `messages_since`, not a silent skip.
 #[test]
