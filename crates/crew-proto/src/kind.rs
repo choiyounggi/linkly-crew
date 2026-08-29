@@ -25,13 +25,15 @@ pub enum MessageKind {
     Handoff,
     #[serde(rename = "human.gate")]
     HumanGate,
+    #[serde(rename = "human.response")]
+    HumanResponse,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn all_kinds_and_wire_strings() -> [(MessageKind, &'static str); 11] {
+    fn all_kinds_and_wire_strings() -> [(MessageKind, &'static str); 12] {
         [
             (MessageKind::TaskAssign, "task.assign"),
             (MessageKind::TaskAck, "task.ack"),
@@ -44,13 +46,14 @@ mod tests {
             (MessageKind::Blocked, "blocked"),
             (MessageKind::Handoff, "handoff"),
             (MessageKind::HumanGate, "human.gate"),
+            (MessageKind::HumanResponse, "human.response"),
         ]
     }
 
     #[test]
-    fn all_11_kinds_round_trip_their_wire_string() {
+    fn all_12_kinds_round_trip_their_wire_string() {
         let cases = all_kinds_and_wire_strings();
-        assert_eq!(cases.len(), 11);
+        assert_eq!(cases.len(), 12);
         for (kind, wire) in cases {
             let serialized = serde_json::to_string(&kind).unwrap();
             assert_eq!(serialized, format!("\"{wire}\""));
