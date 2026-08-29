@@ -235,16 +235,20 @@ async fn spawn_sprint(
                     cwd: role_cli_cwd(data_dir, role),
                 };
                 let system_hint = format!("You are the {role:?} of a crew building: {goal}");
-                let mut behavior = RoleHarnessBehavior::new(harness, harness_cfg, role, system_hint);
+                // Permit is scoped to each CLI interaction (turn), not the
+                // runner's lifetime (contracts-m6.md §D2d) — a runner-
+                // lifetime `pool.acquire` plus `RoleHarnessBehavior`'s
+                // never-`is_done()` loop meant only `claude-code`'s default
+                // limit-2 workers could ever start their bus loop, so the
+                // 3rd `task.assign` onward hung forever (real-CLI spot
+                // check). `with_pool` acquires/drops the permit around each
+                // turn's spawn+send instead.
+                let mut behavior = RoleHarnessBehavior::new(harness, harness_cfg, role, system_hint)
+                    .with_pool(pool.clone(), harness_id.clone());
                 if let Some(text) = l1 {
                     behavior = behavior.with_injected_context(text.to_string());
                 }
-                let pool = pool.clone();
-                let acquire_id = harness_id.clone();
-                let task = tokio::spawn(async move {
-                    let _permit = pool.acquire(&acquire_id).await;
-                    AgentRunner::run_with_control(conn, behavior, ctrl_rx).await
-                });
+                let task = tokio::spawn(AgentRunner::run_with_control(conn, behavior, ctrl_rx));
                 worker_aborts.push(task.abort_handle());
                 controls.insert(agent_id.to_string(), ctrl_tx);
             }
