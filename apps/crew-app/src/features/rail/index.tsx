@@ -1,5 +1,5 @@
 import { useRunStore } from "../../lib/store";
-import { deriveRail, type AgentCard, type RailStatus } from "./derive";
+import { avatarInitials, deriveRail, type AgentCard, type RailStatus } from "./derive";
 import "./rail.css";
 
 const STATUS_LABEL: Record<RailStatus, string> = {
@@ -21,6 +21,9 @@ function Card({ card }: { card: AgentCard }) {
   return (
     <li className="rail-card">
       <div className="rail-card__header">
+        <span className="rail-card__avatar" aria-hidden="true">
+          {avatarInitials(card.role)}
+        </span>
         <span className="rail-card__name">{ROLE_LABEL[card.role]}</span>
         <span className={`rail-badge rail-badge--${card.status}`}>{STATUS_LABEL[card.status]}</span>
       </div>
@@ -36,7 +39,8 @@ export default function Rail() {
   const messages = useRunStore((s) => s.messages);
   const runId = useRunStore((s) => s.runId);
   const finished = useRunStore((s) => s.finished);
-  const cards = deriveRail(dag, taskStates, messages, runId, finished);
+  const roster = useRunStore((s) => s.roster);
+  const cards = deriveRail(dag, taskStates, messages, runId, finished, roster);
 
   return (
     <section className="panel panel--rail" aria-label="에이전트 레일">

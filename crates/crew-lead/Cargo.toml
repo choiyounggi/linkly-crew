@@ -7,6 +7,7 @@ edition = "2021"
 crew-proto = { path = "../crew-proto" }
 crew-bus = { path = "../crew-bus" }
 crew-agent = { path = "../crew-agent" }
+crew-harness = { path = "../crew-harness" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -17,4 +18,3 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 crew-ledger = { path = "../crew-ledger" }
-crew-harness = { path = "../crew-harness" }

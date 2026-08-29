@@ -1,26 +1,40 @@
 //! `RunController`/`RunHandle` — the m3_sprint.rs assembly pattern (bus →
 //! ledger → single subscription loop → 5 workers → `ObservingLead`)
-//! promoted to a reusable crate, contract §C3.
+//! promoted to a reusable crate, contract §C3, extended by
+//! contracts-m5.md §C5a to a sequential multi-sprint loop: one run's bus/
+//! ledger/subscription-loop/broadcast/relay are created once (plan D1) and
+//! reused across every sprint slice, while each sprint gets a fresh set of
+//! workers and a fresh `LeadBehavior` seeded with the accumulated terminal
+//! states of every earlier sprint (`with_prior_states`, contract C3a).
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crew_agent::{AgentRunner, BusConn, RoleHarnessBehavior, RunnerError, ScriptedCrewMember};
 use crew_bus::{BusConfig, BusEvent as BusLifecycleEvent, BusHandle, BusServer};
-use crew_harness::claude::ClaudeCodeHarness;
-use crew_harness::{AgentCfg as HarnessAgentCfg, Harness};
-use crew_lead::dispatch::LeadBehavior;
-use crew_lead::plan::{LeadPlanner, SprintSlicer};
+use crew_harness::{AgentCfg as HarnessAgentCfg, Harness, HarnessPool, HarnessRegistry};
+use crew_lead::compress::summarize_sprint;
+use crew_lead::dispatch::{LeadBehavior, TaskState};
+use crew_lead::plan::{LeadPlanner, PlanError, SprintSlicer};
+use crew_lead::plan_llm::LlmLeadPlanner;
 use crew_ledger::EventLedger;
-use crew_proto::{Role, SpecDoc, TaskDag};
+use crew_proto::{handoff_body, Envelope, HandoffPack, MessageKind, Role, Roster, RosterAgent, SpecDoc, TaskDag};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::config::{RunConfig, RunError, RunMode};
-use crate::events::{now_ts, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};
+use crate::events::{now_ts, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};
 use crate::observe::{ObservingLead, TaskStateChange};
 
 const CHANNEL_CAPACITY: usize = 256;
+
+/// L1 assembly budget for `summarize_sprint` (contracts-m5.md §C5a plan
+/// D6) — ≈4k tokens, per backend/common/llm/context-window-budget.md's
+/// "derive the cap from the serving model" guidance applied to a fixed L1
+/// slice rather than the whole context window.
+const L1_BUDGET_CHARS: usize = 16_000;
 
 /// The five fixed M3 roles and their agent ids (m3_sprint.rs `roles_all`).
 fn roles_all() -> [(&'static str, Role); 5] {
@@ -50,12 +64,76 @@ fn role_dir_name(role: Role) -> &'static str {
     }
 }
 
+/// A roster slot's `role` string (`RosterAgent::role`) to `crew_proto::Role`
+/// — `None` for `"lead"` (and anything unrecognized), since that enum has
+/// no `Lead` variant (t-swap plan D3): `swap_harness` skips the handoff
+/// envelope for the lead slot.
+fn role_from_str(role: &str) -> Option<Role> {
+    match role {
+        "pm" => Some(Role::Pm),
+        "designer" => Some(Role::Designer),
+        "publisher" => Some(Role::Publisher),
+        "developer" => Some(Role::Developer),
+        "qa" => Some(Role::Qa),
+        _ => None,
+    }
+}
+
+/// The default 6-slot roster (contracts-m5.md §C5a: `None` = lead + 5
+/// roles, all `claude-code`/`"default"`) — team size is fixed (contract
+/// §C0), only harness/model assignment varies per slot.
+fn default_roster() -> Roster {
+    let slot = |id: &str, role: &str| RosterAgent {
+        id: id.to_string(),
+        role: role.to_string(),
+        harness: "claude-code".to_string(),
+        model: "default".to_string(),
+        instructions: String::new(),
+    };
+    Roster {
+        agents: vec![
+            slot("agent:lead", "lead"),
+            slot("agent:pm", "pm"),
+            slot("agent:designer", "designer"),
+            slot("agent:publisher", "publisher"),
+            slot("agent:developer", "developer"),
+            slot("agent:qa", "qa"),
+        ],
+    }
+}
+
+fn roster_to_dto(roster: &Roster) -> Vec<RosterAgentDto> {
+    roster.agents.iter().map(RosterAgentDto::from).collect()
+}
+
+/// The roster slot's harness id for `agent_id`, or `"claude-code"` if the
+/// roster has no matching slot (plan D6 default).
+fn harness_id_for(roster: &Roster, agent_id: &str) -> String {
+    roster
+        .agents
+        .iter()
+        .find(|a| a.id == agent_id)
+        .map(|a| a.harness.clone())
+        .unwrap_or_else(|| "claude-code".to_string())
+}
+
+/// L1 context assembled at every sprint boundary after the first (plan
+/// D6): the spec goal plus every prior sprint's summary text, joined —
+/// injected into `RealCli` workers' first turn via
+/// `RoleHarnessBehavior::with_injected_context`.
+fn l1_context(goal: &str, summaries_so_far: &[String]) -> String {
+    format!("[공유 사실]\n목표: {goal}\n\n{}", summaries_so_far.join("\n\n"))
+}
+
 /// Shared, mutex-guarded run state — `snapshot()`'s source of truth
 /// besides the ledger (plan D5).
 struct SnapshotState {
     goal: String,
     spec: Option<SpecDoc>,
     dag: Option<TaskDag>,
+    /// Every task id across every sprint, in topological order (plan D1)
+    /// — the currently-active sprint's own subset is carried separately by
+    /// each `SprintStarted.task_ids`.
     sprint: Vec<String>,
     task_states: Vec<(String, TaskStateDto)>,
     /// `messages` table seq — same space as `RunEvent::Message.seq`
@@ -63,17 +141,148 @@ struct SnapshotState {
     last_seq: i64,
 }
 
+/// One sprint's just-spawned workers/lead (plan D1/D5/D6).
+struct SpawnedSprint {
+    worker_aborts: Vec<AbortHandle>,
+    lead_task: JoinHandle<Result<(), RunnerError>>,
+}
+
+/// Connects this sprint's five workers plus its `ObservingLead`-wrapped
+/// Lead: `Scripted` always spawns a fresh `ScriptedCrewMember` per role per
+/// sprint (session-restart semantics via a brand new instance, contract
+/// C5a); `RealCli` resolves each role's harness id from `roster`, skipping
+/// (logging, not failing) any role whose `HarnessRegistry::make` returns
+/// `None` (plan D6 — assembly-only, this path is never exercised by a
+/// worker test) and injecting `l1` on sprint index > 0.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_sprint(
+    url: &str,
+    token: &str,
+    mode: &RunMode,
+    goal: &str,
+    data_dir: &Path,
+    roster: &Roster,
+    pool: &Arc<HarnessPool>,
+    dag: &TaskDag,
+    sprint_tasks: &[String],
+    l1: Option<&str>,
+    max_rework: u32,
+    escalation_timeout_ms: u64,
+    cumulative: Arc<Mutex<HashMap<String, TaskState>>>,
+    ts_tx: mpsc::UnboundedSender<TaskStateChange>,
+) -> Result<SpawnedSprint, RunError> {
+    let mut worker_aborts = Vec::new();
+    for (agent_id, role) in roles_all() {
+        let conn = BusConn::connect(url, token, agent_id).await?;
+        match mode {
+            RunMode::Scripted { planted_violations } => {
+                let planted = planted_violations
+                    .iter()
+                    .find(|(r, _)| *r == role)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                let member = ScriptedCrewMember::new(agent_id, role, planted);
+                let task = tokio::spawn(AgentRunner::run(conn, member));
+                worker_aborts.push(task.abort_handle());
+            }
+            RunMode::RealCli => {
+                let harness_id = harness_id_for(roster, agent_id);
+                let harness: Option<Arc<dyn Harness>> = HarnessRegistry::make(&harness_id);
+                let Some(harness) = harness else {
+                    tracing::warn!(
+                        agent_id,
+                        harness_id,
+                        "no adapter for this harness id; skipping worker spawn (RealCli assembly-only path)"
+                    );
+                    continue;
+                };
+                let harness_cfg = HarnessAgentCfg {
+                    cwd: data_dir.join("cli-cwd").join(role_dir_name(role)),
+                };
+                let system_hint = format!("You are the {role:?} of a crew building: {goal}");
+                let mut behavior = RoleHarnessBehavior::new(harness, harness_cfg, role, system_hint);
+                if let Some(text) = l1 {
+                    behavior = behavior.with_injected_context(text.to_string());
+                }
+                let pool = pool.clone();
+                let acquire_id = harness_id.clone();
+                let task = tokio::spawn(async move {
+                    let _permit = pool.acquire(&acquire_id).await;
+                    AgentRunner::run(conn, behavior).await
+                });
+                worker_aborts.push(task.abort_handle());
+            }
+        }
+    }
+
+    let lead_conn = BusConn::connect(url, token, "agent:lead").await?;
+    let prior_states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
+    let lead_behavior = LeadBehavior::new(
+        "agent:lead",
+        dag.clone(),
+        sprint_tasks.to_vec(),
+        roles_routing(),
+        max_rework,
+    )
+    .with_prior_states(prior_states)
+    .escalation_timeout_ms(escalation_timeout_ms);
+    let observing = ObservingLead::new(lead_behavior, sprint_tasks.to_vec(), ts_tx, cumulative);
+    let lead_task = tokio::spawn(AgentRunner::run(lead_conn, observing));
+
+    Ok(SpawnedSprint { worker_aborts, lead_task })
+}
+
+/// The abort handles for whichever sprint's workers/lead are currently
+/// live — read by [`RunHandle::shutdown`], written by the orchestrator at
+/// every sprint boundary (plan D1: dynamic per-sprint respawn means a
+/// fixed field on `RunHandle` can no longer describe "the currently
+/// running tasks").
+struct LiveHandles {
+    worker_aborts: Vec<AbortHandle>,
+    lead_abort: AbortHandle,
+}
+
+/// Drains the subscription loop's already-buffered bus-event backlog
+/// (plan D2/finisher pattern) so `ledger.messages_since` sees everything
+/// this sprint (or, at the very end, this run) has produced so far before
+/// the caller reads it.
+async fn drain_subscription_backlog(drain_tx: &mpsc::UnboundedSender<oneshot::Sender<()>>) {
+    let (ack_tx, ack_rx) = oneshot::channel();
+    if drain_tx.send(ack_tx).is_ok() {
+        let _ = ack_rx.await;
+    }
+}
+
 pub struct RunController;
 
 impl RunController {
     pub async fn start(cfg: RunConfig) -> Result<RunHandle, RunError> {
-        let spec = LeadPlanner::specify(&cfg.goal)?;
+        let spec = match &cfg.mode {
+            RunMode::Scripted { .. } => LeadPlanner::specify(&cfg.goal)?,
+            RunMode::RealCli => {
+                // Lead slot's harness id, falling back to claude-code if the
+                // roster names an id with no adapter (contracts-m5.md §C3c
+                // controller wiring — mirrors spawn_sprint's RealCli branch).
+                let roster = cfg.roster.clone().unwrap_or_else(default_roster);
+                let harness_id = harness_id_for(&roster, "agent:lead");
+                let harness = HarnessRegistry::make(&harness_id)
+                    .or_else(|| HarnessRegistry::make("claude-code"))
+                    .ok_or_else(|| {
+                        PlanError::LlmSpecify(format!(
+                            "no harness adapter for lead harness id \"{harness_id}\" or fallback \"claude-code\""
+                        ))
+                    })?;
+                LlmLeadPlanner::specify(harness, &cfg.goal).await?
+            }
+        };
         let dag = LeadPlanner::plan_dag(&spec)?;
-        // Fixed 5-task M3 template: one chunk always holds every task.
-        let sprint = SprintSlicer::slice(&dag, dag.tasks.len().max(1))?
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        let effective_max = if cfg.max_per_sprint == 0 {
+            dag.tasks.len().max(1)
+        } else {
+            cfg.max_per_sprint
+        };
+        let sprints = SprintSlicer::slice(&dag, effective_max)?;
+        let full_order: Vec<String> = sprints.iter().flatten().cloned().collect();
 
         let run_id = uuid::Uuid::new_v4().to_string();
         let token = uuid::Uuid::new_v4().to_string();
@@ -88,8 +297,8 @@ impl RunController {
             goal: cfg.goal.clone(),
             spec: Some(spec.clone()),
             dag: Some(dag.clone()),
-            sprint: sprint.clone(),
-            task_states: sprint
+            sprint: full_order.clone(),
+            task_states: full_order
                 .iter()
                 .map(|id| (id.clone(), TaskStateDto::Pending))
                 .collect(),
@@ -104,9 +313,21 @@ impl RunController {
         let _ = run_tx.send(RunEvent::SpecReady {
             spec: spec.clone(),
             dag: dag.clone(),
-            sprint: sprint.clone(),
+            sprint: full_order.clone(),
             ts: now_ts(),
         });
+
+        // RosterChanged fires once right after RunStarted/SpecReady (plan
+        // D4/contract C5a) — before any sprint's workers spawn.
+        let roster = Arc::new(Mutex::new(cfg.roster.clone().unwrap_or_else(default_roster)));
+        let _ = run_tx.send(RunEvent::RosterChanged {
+            agents: roster_to_dto(&roster.lock().expect("roster mutex poisoned")),
+            ts: now_ts(),
+        });
+        // Cloned before the finisher's `async move` block below moves
+        // `roster` in (t-swap plan D1) — `RunHandle::swap_harness` needs its
+        // own handle on the same `Arc<Mutex<Roster>>` the sprint loop reads.
+        let roster_for_handle = roster.clone();
 
         // Best-effort: if this fails, `EventLedger::open` below fails for
         // the same reason and surfaces as `RunError::Ledger`.
@@ -132,76 +353,152 @@ impl RunController {
             drain_rx,
         ));
 
-        let mut worker_tasks: Vec<JoinHandle<Result<(), RunnerError>>> = Vec::new();
-        for (agent_id, role) in roles_all() {
-            let conn = BusConn::connect(&url, &token, agent_id).await?;
-            match &cfg.mode {
-                RunMode::Scripted { planted_violations } => {
-                    let planted = planted_violations
-                        .iter()
-                        .find(|(r, _)| *r == role)
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_default();
-                    let member = ScriptedCrewMember::new(agent_id, role, planted);
-                    worker_tasks.push(tokio::spawn(AgentRunner::run(conn, member)));
-                }
-                RunMode::RealCli => {
-                    let harness: Arc<dyn Harness> = Arc::new(ClaudeCodeHarness::new());
-                    let harness_cfg = HarnessAgentCfg {
-                        cwd: cfg.data_dir.join("cli-cwd").join(role_dir_name(role)),
-                    };
-                    let system_hint =
-                        format!("You are the {role:?} of a crew building: {}", cfg.goal);
-                    let behavior = RoleHarnessBehavior::new(harness, harness_cfg, role, system_hint);
-                    worker_tasks.push(tokio::spawn(AgentRunner::run(conn, behavior)));
-                }
-            }
-        }
-
-        let lead_conn = BusConn::connect(&url, &token, "agent:lead").await?;
+        // One relay + one channel for the whole run (plan D1): every
+        // sprint's `ObservingLead` gets its own clone of `ts_tx`.
         let (ts_tx, ts_rx) = mpsc::unbounded_channel::<TaskStateChange>();
-        let lead_behavior = LeadBehavior::new(
-            "agent:lead",
-            dag.clone(),
-            sprint.clone(),
-            roles_routing(),
-            cfg.max_rework,
-        );
-        let observing = ObservingLead::new(lead_behavior, sprint.clone(), ts_tx);
-        let lead_task: JoinHandle<Result<(), RunnerError>> =
-            tokio::spawn(AgentRunner::run(lead_conn, observing));
-        let lead_abort = lead_task.abort_handle();
-
         let relay_task = tokio::spawn(relay_loop(ts_rx, run_tx.clone(), snapshot.clone()));
         let relay_abort = relay_task.abort_handle();
+
+        // One cumulative terminal-state map for the whole run (plan
+        // D1/C3a): every sprint's `ObservingLead` writes its own task ids
+        // into it, so `with_prior_states` for sprint N+1 already has every
+        // earlier sprint's outcome.
+        let cumulative: Arc<Mutex<HashMap<String, TaskState>>> = Arc::new(Mutex::new(HashMap::new()));
+        let pool = HarnessPool::with_defaults();
+
+        let sprint0 = sprints.first().cloned().unwrap_or_default();
+        let _ = run_tx.send(RunEvent::SprintStarted {
+            index: 0,
+            task_ids: sprint0.clone(),
+            ts: now_ts(),
+        });
+        let roster_snapshot0 = roster.lock().expect("roster mutex poisoned").clone();
+        let spawned0 = spawn_sprint(
+            &url,
+            &token,
+            &cfg.mode,
+            &cfg.goal,
+            &cfg.data_dir,
+            &roster_snapshot0,
+            &pool,
+            &dag,
+            &sprint0,
+            None,
+            cfg.max_rework,
+            cfg.escalation_timeout_ms,
+            cumulative.clone(),
+            ts_tx.clone(),
+        )
+        .await?;
+        let live = Arc::new(Mutex::new(LiveHandles {
+            worker_aborts: spawned0.worker_aborts.clone(),
+            lead_abort: spawned0.lead_task.abort_handle(),
+        }));
 
         // Controller is the single `RunEvent` emission point (plan D4):
         // `ObservingLead` only sends to the relay's mpsc channel, never
         // broadcasts directly.
         let finisher_run_tx = run_tx.clone();
+        let finisher_ledger = ledger.clone();
+        let mode = cfg.mode.clone();
+        let goal = cfg.goal.clone();
+        let data_dir = cfg.data_dir.clone();
+        let max_rework = cfg.max_rework;
+        let escalation_timeout_ms = cfg.escalation_timeout_ms;
+        let finisher_live = live.clone();
         let finisher: JoinHandle<RunOutcomeDto> = tokio::spawn(async move {
-            let lead_result = lead_task.await;
-            // Every `EnvelopeAccepted`/lifecycle `BusEvent` this run will
-            // ever produce was broadcast by the bus strictly before the
-            // corresponding envelope was delivered to the Lead (contract
-            // §C1: "Emitted exactly once ... before delivery is
-            // attempted") — so by the time `lead_task` resolves, the
-            // subscription loop's already-buffered backlog is everything
-            // relevant. Ask it to drain that backlog before announcing
-            // `RunFinished`, so a subscriber never observes `run_finished`
-            // ahead of a `message`/`bus_lifecycle` event it should have
-            // preceded.
-            let (ack_tx, ack_rx) = oneshot::channel();
-            if drain_tx.send(ack_tx).is_ok() {
-                let _ = ack_rx.await;
+            let mut current_worker_aborts = spawned0.worker_aborts;
+            let mut current_lead_task = spawned0.lead_task;
+
+            let mut boundary_seq: i64 = 0;
+            let mut summaries: Vec<String> = Vec::new();
+            let mut outcome = RunOutcomeDto::Completed;
+
+            for (index, sprint_tasks) in sprints.iter().enumerate() {
+                if index > 0 {
+                    let _ = finisher_run_tx.send(RunEvent::SprintStarted {
+                        index: index as u32,
+                        task_ids: sprint_tasks.clone(),
+                        ts: now_ts(),
+                    });
+                    let l1 = l1_context(&goal, &summaries);
+                    let roster_snapshot = roster.lock().expect("roster mutex poisoned").clone();
+                    match spawn_sprint(
+                        &url,
+                        &token,
+                        &mode,
+                        &goal,
+                        &data_dir,
+                        &roster_snapshot,
+                        &pool,
+                        &dag,
+                        sprint_tasks,
+                        Some(&l1),
+                        max_rework,
+                        escalation_timeout_ms,
+                        cumulative.clone(),
+                        ts_tx.clone(),
+                    )
+                    .await
+                    {
+                        Ok(spawned) => {
+                            *finisher_live.lock().expect("live handles mutex poisoned") = LiveHandles {
+                                worker_aborts: spawned.worker_aborts.clone(),
+                                lead_abort: spawned.lead_task.abort_handle(),
+                            };
+                            current_worker_aborts = spawned.worker_aborts;
+                            current_lead_task = spawned.lead_task;
+                        }
+                        Err(err) => {
+                            tracing::error!(error = %err, index, "failed to spawn sprint; ending run early");
+                            outcome = RunOutcomeDto::Failed;
+                            break;
+                        }
+                    }
+                }
+
+                let lead_result = (&mut current_lead_task).await;
+                for handle in &current_worker_aborts {
+                    handle.abort();
+                }
+
+                drain_subscription_backlog(&drain_tx).await;
+
+                let stored = finisher_ledger.messages_since(boundary_seq).unwrap_or_default();
+                boundary_seq = stored.iter().map(|m| m.seq).max().unwrap_or(boundary_seq);
+                let sprint_messages: Vec<Envelope> = stored.into_iter().map(|m| m.envelope).collect();
+                let states_snapshot = cumulative.lock().expect("cumulative state mutex poisoned").clone();
+                let summary = summarize_sprint(
+                    index as u32,
+                    &spec,
+                    sprint_tasks,
+                    &states_snapshot,
+                    &sprint_messages,
+                    L1_BUDGET_CHARS,
+                );
+                summaries.push(summary.text.clone());
+                let _ = finisher_run_tx.send(RunEvent::SprintFinished {
+                    index: index as u32,
+                    summary: summary.text,
+                    ts: now_ts(),
+                });
+
+                let sprint_ok = matches!(lead_result, Ok(Ok(())));
+                if !sprint_ok {
+                    outcome = RunOutcomeDto::Failed;
+                    break;
+                }
             }
-            // Wait for the relay to flush every already-queued
-            // `TaskStateChanged` before announcing `RunFinished`.
+
+            // Every clone of `ts_tx` besides this one has already been
+            // dropped (each sprint's `ObservingLead` was consumed and
+            // dropped once its `lead_task` resolved) — dropping this last
+            // one lets `relay_loop`'s `while let Some(..) = recv().await`
+            // end so every already-queued `TaskStateChanged` is flushed
+            // before `RunFinished`.
+            drop(ts_tx);
             let _ = relay_task.await;
-            let outcome = match lead_result {
-                Ok(Ok(())) => RunOutcomeDto::Completed,
-                _ => RunOutcomeDto::Failed,
-            };
+
             let _ = finisher_run_tx.send(RunEvent::RunFinished {
                 outcome,
                 ts: now_ts(),
@@ -216,12 +513,12 @@ impl RunController {
             snapshot,
             ledger,
             bus,
-            worker_tasks,
+            live,
             sub_task,
-            lead_abort,
             relay_abort,
             finisher: Some(finisher),
             joined_outcome: None,
+            roster: roster_for_handle,
         })
     }
 }
@@ -287,11 +584,18 @@ fn handle_bus_event(
     };
 
     if let BusLifecycleEvent::EnvelopeAccepted { .. } = &event {
-        let prev_last_seq = snapshot.lock().unwrap().last_seq;
+        // Locked for the whole read-query-update section, not just the
+        // initial read (t-swap plan D4): `RunHandle::swap_harness` is a
+        // second caller of this function alongside `subscription_loop`, so
+        // two concurrent calls reading the same `prev_last_seq` before
+        // either updates it could otherwise both see (and double-broadcast)
+        // the same freshly-committed row.
+        let mut snap = snapshot.lock().unwrap();
+        let prev_last_seq = snap.last_seq;
         match ledger.messages_since(prev_last_seq) {
             Ok(messages) => {
                 for message in messages {
-                    snapshot.lock().unwrap().last_seq = message.seq;
+                    snap.last_seq = message.seq;
                     let _ = run_tx.send(RunEvent::Message {
                         seq: message.seq,
                         envelope: message.envelope,
@@ -353,7 +657,8 @@ async fn relay_loop(
     }
 }
 
-/// Handle to a running crew — contract §C3.
+/// Handle to a running crew — contract §C3, extended by contracts-m5.md
+/// §C5a's multi-sprint loop.
 pub struct RunHandle {
     run_id: String,
     run_tx: broadcast::Sender<RunEvent>,
@@ -365,12 +670,18 @@ pub struct RunHandle {
     snapshot: Arc<Mutex<SnapshotState>>,
     ledger: Arc<EventLedger>,
     bus: BusHandle,
-    worker_tasks: Vec<JoinHandle<Result<(), RunnerError>>>,
+    /// Whichever sprint's workers/lead are currently running (plan D1) —
+    /// replaced at every sprint boundary by the orchestrator inside
+    /// `RunController::start`'s spawned finisher task.
+    live: Arc<Mutex<LiveHandles>>,
     sub_task: JoinHandle<()>,
-    lead_abort: AbortHandle,
     relay_abort: AbortHandle,
     finisher: Option<JoinHandle<RunOutcomeDto>>,
     joined_outcome: Option<RunOutcomeDto>,
+    /// The same `Arc<Mutex<Roster>>` the sprint loop reads a snapshot of at
+    /// every sprint boundary (t-swap plan D1) — `swap_harness` mutates it
+    /// directly; the next `spawn_sprint` call picks up the change.
+    roster: Arc<Mutex<Roster>>,
 }
 
 impl RunHandle {
@@ -410,6 +721,97 @@ impl RunHandle {
         }
     }
 
+    /// Swaps the harness assigned to `agent_id`'s roster slot — contract
+    /// §C5c (2026-08-29 보정판, t-swap plan). Validates both arguments
+    /// before touching anything: an unknown `agent_id` or a `harness` id
+    /// `HarnessRegistry::make` can't build (`opencode`'s Stub adapter is
+    /// accepted) returns `RunError::SwapRejected` with the roster untouched
+    /// and zero events emitted. On success: the roster slot's harness is
+    /// updated immediately, a `handoff` envelope is appended straight to
+    /// the ledger and broadcast as `Message` (skipped for the `lead` slot —
+    /// plan D3, `crew_proto::Role` has no `Lead` variant), then
+    /// `RosterChanged` broadcasts the updated roster. No running session is
+    /// touched here — the swap takes effect at the next sprint boundary,
+    /// when `spawn_sprint` reads a fresh roster snapshot (plan D5).
+    pub async fn swap_harness(&self, agent_id: &str, harness: &str) -> Result<(), RunError> {
+        {
+            let roster = self.roster.lock().expect("roster mutex poisoned");
+            if !roster.agents.iter().any(|a| a.id == agent_id) {
+                return Err(RunError::SwapRejected(format!("unknown agent id: {agent_id}")));
+            }
+        }
+        if HarnessRegistry::make(harness).is_none() {
+            return Err(RunError::SwapRejected(format!("unknown harness id: {harness}")));
+        }
+
+        let (old_harness, role_str) = {
+            let mut roster = self.roster.lock().expect("roster mutex poisoned");
+            let slot = roster
+                .agents
+                .iter_mut()
+                .find(|a| a.id == agent_id)
+                .expect("agent_id presence was just checked above");
+            let old_harness = std::mem::replace(&mut slot.harness, harness.to_string());
+            (old_harness, slot.role.clone())
+        };
+
+        if let Some(role) = role_from_str(&role_str) {
+            let (goal, done, in_flight) = {
+                let snap = self.snapshot.lock().unwrap();
+                let done = snap
+                    .task_states
+                    .iter()
+                    .filter(|(_, state)| *state == TaskStateDto::Accepted)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                let in_flight = snap
+                    .task_states
+                    .iter()
+                    .filter(|(_, state)| *state == TaskStateDto::Assigned)
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                (snap.goal.clone(), done, in_flight)
+            };
+            let pack = HandoffPack {
+                role,
+                spec_ref: goal,
+                done,
+                in_flight,
+                decisions: Vec::new(),
+                open_questions: Vec::new(),
+                notes: format!("harness swap: {old_harness} -> {harness}"),
+            };
+            let envelope = Envelope::new(
+                // Literal duplicate of crew-lead::dispatch's private
+                // `SPRINT_LABEL` (t-swap plan D4) — that crate is out of
+                // scope for this task so the constant can't be imported;
+                // unifying the two is a separate, scoped-out refactor.
+                "sp-m3".to_string(),
+                format!("th-swap-{agent_id}"),
+                "agent:lead".to_string(),
+                vec![agent_id.to_string()],
+                MessageKind::Handoff,
+                None,
+                format!("swap-{}", uuid::Uuid::new_v4()),
+                handoff_body(&pack),
+                Vec::new(),
+                false,
+                900_000,
+            );
+            handle_bus_event(
+                &self.ledger,
+                &self.run_tx,
+                &self.snapshot,
+                BusLifecycleEvent::EnvelopeAccepted { envelope },
+            );
+        }
+
+        let agents = roster_to_dto(&self.roster.lock().expect("roster mutex poisoned"));
+        let _ = self.run_tx.send(RunEvent::RosterChanged { agents, ts: now_ts() });
+
+        Ok(())
+    }
+
     /// Waits for the Lead runner to finish (contract §C3). Idempotent: a
     /// second call returns the same cached outcome instead of panicking on
     /// an already-consumed join handle.
@@ -433,16 +835,22 @@ impl RunHandle {
     /// Worker/lead/relay/subscription tasks abort, then the bus shuts down
     /// (m3 pattern). Safe to call regardless of whether the run already
     /// finished on its own — aborting an already-finished task is a no-op.
+    /// `live` is read fresh (plan D1: workers/lead are re-spawned at every
+    /// sprint boundary, so a single fixed set of handles captured at
+    /// `start()` time could no longer describe "what's currently running").
     pub async fn shutdown(self) {
-        for task in &self.worker_tasks {
-            task.abort();
-        }
-        self.sub_task.abort();
-        self.lead_abort.abort();
-        self.relay_abort.abort();
         if let Some(finisher) = &self.finisher {
             finisher.abort();
         }
+        {
+            let live = self.live.lock().unwrap();
+            for handle in &live.worker_aborts {
+                handle.abort();
+            }
+            live.lead_abort.abort();
+        }
+        self.sub_task.abort();
+        self.relay_abort.abort();
         self.bus.shutdown().await;
     }
 }

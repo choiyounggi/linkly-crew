@@ -196,3 +196,51 @@ describe("TauriEventSource", () => {
     expect(invoke).toHaveBeenCalledWith("stop_run");
   });
 });
+
+describe("TauriEventSource — C7a optional roster/harness methods", () => {
+  it("invokes each command with the C6-verbatim name and forwards its resolved payload", async () => {
+    const { listen } = fakeListen();
+    const invoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      switch (cmd) {
+        case "detect_harnesses":
+          return [{ id: "claude-code", installed: true, path: "/bin/claude", adapter: "real" }];
+        case "get_roster":
+          return { agents: [] };
+        case "set_roster":
+          expect(args).toEqual({ roster: { agents: [] } });
+          return undefined;
+        case "list_presets":
+          return [{ name: "클로드 5인팀", roster: { agents: [] } }];
+        case "swap_harness":
+          expect(args).toEqual({ agentId: "agent:designer", harness: "opencode" });
+          return undefined;
+        default:
+          throw new Error(`unexpected invoke ${cmd}`);
+      }
+    }) as unknown as Invoke;
+
+    const source = new TauriEventSource(invoke, listen);
+
+    await expect(source.detectHarnesses!()).resolves.toEqual([
+      { id: "claude-code", installed: true, path: "/bin/claude", adapter: "real" },
+    ]);
+    await expect(source.getRoster!()).resolves.toEqual({ agents: [] });
+    await expect(source.setRoster!({ agents: [] })).resolves.toBeUndefined();
+    await expect(source.listPresets!()).resolves.toEqual([{ name: "클로드 5인팀", roster: { agents: [] } }]);
+    await expect(source.swapHarness!("agent:designer", "opencode")).resolves.toBeUndefined();
+
+    expect(invoke).toHaveBeenCalledWith("detect_harnesses");
+    expect(invoke).toHaveBeenCalledWith("get_roster");
+  });
+
+  it("propagates a rejected invoke instead of swallowing the error (boundary: backend not implemented yet)", async () => {
+    const { listen } = fakeListen();
+    const invoke: Invoke = vi.fn(async () => {
+      throw new Error("command swap_harness not found");
+    });
+
+    const source = new TauriEventSource(invoke, listen);
+
+    await expect(source.swapHarness!("agent:designer", "opencode")).rejects.toThrow("command swap_harness not found");
+  });
+});

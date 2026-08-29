@@ -8,4 +8,7 @@ pub enum HarnessError {
 
     #[error("child process exited before a result event arrived")]
     ProcessExited,
+
+    #[error("harness unavailable: {0}")]
+    Unavailable(String),
 }

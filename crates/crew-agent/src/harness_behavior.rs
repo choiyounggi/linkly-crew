@@ -142,7 +142,7 @@ fn strip_code_fence(text: &str) -> &str {
 /// for balanced top-level `{...}` substrings — brace matching that ignores
 /// braces inside JSON string values — and returns the first candidate that
 /// parses as a JSON object.
-fn extract_json(text: &str) -> Option<Value> {
+pub fn extract_json(text: &str) -> Option<Value> {
     let stripped = strip_code_fence(text);
 
     if let Ok(value) = serde_json::from_str::<Value>(stripped) {
@@ -273,6 +273,11 @@ pub struct RoleHarnessBehavior {
     system_hint: String,
     session: Option<Session>,
     events: Option<mpsc::Receiver<HarnessEvent>>,
+    /// Text to prepend to the first turn's prompt (handoff pack JSON,
+    /// sprint summary, ...) — contracts-m5.md C4a. `Option::take()` in
+    /// `build_prompt` guarantees it is consumed exactly once, so later
+    /// turns are unaffected without any extra bookkeeping.
+    injected_context: Option<String>,
 }
 
 impl RoleHarnessBehavior {
@@ -284,7 +289,16 @@ impl RoleHarnessBehavior {
             system_hint,
             session: None,
             events: None,
+            injected_context: None,
         }
+    }
+
+    /// Prepends `text` to the very first turn's prompt only (contracts-m5.md
+    /// C4a) — e.g. a handoff pack JSON or a sprint summary assembled by the
+    /// caller.
+    pub fn with_injected_context(mut self, text: String) -> Self {
+        self.injected_context = Some(text);
+        self
     }
 
     async fn ensure_session(&mut self) -> Result<(), crew_harness::HarnessError> {
@@ -300,8 +314,9 @@ impl RoleHarnessBehavior {
     /// Builds this turn's prompt, or an `Err(reason)` if `env` is a
     /// `TaskAssign` whose `body["task"]` does not parse as a `TaskSpec`
     /// (M3 contract, `.orchestration/contracts-m3.md`) — the caller maps
-    /// that to `Blocked` (D3).
-    fn build_prompt(&self, env: &Envelope) -> Result<String, String> {
+    /// that to `Blocked` (D3). `&mut self` so a successful build can
+    /// consume `injected_context` exactly once (M5 C4a).
+    fn build_prompt(&mut self, env: &Envelope) -> Result<String, String> {
         let task_desc = match env.kind {
             MessageKind::TaskAssign => {
                 let task_value = env
@@ -352,10 +367,15 @@ impl RoleHarnessBehavior {
         // Hardcoded here rather than left to `system_hint` (SPIKE-M2 Finding
         // 1): a caller that forgets to fold it into the hint reintroduces
         // the 120s tool-use timeout.
-        Ok(format!(
+        let prompt = format!(
             "{}\n\n{}\n\nDo not use tools, do not read or write files, do not run commands, answer immediately.\n\nreply ONLY with JSON {{\"covered_req_ids\": [...], \"artifacts\": [{{\"name\": \"...\", \"kind\": \"...\", \"req_ids\": [...], \"content\": \"...\"}}]}}",
             self.system_hint, task_desc
-        ))
+        );
+
+        Ok(match self.injected_context.take() {
+            Some(injected) => format!("{injected}\n\n{prompt}"),
+            None => prompt,
+        })
     }
 
     fn reply(&self, in_reply_to: &Envelope, kind: MessageKind, body: Value) -> Envelope {

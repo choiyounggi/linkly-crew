@@ -27,6 +27,7 @@ tracing = "0.1"
 crew-run = { path = "../../../crates/crew-run" }
 crew-proto = { path = "../../../crates/crew-proto" }
 crew-lead = { path = "../../../crates/crew-lead" }
+crew-harness = { path = "../../../crates/crew-harness" }
 
 # standalone (contracts-m4.md §C4): this crate is NOT a member of the root
 # workspace. An empty [workspace] table here stops Cargo's upward member

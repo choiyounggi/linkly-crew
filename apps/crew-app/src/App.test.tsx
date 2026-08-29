@@ -5,13 +5,14 @@ import App from "./App";
 import { useRunStore } from "./lib/store";
 
 describe("App", () => {
-  it("renders the command bar and all three panel stubs", () => {
+  it("renders the command bar and all four panel stubs", () => {
     render(<App />);
     expect(screen.getByLabelText("요청")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "시작" })).toBeInTheDocument();
     expect(screen.getByLabelText("에이전트 레일")).toBeInTheDocument();
     expect(screen.getByLabelText("스프린트 보드")).toBeInTheDocument();
     expect(screen.getByLabelText("라이브 스레드")).toBeInTheDocument();
+    expect(screen.getByLabelText("로스터")).toBeInTheDocument();
   });
 
   it("shows a validation error and starts no run for an empty/whitespace-only goal", () => {

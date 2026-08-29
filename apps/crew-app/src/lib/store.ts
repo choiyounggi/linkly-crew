@@ -2,9 +2,9 @@ import { create } from "zustand";
 
 import { createDefaultSource } from "./source";
 import type { RunEventSource } from "./source";
-import type { Envelope, RunEvent, SpecDoc, TaskDag, TaskStateDto } from "./types";
+import type { Envelope, RosterAgentDto, RunEvent, SpecDoc, TaskDag, TaskStateDto } from "./types";
 
-/** Verbatim per contracts-m4.md §C4. */
+/** Verbatim per contracts-m4.md §C4, extended per contracts-m5.md §C7a. */
 export interface RunState {
   runId: string | null;
   goal: string | null;
@@ -14,6 +14,9 @@ export interface RunState {
   messages: { seq: number; envelope: Envelope }[];
   taskStates: Record<string, TaskStateDto>;
   finished: "completed" | "failed" | null;
+  sprintIndex: number | null;
+  sprintSummaries: { index: number; summary: string }[];
+  roster: RosterAgentDto[];
   startRun(goal: string): Promise<void>;
   applyEvent(ev: RunEvent): void;
 }
@@ -38,6 +41,9 @@ export function createRunStore(source: RunEventSource) {
     messages: [],
     taskStates: {},
     finished: null,
+    sprintIndex: null,
+    sprintSummaries: [],
+    roster: [],
 
     async startRun(goal) {
       await source.start(goal);
@@ -56,6 +62,9 @@ export function createRunStore(source: RunEventSource) {
             messages: [],
             taskStates: {},
             finished: null,
+            sprintIndex: null,
+            sprintSummaries: [],
+            roster: [],
           });
           return;
 
@@ -79,6 +88,24 @@ export function createRunStore(source: RunEventSource) {
 
         case "run_finished":
           set({ finished: ev.outcome });
+          return;
+
+        case "sprint_started":
+          set({ sprintIndex: ev.index });
+          return;
+
+        case "sprint_finished":
+          // Idempotent: same index re-applied is a no-op, not a duplicate append.
+          set((s) =>
+            s.sprintSummaries.some((entry) => entry.index === ev.index)
+              ? {}
+              : { sprintSummaries: [...s.sprintSummaries, { index: ev.index, summary: ev.summary }] },
+          );
+          return;
+
+        case "roster_changed":
+          // Full replace, never a merge (plan D2).
+          set({ roster: ev.agents });
           return;
 
         default:

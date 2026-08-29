@@ -1,6 +1,6 @@
 import { useRunStore } from "../../lib/store";
 import type { Role } from "../../lib/types";
-import { deriveBoard, type BoardCard, type BoardColumns } from "./derive";
+import { avatarInitials, deriveBoard, type BoardCard, type BoardColumns } from "./derive";
 import "./board.css";
 
 const COLUMNS: { key: keyof BoardColumns; label: string }[] = [
@@ -22,7 +22,7 @@ const ROLE_CLASS: Record<Role, string> = {
 function RoleAvatar({ role }: { role: Role }) {
   return (
     <span className={`board-avatar ${ROLE_CLASS[role]}`} title={role}>
-      {role.charAt(0).toUpperCase()}
+      {avatarInitials(role)}
     </span>
   );
 }
@@ -32,6 +32,7 @@ function Card({ card }: { card: BoardCard }) {
     <li className="board-card">
       <RoleAvatar role={card.task.role} />
       <span className="board-card__title">{card.task.title}</span>
+      {card.blockReason && <span className="board-card__block-label">{card.blockReason}</span>}
       {card.reworkCount > 0 && (
         <span className="board-card__badge" aria-label={`리워크 ${card.reworkCount}회`}>
           ↺{card.reworkCount}

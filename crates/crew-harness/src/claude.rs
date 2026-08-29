@@ -3,6 +3,7 @@
 //! Decisions D1-D3, D6, D8, D10, D11 in the plan.
 
 use std::process::Stdio;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -13,8 +14,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
-    judge_result, AgentCfg, Harness, HarnessError, HarnessEvent, HarnessId, Session, TurnOutcome,
-    UserTurn,
+    judge_result, AgentCfg, HandoffSnapshot, Harness, HarnessError, HarnessEvent, HarnessId,
+    Session, TurnOutcome, UserTurn,
 };
 
 const HARNESS_ID: HarnessId = HarnessId("claude-code");
@@ -100,7 +101,13 @@ impl ClaudeCodeHarness {
 
         let (events_tx, events_rx) = mpsc::channel(EVENTS_CHANNEL_CAPACITY);
         let (turn_tx, turn_rx) = mpsc::channel(TURN_CHANNEL_CAPACITY);
-        let reader_task = tokio::spawn(read_events(stdout, events_tx, turn_tx));
+        let reported_session_id: Arc<OnceLock<String>> = Arc::new(OnceLock::new());
+        let reader_task = tokio::spawn(read_events(
+            stdout,
+            events_tx,
+            turn_tx,
+            reported_session_id.clone(),
+        ));
         let stderr_task = tokio::spawn(drain_stderr(stderr));
 
         Ok(Session {
@@ -111,6 +118,7 @@ impl ClaudeCodeHarness {
             turn_rx,
             reader_task,
             stderr_task,
+            reported_session_id,
         })
     }
 }
@@ -199,15 +207,32 @@ impl Harness for ClaudeCodeHarness {
         let _ = session.child.wait().await;
         Ok(())
     }
+
+    async fn snapshot(&self, session: &Session) -> Result<HandoffSnapshot, HarnessError> {
+        let session_id = session
+            .reported_session_id
+            .get()
+            .cloned()
+            .unwrap_or_else(|| session.session_id.to_string());
+        Ok(HandoffSnapshot {
+            harness: HARNESS_ID.0.to_string(),
+            session_id,
+            notes: String::new(),
+        })
+    }
 }
 
 /// Reads NDJSON lines from `stdout`, normalizes each into zero or more
 /// [`HarnessEvent`]s (D2), and for every `type:"result"` line also judges
-/// the turn outcome (D4) and delivers it on `turn_tx`.
+/// the turn outcome (D4) and delivers it on `turn_tx`. Also records the
+/// CLI-reported session id from the first `Started` event into
+/// `reported_session_id` (M5 D3) — `set` failing (already set) is ignored,
+/// since only the first report matters.
 async fn read_events(
     stdout: ChildStdout,
     events_tx: mpsc::Sender<HarnessEvent>,
     turn_tx: mpsc::Sender<TurnOutcome>,
+    reported_session_id: Arc<OnceLock<String>>,
 ) {
     let mut lines = BufReader::new(stdout).lines();
     loop {
@@ -232,6 +257,11 @@ async fn read_events(
         let is_result = value.get("type").and_then(Value::as_str) == Some("result");
 
         for event in normalize(&value) {
+            if let HarnessEvent::Started { session_id } = &event {
+                if !session_id.is_empty() {
+                    let _ = reported_session_id.set(session_id.clone());
+                }
+            }
             if events_tx.send(event).await.is_err() {
                 return; // no one is listening anymore
             }
