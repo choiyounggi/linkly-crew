@@ -1,0 +1,148 @@
+.artifacts-view {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  padding: 0.6rem;
+}
+
+.artifacts-view__empty {
+  color: var(--text-dim);
+  padding: 0.4rem 0;
+}
+
+.artifacts-view__matrix {
+  overflow-x: auto;
+}
+
+.req-matrix {
+  border-collapse: collapse;
+  font-size: 0.78rem;
+}
+
+.req-matrix th,
+.req-matrix td {
+  border: 1px solid var(--border);
+  padding: 0.3rem 0.5rem;
+  text-align: left;
+  color: var(--text-dim);
+}
+
+.req-matrix thead th {
+  color: var(--text);
+}
+
+.req-matrix__cell {
+  min-width: 2.4rem;
+}
+
+.req-matrix__cell--covered {
+  background: #3fb950;
+}
+
+.req-matrix__cell--expected {
+  background: var(--border);
+}
+
+.req-matrix__cell--none {
+  background: transparent;
+}
+
+.artifacts-view__body {
+  display: flex;
+  gap: 0.8rem;
+  min-height: 0;
+  flex: 1;
+}
+
+.artifact-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  min-width: 12rem;
+}
+
+.artifact-list__item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.1rem;
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+  background: var(--bg-panel);
+  color: var(--text);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+
+.artifact-list__item--active {
+  border-color: var(--accent);
+}
+
+.artifact-list__task {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.artifact-list__name {
+  font-size: 0.85rem;
+}
+
+.artifact-detail {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.artifact-detail__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.artifact-detail__name {
+  color: var(--text);
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.artifact-detail__content {
+  margin: 0;
+  padding: 0.4rem;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: auto;
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.diff-line {
+  padding: 0 0.2rem;
+}
+
+.diff-line--same {
+  color: var(--text-dim);
+}
+
+.diff-line--added {
+  color: #3fb950;
+  background: color-mix(in srgb, #3fb950 12%, transparent);
+}
+
+.diff-line--removed {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+}
