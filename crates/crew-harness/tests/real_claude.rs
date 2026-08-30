@@ -13,6 +13,7 @@ use crew_harness::{AgentCfg, Harness, TurnOutcome, UserTurn};
 fn agent_cfg() -> AgentCfg {
     AgentCfg {
         cwd: std::env::current_dir().expect("current dir"),
+        model: None,
     }
 }
 

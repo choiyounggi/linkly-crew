@@ -296,6 +296,7 @@ async fn spawn_sprint(
                 };
                 let harness_cfg = HarnessAgentCfg {
                     cwd: role_cli_cwd(data_dir, role),
+                    model: None,
                 };
                 let system_hint = format!("You are the {role:?} of a crew building: {goal}");
                 // Permit is scoped to each CLI interaction (turn), not the

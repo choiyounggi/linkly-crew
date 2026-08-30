@@ -1,0 +1,5 @@
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"extension_ui_request","id":"dialog-1","method":"select","title":"Pick one","options":["a","b"]}
+{"type":"turn_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"},"toolResults":[]}
+{"type":"agent_end","messages":[],"willRetry":false}
