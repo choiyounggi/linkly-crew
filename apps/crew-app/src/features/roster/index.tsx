@@ -14,6 +14,8 @@ interface RosterPanelProps {
   source?: RunEventSource;
 }
 
+const ADDABLE_ROLES = ["pm", "designer", "publisher", "developer", "qa"] as const;
+
 type LoadState = "loading" | "idle" | "error";
 type SaveState = "idle" | "loading" | "success" | "error";
 
@@ -35,6 +37,7 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
   const [presets, setPresets] = useState<RosterPreset[]>([]);
   const [harnesses, setHarnesses] = useState<HarnessInfo[]>([]);
   const [selectedPresetName, setSelectedPresetName] = useState("");
+  const [addRole, setAddRole] = useState("");
 
   const [loadState, setLoadState] = useState<LoadState>(supported ? "loading" : "idle");
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -93,6 +96,28 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
 
   const updateSlot = (agentId: string, patch: Partial<Pick<RosterAgent, "harness" | "model">>) => {
     setDraft((prev) => (prev ? { agents: prev.agents.map((a) => (a.id === agentId ? { ...a, ...patch } : a)) } : prev));
+  };
+
+  const missingRoles = draft ? ADDABLE_ROLES.filter((role) => !draft.agents.some((a) => a.role === role)) : [];
+  const effectiveAddRole = missingRoles.includes(addRole as (typeof ADDABLE_ROLES)[number])
+    ? addRole
+    : (missingRoles[0] ?? "");
+
+  const handleAddSlot = () => {
+    if (!draft || !effectiveAddRole) return;
+    const role = effectiveAddRole;
+    const newAgent: RosterAgent = {
+      id: `agent:${role}`,
+      role,
+      harness: "claude-code",
+      model: "default",
+      instructions: "",
+    };
+    setDraft({ agents: [...draft.agents, newAgent] });
+  };
+
+  const handleDeleteSlot = (agentId: string) => {
+    setDraft((prev) => (prev ? { agents: prev.agents.filter((a) => a.id !== agentId) } : prev));
   };
 
   const handleSave = async () => {
@@ -191,6 +216,14 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
                       {swapping ? "교체 중…" : "교체"}
                     </button>
                   )}
+                  <button
+                    type="button"
+                    aria-label={`슬롯 삭제 ${agent.id}`}
+                    disabled={agent.role === "lead"}
+                    onClick={() => handleDeleteSlot(agent.id)}
+                  >
+                    삭제
+                  </button>
                   {swapError && <span className="roster__slot-error">{swapError}</span>}
                 </li>
               );
@@ -201,6 +234,32 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
         </ul>
       ) : (
         <p className="roster__status">슬롯 편집: 이 소스에서 지원 안 함</p>
+      )}
+
+      {supportsGetRoster && draft && (
+        <div className="roster__add">
+          <label htmlFor="roster-add-role-select">역할 추가</label>
+          <select
+            id="roster-add-role-select"
+            aria-label="추가할 역할"
+            value={effectiveAddRole}
+            disabled={missingRoles.length === 0}
+            onChange={(e) => setAddRole(e.target.value)}
+          >
+            {missingRoles.length === 0 ? (
+              <option value="">전부 배정됨</option>
+            ) : (
+              missingRoles.map((role) => (
+                <option key={role} value={role}>
+                  {role}
+                </option>
+              ))
+            )}
+          </select>
+          <button type="button" onClick={handleAddSlot} disabled={missingRoles.length === 0}>
+            추가
+          </button>
+        </div>
       )}
 
       {supportsSetRoster && (

@@ -145,4 +145,95 @@ describe("RosterPanel", () => {
     expect(screen.getByText("이 소스에서 지원 안 함")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "저장" })).not.toBeInTheDocument();
   });
+
+  const FOUR_ROLE_ROSTER: Roster = {
+    agents: [
+      { id: "agent:pm", role: "pm", harness: "claude-code", model: "default", instructions: "" },
+      { id: "agent:designer", role: "designer", harness: "claude-code", model: "default", instructions: "" },
+      { id: "agent:publisher", role: "publisher", harness: "claude-code", model: "default", instructions: "" },
+      { id: "agent:developer", role: "developer", harness: "claude-code", model: "default", instructions: "" },
+    ],
+  };
+
+  const LEAD_ROSTER: Roster = {
+    agents: [
+      { id: "agent:lead", role: "lead", harness: "claude-code", model: "default", instructions: "" },
+      { id: "agent:designer", role: "designer", harness: "claude-code", model: "default", instructions: "" },
+    ],
+  };
+
+  const FULL_ROSTER: Roster = {
+    agents: [
+      { id: "agent:pm", role: "pm", harness: "claude-code", model: "default", instructions: "" },
+      { id: "agent:designer", role: "designer", harness: "claude-code", model: "default", instructions: "" },
+      { id: "agent:publisher", role: "publisher", harness: "claude-code", model: "default", instructions: "" },
+      { id: "agent:developer", role: "developer", harness: "claude-code", model: "default", instructions: "" },
+      { id: "agent:qa", role: "qa", harness: "claude-code", model: "default", instructions: "" },
+    ],
+  };
+
+  it("adds a slot for the selected unassigned role with contract-default fields", async () => {
+    const setRoster = vi.fn(async () => {});
+    const source = createFakeSource({
+      listPresets: vi.fn(async () => []),
+      detectHarnesses: vi.fn(async () => []),
+      getRoster: vi.fn(async () => FOUR_ROLE_ROSTER),
+      setRoster,
+    });
+
+    render(<RosterPanel source={source} />);
+    await screen.findByLabelText("pm 모델");
+
+    const addSelect = screen.getByLabelText("추가할 역할");
+    expect(within(addSelect).getByRole("option", { name: "qa" })).toBeInTheDocument();
+
+    fireEvent.change(addSelect, { target: { value: "qa" } });
+    fireEvent.click(screen.getByRole("button", { name: "추가" }));
+
+    expect(screen.getByLabelText("qa 모델")).toHaveValue("default");
+
+    fireEvent.click(screen.getByRole("button", { name: "저장" }));
+
+    await waitFor(() =>
+      expect(setRoster).toHaveBeenCalledWith({
+        agents: [
+          ...FOUR_ROLE_ROSTER.agents,
+          { id: "agent:qa", role: "qa", harness: "claude-code", model: "default", instructions: "" },
+        ],
+      }),
+    );
+  });
+
+  it("disables deleting the lead slot but removes a non-lead slot on click", async () => {
+    const source = createFakeSource({
+      listPresets: vi.fn(async () => []),
+      detectHarnesses: vi.fn(async () => []),
+      getRoster: vi.fn(async () => LEAD_ROSTER),
+      setRoster: vi.fn(async () => {}),
+    });
+
+    render(<RosterPanel source={source} />);
+    await screen.findByLabelText("designer 모델");
+
+    expect(screen.getByRole("button", { name: "슬롯 삭제 agent:lead" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "슬롯 삭제 agent:designer" }));
+
+    expect(screen.queryByLabelText("designer 모델")).not.toBeInTheDocument();
+  });
+
+  it("disables the add-role select and button once all five roles are assigned", async () => {
+    const source = createFakeSource({
+      listPresets: vi.fn(async () => []),
+      detectHarnesses: vi.fn(async () => []),
+      getRoster: vi.fn(async () => FULL_ROSTER),
+      setRoster: vi.fn(async () => {}),
+    });
+
+    render(<RosterPanel source={source} />);
+    await screen.findByLabelText("qa 모델");
+
+    expect(screen.getByLabelText("추가할 역할")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "추가" })).toBeDisabled();
+  });
 });
