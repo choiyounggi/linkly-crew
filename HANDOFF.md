@@ -202,7 +202,7 @@
   t-pool-wire(F2 — `looks_like_rate_limit` 술어 7신호 + `RoleHarnessBehavior`
   Failed 경로 배선).
 - 결정론: `cargo test --workspace` 통합 브랜치 green(실패 0). crew-harness 신규
-  테스트: pool 6종(축소/하한/멱등/회복/catch-up), pi 단위 6종 + registry 경계 1.
+  테스트: pool 5종(축소/하한/멱등/회복/catch-up), pi 단위 6종 + registry 경계 1.
   crew-agent 신규: 술어 5 + 통합 2.
 - pi RPC 스파이크(코디네이터, 2026-08-31, 원시 캡처
   `~/.linkly-crew/pi-spike/rpc2.jsonl`): ① stdin EOF 시 즉시 셧다운(턴 완료 전
