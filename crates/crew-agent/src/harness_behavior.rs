@@ -122,6 +122,27 @@ async fn drain_until_terminal(mut events: mpsc::Receiver<HarnessEvent>) -> (mpsc
     (events, text)
 }
 
+/// Recognizes rate-limit-shaped failure text (contracts-m8.md §F2, signal
+/// list verbatim) so a `TurnOutcome::Failed` on a pool-holding behavior can
+/// report it to `HarnessPool::report_rate_limit`. A false positive here is
+/// harmless — it only costs a spurious backoff + one-step limit reduction,
+/// which contracts-m8.md §F1's lazy recovery self-heals — so the list favors
+/// recall over precision.
+pub(crate) fn looks_like_rate_limit(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "rate limit",
+        "rate_limit",
+        "429",
+        "usage limit",
+        "session limit",
+        "overloaded",
+        "quota",
+    ]
+    .iter()
+    .any(|signal| lower.contains(signal))
+}
+
 /// Strips a leading/trailing ``` fence (with an optional language tag), so
 /// `{"covered_req_ids": [...]}` and ` ```json\n{...}\n``` ` both parse.
 fn strip_code_fence(text: &str) -> &str {
@@ -491,6 +512,17 @@ impl RoleBehavior for RoleHarnessBehavior {
                 None => self.blocked(&env, "role turn produced no parseable JSON reply".to_string()),
             },
             Ok(TurnOutcome::Failed { error }) => {
+                // contracts-m8.md §F2: report a rate-limit-shaped failure to
+                // the pool this turn actually ran under, so the next
+                // `acquire` backs off and the harness's effective
+                // concurrency limit shrinks. Only reachable when `with_pool`
+                // was used (M6 §D2d) — the permit scope above is unchanged,
+                // this only adds a report after it's already dropped.
+                if let (Some(pool), Some(harness_id)) = (self.pool.as_ref(), self.pool_harness_id.as_ref()) {
+                    if looks_like_rate_limit(&error) {
+                        pool.report_rate_limit(harness_id);
+                    }
+                }
                 self.blocked(&env, format!("role turn failed: {error}"))
             }
             Err(e) => self.blocked(&env, format!("harness send error: {e}")),
@@ -595,6 +627,7 @@ mod role_harness_behavior_tests {
             Arc::new(crew_harness::claude::ClaudeCodeHarness::with_binary("/bin/false")),
             AgentCfg {
                 cwd: std::env::current_dir().expect("current dir"),
+                model: None,
             },
             Role::Developer,
             // Deliberately does NOT mention tools or JSON — proves the
@@ -696,5 +729,36 @@ mod extract_json_tests {
 
         assert_eq!(value["note"], json!("a { b } c"));
         assert_eq!(value["covered_req_ids"], json!([]));
+    }
+}
+
+/// contracts-m8.md §F2: `looks_like_rate_limit`'s signal list, verbatim.
+#[cfg(test)]
+mod looks_like_rate_limit_tests {
+    use super::*;
+
+    #[test]
+    fn matches_mixed_case_rate_limit_phrase() {
+        assert!(looks_like_rate_limit("Error: Rate Limit exceeded, try again later"));
+    }
+
+    #[test]
+    fn matches_http_429_status_mentioned_in_prose() {
+        assert!(looks_like_rate_limit("upstream call failed: HTTP 429"));
+    }
+
+    #[test]
+    fn matches_quota_exceeded_message() {
+        assert!(looks_like_rate_limit("quota exceeded for this billing period"));
+    }
+
+    #[test]
+    fn does_not_match_unrelated_failure_text() {
+        assert!(!looks_like_rate_limit("file not found"));
+    }
+
+    #[test]
+    fn does_not_match_empty_string() {
+        assert!(!looks_like_rate_limit(""));
     }
 }

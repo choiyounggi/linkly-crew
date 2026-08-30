@@ -22,6 +22,7 @@ fn fake_cli_path() -> PathBuf {
 fn agent_cfg() -> AgentCfg {
     AgentCfg {
         cwd: std::env::current_dir().expect("current dir"),
+        model: None,
     }
 }
 

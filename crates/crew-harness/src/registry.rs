@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::claude::ClaudeCodeHarness;
 use crate::opencode::OpencodeHarness;
+use crate::pi::PiHarness;
 use crate::Harness;
 
 /// Every harness id the registry knows about, in contract order.
-const KNOWN: &[&str] = &["claude-code", "codex", "gemini", "grok", "opencode", "ollama"];
+const KNOWN: &[&str] = &["claude-code", "codex", "gemini", "grok", "opencode", "ollama", "pi"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessInfo {
@@ -38,7 +39,7 @@ pub enum AdapterStatus {
 /// (plan D3).
 fn adapter_status_for(id: &str) -> AdapterStatus {
     match id {
-        "claude-code" => AdapterStatus::Real,
+        "claude-code" | "pi" => AdapterStatus::Real,
         "opencode" => AdapterStatus::Stub,
         _ => AdapterStatus::None,
     }
@@ -96,9 +97,12 @@ impl HarnessRegistry {
     }
 
     /// Constructs the live adapter for `id`, or `None` if `id` has no real
-    /// or stub implementation.
+    /// or stub implementation. `id == "pi"` is special-cased within the
+    /// `Real` arm since two ids (`claude-code`, `pi`) now share that status
+    /// but construct different adapters (plan D6).
     pub fn make(id: &str) -> Option<Arc<dyn Harness>> {
         match adapter_status_for(id) {
+            AdapterStatus::Real if id == "pi" => Some(Arc::new(PiHarness::new()) as Arc<dyn Harness>),
             AdapterStatus::Real => Some(Arc::new(ClaudeCodeHarness::new()) as Arc<dyn Harness>),
             AdapterStatus::Stub => Some(Arc::new(OpencodeHarness::new()) as Arc<dyn Harness>),
             AdapterStatus::None => None,
@@ -152,10 +156,12 @@ mod tests {
     }
 
     #[test]
-    fn known_lists_exactly_the_six_contract_ids() {
+    fn known_lists_exactly_the_seven_contract_ids() {
+        // Was six (M5); M8 §F3 adds "pi" as a real adapter — not a
+        // weakening, an accurate reflection of the new registered id.
         assert_eq!(
             HarnessRegistry::known(),
-            &["claude-code", "codex", "gemini", "grok", "opencode", "ollama"]
+            &["claude-code", "codex", "gemini", "grok", "opencode", "ollama", "pi"]
         );
     }
 
@@ -166,7 +172,7 @@ mod tests {
 
         let infos = HarnessRegistry::detect_with_path(&bin_dir.path_os());
 
-        assert_eq!(infos.len(), 6);
+        assert_eq!(infos.len(), 7);
         let claude_info = infos.iter().find(|i| i.id == "claude-code").unwrap();
         assert!(claude_info.installed);
         assert_eq!(claude_info.path.as_deref(), Some(claude_path.to_str().unwrap()));
@@ -177,7 +183,7 @@ mod tests {
     fn detect_reports_installed_false_for_every_id_on_empty_path() {
         let infos = HarnessRegistry::detect_with_path(OsStr::new(""));
 
-        assert_eq!(infos.len(), 6);
+        assert_eq!(infos.len(), 7);
         assert!(infos.iter().all(|i| !i.installed));
         assert!(infos.iter().all(|i| i.path.is_none()));
         // Boundary: known() ids are still all reported even with nothing found.
@@ -198,12 +204,24 @@ mod tests {
     }
 
     #[test]
-    fn make_maps_claude_code_to_real_opencode_to_stub_and_others_to_none() {
+    fn make_maps_claude_code_and_pi_to_real_opencode_to_stub_and_others_to_none() {
         assert!(HarnessRegistry::make("claude-code").is_some());
+        assert!(HarnessRegistry::make("pi").is_some());
         assert!(HarnessRegistry::make("opencode").is_some());
         for id in ["codex", "gemini", "grok", "ollama", "unknown-id"] {
             assert!(HarnessRegistry::make(id).is_none(), "id {id} should map to None");
         }
+    }
+
+    #[test]
+    fn make_pi_constructs_a_distinct_adapter_from_claude_code_despite_both_being_real() {
+        // Boundary: two ids share AdapterStatus::Real (D6) — make() must
+        // still dispatch to the correct concrete adapter, not always the
+        // first Real one (claude-code).
+        let pi = HarnessRegistry::make("pi").expect("pi should be Real");
+        assert_eq!(pi.id().0, "pi");
+        let claude = HarnessRegistry::make("claude-code").expect("claude-code should be Real");
+        assert_eq!(claude.id().0, "claude-code");
     }
 
     #[test]

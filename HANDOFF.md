@@ -53,6 +53,18 @@
   (검색은 현재 런 원장만), 스폰 세션 훅 차단, Cmd/Browser DoD 실행. `--ignored` real-CLI
   테스트는 전 워커 금지(코디네이터 수동 전용).
 
+**M8 확정 사항** (2026-08-31, Phase 0 사용자 결정 — `.orchestration/contracts-m8.md`):
+- 범위: 적응형 세마포어(§13.1 보강 제안) + PiHarness(opencode 실 어댑터를 대체 — DESIGN
+  §2.3 2순위 갱신, 스텁 존치).
+- PiHarness는 최소 가용(스폰/턴/종결 판정/방어 파싱, claude 어댑터 패리티 아님).
+- 검증: 결정론 fake + real-CLI `#[ignore]` 스팟체크(코디네이터 수동, 함정 19).
+- 스코프 아웃(F0): opencode 실 구현(스텁 그대로 존치·삭제 금지), pi 확장(extension)
+  작성, pi 프로바이더/모델 등록 자동화(유저의 기존 pi 설정을 그대로 사용), pi 버전 자동
+  감지/핀 강제, 로스터 GUI 변경(registry가 Real로 노출하면 기존 GUI가 자동 표시 — 검증만),
+  실 레이트리밋 유도 실험(결정론 fake로만 검증), 어댑터 스트리밍 스티어링(steer)·
+  compact·fork. `--ignored` real-CLI 테스트 실행은 전 워커 금지(추가만 — 코디네이터
+  수동 전용).
+
 ---
 
 ## 3. 검증 상태 (중요)
@@ -181,6 +193,29 @@
 - M7 계약 정본: `.orchestration/contracts-m7.md` (teardown 시
   `archive-20260830-m7a/contracts-m7.md`로 아카이브 예정 — M6 표기 관례와 동일).
 
+**검증됨 — M8** (2026-08-31, 실측):
+- 머지 완료 4/4 태스크(코드 3 + 본 문서): t-pool-adapt(F1 적응형 세마포어 —
+  `report_rate_limit`에 한도 −1·하한 1·쿨다운 멱등 추가, lazy 회복 +1/300s, 기존
+  백오프 verbatim 유지, Semaphore→Mutex+Notify 교체), t-pi-harness(F3 PiHarness
+  최소 가용 — pi v0.75.5 RPC 모드, `AgentCfg.model` 추가, `Session.stdin`
+  `Arc<Mutex>` 보정, registry `KNOWN` 7종·pi=Real, 픽스처 6종 단위 테스트),
+  t-pool-wire(F2 — `looks_like_rate_limit` 술어 7신호 + `RoleHarnessBehavior`
+  Failed 경로 배선).
+- 결정론: `cargo test --workspace` 통합 브랜치 green(실패 0). crew-harness 신규
+  테스트: pool 5종(축소/하한/멱등/회복/catch-up), pi 단위 6종 + registry 경계 1.
+  crew-agent 신규: 술어 5 + 통합 2.
+- pi RPC 스파이크(코디네이터, 2026-08-31, 원시 캡처
+  `~/.linkly-crew/pi-spike/rpc2.jsonl`): ① stdin EOF 시 즉시 셧다운(턴 완료 전
+  절단) ② 정상 턴 = `message_end`(stopReason "stop") → `turn_end` →
+  `agent_end`(willRetry:false); 문서상 `agent_settled`는 90초 내 미발화 — 종결
+  판정 사용 금지 ③ `extension_ui_request` 1턴 89건(무응답형 스팸), 다이얼로그형
+  (select/confirm/input/editor)은 응답 없으면 스톨 위험. 상세: `docs/SPIKE-M8.md`.
+- real-CLI 스팟체크(함정 19, 코디네이터 수동): `crew-harness tests/real_pi.rs
+  one_turn_round_trip` — 실제 pi 프로세스 1턴 라운드트립, **6.70s**, 통과
+  (2026-08-31).
+- M8 계약 정본: `.orchestration/contracts-m8.md` (teardown 시
+  `archive-20260831-m8a/contracts-m8.md`로 아카이브 예정 — M7 표기 관례와 동일).
+
 **미검증**:
 - GUI에서 scripted=false 클릭 실행(네이티브 창 — 사람 1클릭 필요; 실 CLI 경로 자체는 위
   E2E 2건으로 증명됨) — Gate 2에서 확인 예정.
@@ -203,30 +238,37 @@ task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ---
 
-## 4. 다음 스텝 — M7 완료 후 잔여
+## 4. 다음 스텝 — M8 완료 후 잔여
 
-M1~M7 완료·실측 검증됨(§3). 다음 후보:
+M1~M8 완료·실측 검증됨(§3). 다음 후보:
 
-**M7 완료 후 잔여 (작은 것부터)**:
+**M8 완료 후 잔여 (작은 것부터)**:
 1. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가;
    현재 코디네이터 수동 진행 중).
-2. 적응형 세마포어(§13.1), opencode 실 어댑터 — M7 E0로 스코프 아웃, 여전히 미착수.
-3. 스폰 세션 훅 완전 차단(함정 8, 아직 미해결).
-4. Cmd/Browser DoD 실제 실행 (M3부터 skip 기록만).
+2. 스폰 세션 훅 완전 차단(함정 8, 아직 미해결).
+3. Cmd/Browser DoD 실제 실행 (M3부터 skip 기록만).
+
+opencode 실 어댑터는 PiHarness로 대체됨(스텁 존치, DESIGN §2.3) — M8 F0로 스코프
+아웃 항목에서 제거. 적응형 세마포어는 M8 F1로 완료.
 
 **3단계(DESIGN §11 후순위)**: ed25519 서명, 원격 릴레이, 사람 참여, 모바일.
 
 **재사용 계약**: M3(archive-20260827-m3a/contracts-m3.md) + M4(archive-20260828-m4a/
 contracts-m4.md) + M5(archive-20260829-m5a/contracts-m5.md) + M6(archive-20260829-m6a/
-contracts-m6.md 예정, 현재 .orchestration/contracts-m6.md) + **M7(archive-20260830-m7a/
-contracts-m7.md 예정, 현재 .orchestration/contracts-m7.md)** — RunEvent 3종, TaskStateDto
+contracts-m6.md 예정, 현재 .orchestration/contracts-m6.md) + M7(archive-20260830-m7a/
+contracts-m7.md 예정, 현재 .orchestration/contracts-m7.md) + **M8(archive-20260831-m8a/
+contracts-m8.md 예정, 현재 .orchestration/contracts-m8.md)** — RunEvent 3종, TaskStateDto
 "blocked", HandoffPack/Roster, HarnessRegistry/HarnessPool, LlmLeadPlanner,
 `RunHandle::swap_harness`(즉시 실효 + 경계 폴백), `AgentControl`/`on_control`,
 `features/dag`/`features/timeline`, Tauri 커맨드 5종, 로스터 패널/동적 배지/이니셜 맵,
 `plan_dag_for`(가변 역할 DAG), `agent:human`/`GateDecision`/`RunHandle::resolve_gate`,
 crew-ledger FTS5 `search_messages`/`RunHandle::search_messages`, `features/inbox`/
 `features/artifacts`/`features/search`, 가변 로스터 슬롯 UI(추가/삭제), Tauri
-`resolve_gate`/`search_messages` 커맨드 + 미니 2인팀 프리셋. 재발명 금지.
+`resolve_gate`/`search_messages` 커맨드 + 미니 2인팀 프리셋, `HarnessPool` 적응형
+세마포어(`report_rate_limit` 한도 축소/회복, `RATE_RECOVERY_SECS=300`),
+`crew_harness::pi::PiHarness`(`HarnessId("pi")`), `AgentCfg.model`,
+`Session.stdin`(`Arc<Mutex<ChildStdin>>`), `crew_agent::harness_behavior::
+looks_like_rate_limit`. 재발명 금지.
 
 ---
 
@@ -295,3 +337,17 @@ crew-ledger FTS5 `search_messages`/`RunHandle::search_messages`, `features/inbox
     (M7 오케스트레이션 운영 실측, m7a 재진입): 4개 태스크(t-artifacts/t-inbox/
     t-rosterrun/t-search)가 이 상태로 발견됐고, 코디네이터가 스냅샷 커밋으로 회수했다
     — merge-prep 프롬프트(§4, 커밋 지시) 전달 전 워커 생존을 확인할 것.
+22. **`pi --mode rpc`는 stdin EOF 시 턴 완료 전이라도 즉시 셧다운한다** (M8 RPC
+    스파이크 실측, 코디네이터, 2026-08-31, `docs/SPIKE-M8.md`): 어댑터는 세션 수명
+    동안 stdin 파이프를 열어둬야 한다 — 이 실측이 `Session.stdin`을
+    `ChildStdin` → `Arc<tokio::sync::Mutex<ChildStdin>>`로 바꾼 근거(F3).
+23. **pi의 `agent_settled`는 종결 판정에 쓸 수 없다** (M8 RPC 스파이크 실측): 문서상의
+    `agent_settled` 이벤트가 90초 내 미발화하는 것을 실측했다. 정상 턴 순서는
+    `message_end`(stopReason "stop") → `turn_end` → `agent_end`(`willRetry:false`) —
+    `agent_end`(willRetry:false)를 턴 종결 백스톱으로 삼을 것, `agent_settled`를
+    기다리지 말 것.
+24. **pi의 `extension_ui_request` 다이얼로그형 메서드는 응답 없으면 스톨한다** (M8 RPC
+    스파이크 실측): 1턴에 89건(setWidget/setStatus/setTitle 등 무응답형 스팸) 발생,
+    그중 다이얼로그형(select/confirm/input/editor)은 응답이 없으면 진행이 막힌다 —
+    PiHarness는 즉시 `{"type":"extension_ui_response","id":<id>,"cancelled":true}`로
+    자동 응답해 스톨을 방지한다.

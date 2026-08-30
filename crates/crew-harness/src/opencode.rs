@@ -73,6 +73,7 @@ mod tests {
         let harness = OpencodeHarness::new();
         let cfg = AgentCfg {
             cwd: std::env::current_dir().unwrap(),
+            model: None,
         };
         let result = harness.spawn(&cfg).await;
         let err = match result {
