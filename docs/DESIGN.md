@@ -96,6 +96,8 @@ pub trait Harness: Send + Sync {
 
 - 1순위 구현: `claude-code` (설치·검증 완료)
 - 2순위: `opencode` (설치됨), ACP 기반 어댑터 (Zed의 agent-client-protocol — 버즈가 쓰는 방식)
+  (M8: 실 어댑터는 `PiHarness`(pi v0.75.5, RPC 모드)로 대체 구현됨 — pi 하나가 다중
+  프로바이더/모델을 커버해 우선 채택. opencode는 스텁 존치, 삭제 안 함.)
 - 미설치 CLI는 **설치 감지 후 비활성 카드**로 UI에 표시. 스텁만 두고 나중에.
 
 
