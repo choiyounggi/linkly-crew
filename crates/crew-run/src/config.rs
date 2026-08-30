@@ -74,4 +74,9 @@ pub enum RunError {
     /// (M5 semantics), not that it failed outright.
     #[error("swap incomplete, falls back to next sprint boundary: {0}")]
     SwapIncomplete(String),
+    /// `validate_roster` rejected `RunConfig::roster` (contracts-m7.md §E4)
+    /// — `RunController::start` returns this before any spawn or ledger
+    /// creation, so a rejected roster leaves no partial run state.
+    #[error("invalid roster: {0}")]
+    RosterInvalid(String),
 }

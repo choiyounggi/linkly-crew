@@ -47,6 +47,10 @@ pub(crate) const SWAP_ACK_TIMEOUT_MS: u64 = 120_000;
 const L1_BUDGET_CHARS: usize = 16_000;
 
 /// The five fixed M3 roles and their agent ids (m3_sprint.rs `roles_all`).
+/// `spawn_sprint` no longer calls this (contracts-m7.md §E4: `crew_agents`
+/// replaces it on the spawn path) — kept, unused, for the default path per
+/// §E4's explicit "함수 자체는 default 경로·테스트용으로 존치 가능".
+#[allow(dead_code)]
 fn roles_all() -> [(&'static str, Role); 5] {
     [
         ("agent:pm", Role::Pm),
@@ -57,6 +61,7 @@ fn roles_all() -> [(&'static str, Role); 5] {
     ]
 }
 
+#[allow(dead_code)]
 fn roles_routing() -> Vec<(Role, String)> {
     roles_all()
         .into_iter()
@@ -103,6 +108,27 @@ fn role_from_str(role: &str) -> Option<Role> {
     }
 }
 
+/// Canonical role order (contracts-m7.md §E1's `ROLE_ORDER`, mirrored here
+/// since `crew-run` has no access to `crew-lead::plan`'s private constant)
+/// — `crew_agents`' sort key.
+const ROLE_ORDER: [Role; 5] = [Role::Pm, Role::Designer, Role::Publisher, Role::Developer, Role::Qa];
+
+/// Non-lead roster slots with a recognized role, sorted into canonical role
+/// order (contracts-m7.md §E4 verbatim) — the vary-roster replacement for
+/// `roles_all()` in `spawn_sprint`'s worker loop and its `LeadBehavior`
+/// routing table. `role_from_str` already returns `None` for `"lead"`, so a
+/// single `filter_map` excludes both the lead slot and any unrecognized
+/// role in one pass.
+fn crew_agents(roster: &Roster) -> Vec<(String, Role)> {
+    let mut agents: Vec<(String, Role)> = roster
+        .agents
+        .iter()
+        .filter_map(|a| role_from_str(&a.role).map(|role| (a.id.clone(), role)))
+        .collect();
+    agents.sort_by_key(|(_, role)| ROLE_ORDER.iter().position(|r| r == role).unwrap_or(usize::MAX));
+    agents
+}
+
 /// The default 6-slot roster (contracts-m5.md §C5a: `None` = lead + 5
 /// roles, all `claude-code`/`"default"`) — team size is fixed (contract
 /// §C0), only harness/model assignment varies per slot.
@@ -124,6 +150,36 @@ fn default_roster() -> Roster {
             slot("agent:qa", "qa"),
         ],
     }
+}
+
+/// Validates a roster before any spawn (contracts-m7.md §E4): a `"lead"`
+/// slot must exist, at least one non-lead slot must exist (crew ≥1), every
+/// non-lead slot's role string must be recognized (`role_from_str`), and no
+/// recognized role may repeat. Checked in that order so each violation
+/// class (crew-zero vs. unknown-role vs. duplicate) surfaces its own
+/// distinct message naming the offending value.
+pub fn validate_roster(roster: &Roster) -> Result<(), String> {
+    if !roster.agents.iter().any(|a| a.role == "lead") {
+        return Err("roster has no \"lead\" slot".to_string());
+    }
+    let crew: Vec<&RosterAgent> = roster.agents.iter().filter(|a| a.role != "lead").collect();
+    if crew.is_empty() {
+        return Err("roster has no crew slots (lead only)".to_string());
+    }
+    for agent in &crew {
+        if role_from_str(&agent.role).is_none() {
+            return Err(format!("unknown role \"{}\" for agent \"{}\"", agent.role, agent.id));
+        }
+    }
+    let mut seen: Vec<Role> = Vec::new();
+    for agent in &crew {
+        let role = role_from_str(&agent.role).expect("checked unknown-role above");
+        if seen.contains(&role) {
+            return Err(format!("duplicate role \"{}\" (agent \"{}\")", agent.role, agent.id));
+        }
+        seen.push(role);
+    }
+    Ok(())
 }
 
 fn roster_to_dto(roster: &Roster) -> Vec<RosterAgentDto> {
@@ -201,7 +257,14 @@ async fn spawn_sprint(
 ) -> Result<SpawnedSprint, RunError> {
     let mut worker_aborts = Vec::new();
     let mut controls: HashMap<String, mpsc::Sender<AgentControl>> = HashMap::new();
-    for (agent_id, role) in roles_all() {
+    // Vary-roster spawn/routing (contracts-m7.md §E4): `crew` replaces the
+    // fixed `roles_all()` here and feeds `LeadBehavior`'s routing table
+    // below, so both reflect exactly this roster's non-lead, recognized-role
+    // slots.
+    let crew = crew_agents(roster);
+    for (agent_id, role) in &crew {
+        let agent_id: &str = agent_id.as_str();
+        let role = *role;
         let conn = BusConn::connect(url, token, agent_id).await?;
         // Every worker (Scripted included, plan D3) gets a control channel
         // so `swap_harness` step 3 has a real send target to test against;
@@ -256,12 +319,13 @@ async fn spawn_sprint(
     }
 
     let lead_conn = BusConn::connect(url, token, "agent:lead").await?;
+    let routing: Vec<(Role, String)> = crew.iter().map(|(id, role)| (*role, id.clone())).collect();
     let prior_states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
     let lead_behavior = LeadBehavior::new(
         "agent:lead",
         dag.clone(),
         sprint_tasks.to_vec(),
-        roles_routing(),
+        routing,
         max_rework,
     )
     .with_prior_states(prior_states)
@@ -308,13 +372,18 @@ pub struct RunController;
 
 impl RunController {
     pub async fn start(cfg: RunConfig) -> Result<RunHandle, RunError> {
+        // Validated before any spec/dag/ledger/spawn work (contracts-m7.md
+        // §E4 plan D5) — a rejected roster leaves zero partial run state.
+        let roster = cfg.roster.clone().unwrap_or_else(default_roster);
+        validate_roster(&roster).map_err(RunError::RosterInvalid)?;
+        let present_roles: Vec<Role> = crew_agents(&roster).into_iter().map(|(_, role)| role).collect();
+
         let spec = match &cfg.mode {
             RunMode::Scripted { .. } => LeadPlanner::specify(&cfg.goal)?,
             RunMode::RealCli => {
                 // Lead slot's harness id, falling back to claude-code if the
                 // roster names an id with no adapter (contracts-m5.md §C3c
                 // controller wiring — mirrors spawn_sprint's RealCli branch).
-                let roster = cfg.roster.clone().unwrap_or_else(default_roster);
                 let harness_id = harness_id_for(&roster, "agent:lead");
                 let harness = HarnessRegistry::make(&harness_id)
                     .or_else(|| HarnessRegistry::make("claude-code"))
@@ -326,7 +395,9 @@ impl RunController {
                 LlmLeadPlanner::specify(harness, &cfg.goal).await?
             }
         };
-        let dag = LeadPlanner::plan_dag(&spec)?;
+        // present = crew_agents' roles (contracts-m7.md §E4) — the LLM path
+        // varies only the SpecDoc, DAG shaping is the same function either way.
+        let dag = LeadPlanner::plan_dag_for(&spec, &present_roles)?;
         let effective_max = if cfg.max_per_sprint == 0 {
             dag.tasks.len().max(1)
         } else {
@@ -369,8 +440,9 @@ impl RunController {
         });
 
         // RosterChanged fires once right after RunStarted/SpecReady (plan
-        // D4/contract C5a) — before any sprint's workers spawn.
-        let roster = Arc::new(Mutex::new(cfg.roster.clone().unwrap_or_else(default_roster)));
+        // D4/contract C5a) — before any sprint's workers spawn. Reuses the
+        // already-validated `roster` resolved at the top of `start`.
+        let roster = Arc::new(Mutex::new(roster));
         let _ = run_tx.send(RunEvent::RosterChanged {
             agents: roster_to_dto(&roster.lock().expect("roster mutex poisoned")),
             ts: now_ts(),
