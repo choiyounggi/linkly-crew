@@ -163,6 +163,15 @@ export class TauriEventSource implements RunEventSource {
     return this.invoke<HarnessInfo[]>("detect_harnesses");
   }
 
+  /** Command names verbatim per contracts-m7.md §E8. */
+  async resolveGate(taskId: string, decision: "approve" | "reject", reason: string): Promise<void> {
+    await this.invoke<void>("resolve_gate", { taskId, decision, reason });
+  }
+
+  async searchMessages(query: string): Promise<{ seq: number; envelope: Envelope }[]> {
+    return this.invoke<{ seq: number; envelope: Envelope }[]>("search_messages", { query });
+  }
+
   /** A live `message` at or below `lastSeq` is already covered by the snapshot replay — dropped, not re-delivered. */
   private deliverLive(ev: RunEvent): void {
     if (ev.type === "message") {

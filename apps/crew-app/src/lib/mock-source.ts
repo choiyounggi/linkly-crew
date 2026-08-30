@@ -175,7 +175,7 @@ function buildSprintPlans(): SprintPlan[] {
   return [
     { index: 1, taskIds: ["t-pm", "t-design"], summary: "스프린트 1 완료: t-pm, t-design 수락" },
     { index: 2, taskIds: ["t-publish", "t-dev"], summary: "스프린트 2 완료: t-publish, t-dev 수락" },
-    { index: 3, taskIds: ["t-qa"], summary: "스프린트 3 완료: t-qa 수락" },
+    { index: 3, taskIds: ["t-qa"], summary: "스프린트 3: t-qa 에스컬레이션(승인 대기)" },
   ];
 }
 
@@ -244,6 +244,38 @@ function buildScenario(goal: string, initialRoster: Roster, allocateSeq: () => n
       body: {},
     });
     pushMessage(ack);
+
+    if (roleTask.role === "qa") {
+      // Escalation demo (contracts-m7.md §E8/plan D5): qa reports blocked,
+      // lead escalates via human.gate, task lands on "escalated" (not
+      // "accepted") — the run still reaches run_finished(completed) despite
+      // this (existing M3 completion semantics), and resolveGate()/the
+      // inbox feature act on it live from there.
+      const blocked = makeEnvelope({
+        thread: task.id,
+        from: roleTask.agent,
+        to: ["lead"],
+        kind: "blocked",
+        corr: task.id,
+        in_reply_to: ack.id,
+        body: { reason: "REQ-4 반응형 레이아웃을 재현할 수 없음 — 승인 필요" },
+      });
+      pushMessage(blocked);
+      events.push({ type: "task_state_changed", task_id: task.id, state: "blocked", ts: PENDING_TS });
+
+      const gate = makeEnvelope({
+        thread: task.id,
+        from: "lead",
+        to: [],
+        kind: "human.gate",
+        corr: task.id,
+        in_reply_to: blocked.id,
+        body: { task_id: task.id, reason: "qa 차단 사유 검토 필요 — 승인/반려 결정 대기" },
+      });
+      pushMessage(gate);
+      events.push({ type: "task_state_changed", task_id: task.id, state: "escalated", ts: PENDING_TS });
+      return;
+    }
 
     if (roleTask.role === "designer") {
       const badResult = makeEnvelope({
@@ -381,6 +413,9 @@ export class MockEventSource implements RunEventSource {
   private roster: Roster;
   private nextSeq = 1;
   private swapEnvCounter = 0;
+  private gateEnvCounter = 0;
+  /** Messages actually delivered so far (plan D4) — `searchMessages` filters over this, not the full scripted scenario. */
+  private deliveredMessages: { seq: number; envelope: Envelope }[] = [];
 
   constructor(intervalMs = 300, roster: Roster = buildRoster()) {
     this.intervalMs = intervalMs;
@@ -390,6 +425,7 @@ export class MockEventSource implements RunEventSource {
   async start(goal: string): Promise<void> {
     this.clearTimers();
     this.nextSeq = 1;
+    this.deliveredMessages = [];
     const initialRoster = this.roster;
     const events = buildScenario(goal, initialRoster, () => this.nextSeq++);
     // The scripted scenario always ends with the designer swapped to
@@ -401,8 +437,7 @@ export class MockEventSource implements RunEventSource {
 
     events.forEach((ev, index) => {
       const timer = setTimeout(() => {
-        const stamped = restampWithNow(ev);
-        for (const cb of this.listeners) cb(stamped);
+        this.emit(restampWithNow(ev));
       }, index * this.intervalMs);
       this.timers.push(timer);
     });
@@ -422,6 +457,14 @@ export class MockEventSource implements RunEventSource {
   private clearTimers(): void {
     for (const timer of this.timers) clearTimeout(timer);
     this.timers = [];
+  }
+
+  /** Delivers one event to subscribers, tracking `message`s for `searchMessages` (plan D4). */
+  private emit(ev: RunEvent): void {
+    if (ev.type === "message") {
+      this.deliveredMessages.push({ seq: ev.seq, envelope: ev.envelope });
+    }
+    for (const cb of this.listeners) cb(ev);
   }
 
   // --- C7a optional methods (plan D5) -------------------------------------
@@ -465,8 +508,8 @@ export class MockEventSource implements RunEventSource {
     const handoffEvent: RunEvent = { type: "message", seq: this.nextSeq++, envelope: handoffEnvelope };
     const rosterEvent: RunEvent = { type: "roster_changed", agents: rosterToDto(this.roster), ts: now };
 
-    for (const cb of this.listeners) cb(handoffEvent);
-    for (const cb of this.listeners) cb(rosterEvent);
+    this.emit(handoffEvent);
+    this.emit(rosterEvent);
   }
 
   async getRoster(): Promise<Roster> {
@@ -483,5 +526,50 @@ export class MockEventSource implements RunEventSource {
 
   async detectHarnesses(): Promise<HarnessInfo[]> {
     return KNOWN_HARNESSES;
+  }
+
+  // --- E8 gate/search methods (plan D4) -----------------------------------
+
+  /**
+   * Replays a human.response message, then the resulting state transition:
+   * "approve" -> assigned -> accepted; "reject" -> blocked (contracts-m7.md §E8).
+   */
+  async resolveGate(taskId: string, decision: "approve" | "reject", reason: string): Promise<void> {
+    if (!ROLE_TASKS.some((t) => t.id === taskId)) {
+      throw new Error(`resolveGate: unknown task id "${taskId}"`);
+    }
+
+    const now = new Date().toISOString();
+    const responseEnvelope: Envelope = {
+      id: `env_gate_${++this.gateEnvCounter}`,
+      ts: now,
+      sprint: SPRINT_ID,
+      thread: taskId,
+      from: "human",
+      to: ["lead"],
+      kind: "human.response",
+      corr: taskId,
+      body: { task_id: taskId, decision, reason },
+      artifacts: [],
+      requires_ack: false,
+      deadline_ms: 60_000,
+    };
+    this.emit({ type: "message", seq: this.nextSeq++, envelope: responseEnvelope });
+
+    if (decision === "approve") {
+      this.emit({ type: "task_state_changed", task_id: taskId, state: "assigned", ts: now });
+      this.emit({ type: "task_state_changed", task_id: taskId, state: "accepted", ts: now });
+    } else {
+      this.emit({ type: "task_state_changed", task_id: taskId, state: "blocked", ts: now });
+    }
+  }
+
+  /** In-memory, case-insensitive substring filter over kind/from/body of delivered messages (plan D4). */
+  async searchMessages(query: string): Promise<{ seq: number; envelope: Envelope }[]> {
+    const needle = query.toLowerCase();
+    return this.deliveredMessages.filter(({ envelope }) => {
+      const haystack = `${envelope.kind} ${envelope.from} ${JSON.stringify(envelope.body ?? "")}`.toLowerCase();
+      return haystack.includes(needle);
+    });
   }
 }

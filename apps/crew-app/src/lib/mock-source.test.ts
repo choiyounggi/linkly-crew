@@ -68,8 +68,9 @@ describe("MockEventSource", () => {
     expect(designer?.harness).toBe("opencode");
 
     const messages = received.filter((ev): ev is Extract<RunEvent, { type: "message" }> => ev.type === "message");
-    // 4 normal tasks * (assign+ack+result) + designer rework(5) + 1 handoff message
-    expect(messages).toHaveLength(4 * 3 + 5 + 1);
+    // 3 normal tasks * (assign+ack+result) + qa escalation(assign+ack+blocked+human.gate)
+    // + designer rework(5) + 1 handoff message
+    expect(messages).toHaveLength(3 * 3 + 4 + 5 + 1);
     expect(messages.map((m) => m.seq)).toEqual(messages.map((_, i) => i + 1));
 
     const handoffMessages = messages.filter((m) => m.envelope.kind === "handoff");
@@ -93,8 +94,39 @@ describe("MockEventSource", () => {
     const taskStateChanges = received.filter(
       (ev): ev is Extract<RunEvent, { type: "task_state_changed" }> => ev.type === "task_state_changed",
     );
-    expect(taskStateChanges).toHaveLength(10);
-    expect(taskStateChanges.filter((c) => c.state === "accepted")).toHaveLength(5);
+    // 4 tasks * (assigned, accepted) + t-qa * (assigned, blocked, escalated)
+    expect(taskStateChanges).toHaveLength(4 * 2 + 3);
+    expect(taskStateChanges.filter((c) => c.state === "accepted")).toHaveLength(4);
+    expect(taskStateChanges.filter((c) => c.task_id === "t-qa").map((c) => c.state)).toEqual([
+      "assigned",
+      "blocked",
+      "escalated",
+    ]);
+  });
+
+  it("escalates t-qa via a blocked message + human.gate carrying body.task_id, reaching state escalated (contracts-m7.md §E8)", async () => {
+    const source = new MockEventSource(0);
+    const received: RunEvent[] = [];
+    source.onEvent((ev) => received.push(ev));
+
+    await source.start("간단한 랜딩 페이지");
+    await vi.runAllTimersAsync();
+
+    const messages = received.filter((ev): ev is Extract<RunEvent, { type: "message" }> => ev.type === "message");
+    const qaMessages = messages.filter((m) => m.envelope.thread === "t-qa");
+    expect(qaMessages.map((m) => m.envelope.kind)).toEqual(["task.assign", "task.ack", "blocked", "human.gate"]);
+
+    const gate = qaMessages.find((m) => m.envelope.kind === "human.gate")!;
+    expect(gate.envelope.body).toMatchObject({ task_id: "t-qa" });
+
+    const finalQaState = received
+      .filter((ev): ev is Extract<RunEvent, { type: "task_state_changed" }> => ev.type === "task_state_changed")
+      .filter((c) => c.task_id === "t-qa")
+      .at(-1);
+    expect(finalQaState?.state).toBe("escalated");
+
+    // Existing M3 completion semantics hold even with an escalated task outstanding.
+    expect(received.at(-1)).toMatchObject({ type: "run_finished", outcome: "completed" });
   });
 
   it("stops delivering events after stop() is called", async () => {
@@ -221,6 +253,80 @@ describe("MockEventSource — roster/harness methods (plan D5)", () => {
   });
 });
 
+describe("MockEventSource — gate/search methods (plan D4)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("resolveGate('approve') replays a human.response message then assigned->accepted", async () => {
+    const source = new MockEventSource();
+    const received: RunEvent[] = [];
+    source.onEvent((ev) => received.push(ev));
+
+    await source.resolveGate("t-qa", "approve", "재현 확인, 승인함");
+
+    expect(received.map((e) => e.type)).toEqual(["message", "task_state_changed", "task_state_changed"]);
+    const [responseEvent, assignedEvent, acceptedEvent] = received as [
+      Extract<RunEvent, { type: "message" }>,
+      Extract<RunEvent, { type: "task_state_changed" }>,
+      Extract<RunEvent, { type: "task_state_changed" }>,
+    ];
+    expect(responseEvent.envelope.kind).toBe("human.response");
+    expect(responseEvent.envelope.body).toMatchObject({ task_id: "t-qa", decision: "approve" });
+    expect(assignedEvent).toMatchObject({ task_id: "t-qa", state: "assigned" });
+    expect(acceptedEvent).toMatchObject({ task_id: "t-qa", state: "accepted" });
+  });
+
+  it("resolveGate('reject') replays a human.response message then blocked", async () => {
+    const source = new MockEventSource();
+    const received: RunEvent[] = [];
+    source.onEvent((ev) => received.push(ev));
+
+    await source.resolveGate("t-qa", "reject", "재현 안 됨, 반려");
+
+    expect(received.map((e) => e.type)).toEqual(["message", "task_state_changed"]);
+    const stateEvent = received[1] as Extract<RunEvent, { type: "task_state_changed" }>;
+    expect(stateEvent).toMatchObject({ task_id: "t-qa", state: "blocked" });
+  });
+
+  it("resolveGate rejects for an unknown task id, delivering no events", async () => {
+    const source = new MockEventSource();
+    const received: RunEvent[] = [];
+    source.onEvent((ev) => received.push(ev));
+
+    await expect(source.resolveGate("t-nope", "approve", "")).rejects.toThrow(/unknown task id/);
+    expect(received).toHaveLength(0);
+  });
+
+  it("searchMessages filters delivered messages by kind/from/body, case-insensitively", async () => {
+    const source = new MockEventSource(0);
+    await source.start("간단한 랜딩 페이지");
+    await vi.runAllTimersAsync();
+
+    const byKind = await source.searchMessages("HANDOFF");
+    expect(byKind).toHaveLength(1);
+    expect(byKind[0].envelope.kind).toBe("handoff");
+
+    const byBody = await source.searchMessages("req-4");
+    expect(byBody.length).toBeGreaterThan(0);
+    expect(byBody.every((m) => JSON.stringify(m.envelope.body).toLowerCase().includes("req-4"))).toBe(true);
+  });
+
+  it("searchMessages returns an empty array for a query with no matches and for an empty delivered log", async () => {
+    const emptySource = new MockEventSource();
+    expect(await emptySource.searchMessages("anything")).toEqual([]);
+
+    const source = new MockEventSource(0);
+    await source.start("간단한 랜딩 페이지");
+    await vi.runAllTimersAsync();
+    expect(await source.searchMessages("no-such-token-xyz")).toEqual([]);
+  });
+});
+
 describe("MockEventSource + RunState integration", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -230,7 +336,7 @@ describe("MockEventSource + RunState integration", () => {
     vi.useRealTimers();
   });
 
-  it("drives the store to a fully accepted, completed final state across 3 sprints with the designer swap applied", async () => {
+  it("drives the store to a completed final state across 3 sprints, with t-qa escalated and the designer swap applied", async () => {
     const source = new MockEventSource(0);
     const store = createRunStore(source);
     source.onEvent(store.getState().applyEvent);
@@ -241,8 +347,8 @@ describe("MockEventSource + RunState integration", () => {
     const s = store.getState();
     expect(s.finished).toBe("completed");
     expect(s.dag?.tasks).toHaveLength(5);
-    expect(Object.values(s.taskStates)).toEqual(["accepted", "accepted", "accepted", "accepted", "accepted"]);
-    expect(s.messages).toHaveLength(4 * 3 + 5 + 1);
+    expect(Object.values(s.taskStates)).toEqual(["accepted", "accepted", "accepted", "accepted", "escalated"]);
+    expect(s.messages).toHaveLength(3 * 3 + 4 + 5 + 1);
     // seq dedup holds across the whole replayed scenario too.
     const seqs = s.messages.map((m) => m.seq);
     expect(new Set(seqs).size).toBe(seqs.length);

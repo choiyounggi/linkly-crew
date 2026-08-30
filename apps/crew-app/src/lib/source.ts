@@ -1,14 +1,15 @@
 import { isTauri } from "@tauri-apps/api/core";
 
-import type { HarnessInfo, Roster, RosterPreset, RunEvent } from "./types";
+import type { Envelope, HarnessInfo, Roster, RosterPreset, RunEvent } from "./types";
 import { MockEventSource } from "./mock-source";
 import { TauriEventSource } from "./tauri-source";
 
 /**
- * Verbatim per contracts-m4.md §C4, extended per contracts-m5.md §C7a.
- * `t-bridge` implements a `TauriEventSource` (`src/lib/tauri-source.ts`)
- * against this same interface — out of scope here. The 5 roster/harness
- * methods are optional so existing sources keep compiling unchanged.
+ * Verbatim per contracts-m4.md §C4, extended per contracts-m5.md §C7a and
+ * contracts-m7.md §E8. `t-bridge` implements a `TauriEventSource`
+ * (`src/lib/tauri-source.ts`) against this same interface — out of scope
+ * here. The optional methods are optional so existing sources keep
+ * compiling unchanged.
  */
 export interface RunEventSource {
   start(goal: string): Promise<void>;
@@ -20,6 +21,8 @@ export interface RunEventSource {
   setRoster?(roster: Roster): Promise<void>;
   listPresets?(): Promise<RosterPreset[]>;
   detectHarnesses?(): Promise<HarnessInfo[]>;
+  resolveGate?(taskId: string, decision: "approve" | "reject", reason: string): Promise<void>;
+  searchMessages?(query: string): Promise<{ seq: number; envelope: Envelope }[]>;
 }
 
 /**

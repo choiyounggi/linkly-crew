@@ -19,13 +19,13 @@ use crew_lead::compress::summarize_sprint;
 use crew_lead::dispatch::{LeadBehavior, TaskState};
 use crew_lead::plan::{LeadPlanner, PlanError, SprintSlicer};
 use crew_lead::plan_llm::LlmLeadPlanner;
-use crew_ledger::EventLedger;
+use crew_ledger::{EventLedger, StoredMessage};
 use crew_proto::{handoff_body, Envelope, HandoffPack, MessageKind, Role, Roster, RosterAgent, SpecDoc, TaskDag};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::config::{RunConfig, RunError, RunMode};
+use crate::config::{GateDecision, RunConfig, RunError, RunMode};
 use crate::events::{now_ts, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};
 use crate::observe::{ObservingLead, TaskStateChange};
 
@@ -47,6 +47,10 @@ pub(crate) const SWAP_ACK_TIMEOUT_MS: u64 = 120_000;
 const L1_BUDGET_CHARS: usize = 16_000;
 
 /// The five fixed M3 roles and their agent ids (m3_sprint.rs `roles_all`).
+/// `spawn_sprint` no longer calls this (contracts-m7.md §E4: `crew_agents`
+/// replaces it on the spawn path) — kept, unused, for the default path per
+/// §E4's explicit "함수 자체는 default 경로·테스트용으로 존치 가능".
+#[allow(dead_code)]
 fn roles_all() -> [(&'static str, Role); 5] {
     [
         ("agent:pm", Role::Pm),
@@ -57,6 +61,7 @@ fn roles_all() -> [(&'static str, Role); 5] {
     ]
 }
 
+#[allow(dead_code)]
 fn roles_routing() -> Vec<(Role, String)> {
     roles_all()
         .into_iter()
@@ -103,6 +108,27 @@ fn role_from_str(role: &str) -> Option<Role> {
     }
 }
 
+/// Canonical role order (contracts-m7.md §E1's `ROLE_ORDER`, mirrored here
+/// since `crew-run` has no access to `crew-lead::plan`'s private constant)
+/// — `crew_agents`' sort key.
+const ROLE_ORDER: [Role; 5] = [Role::Pm, Role::Designer, Role::Publisher, Role::Developer, Role::Qa];
+
+/// Non-lead roster slots with a recognized role, sorted into canonical role
+/// order (contracts-m7.md §E4 verbatim) — the vary-roster replacement for
+/// `roles_all()` in `spawn_sprint`'s worker loop and its `LeadBehavior`
+/// routing table. `role_from_str` already returns `None` for `"lead"`, so a
+/// single `filter_map` excludes both the lead slot and any unrecognized
+/// role in one pass.
+fn crew_agents(roster: &Roster) -> Vec<(String, Role)> {
+    let mut agents: Vec<(String, Role)> = roster
+        .agents
+        .iter()
+        .filter_map(|a| role_from_str(&a.role).map(|role| (a.id.clone(), role)))
+        .collect();
+    agents.sort_by_key(|(_, role)| ROLE_ORDER.iter().position(|r| r == role).unwrap_or(usize::MAX));
+    agents
+}
+
 /// The default 6-slot roster (contracts-m5.md §C5a: `None` = lead + 5
 /// roles, all `claude-code`/`"default"`) — team size is fixed (contract
 /// §C0), only harness/model assignment varies per slot.
@@ -124,6 +150,36 @@ fn default_roster() -> Roster {
             slot("agent:qa", "qa"),
         ],
     }
+}
+
+/// Validates a roster before any spawn (contracts-m7.md §E4): a `"lead"`
+/// slot must exist, at least one non-lead slot must exist (crew ≥1), every
+/// non-lead slot's role string must be recognized (`role_from_str`), and no
+/// recognized role may repeat. Checked in that order so each violation
+/// class (crew-zero vs. unknown-role vs. duplicate) surfaces its own
+/// distinct message naming the offending value.
+pub fn validate_roster(roster: &Roster) -> Result<(), String> {
+    if !roster.agents.iter().any(|a| a.role == "lead") {
+        return Err("roster has no \"lead\" slot".to_string());
+    }
+    let crew: Vec<&RosterAgent> = roster.agents.iter().filter(|a| a.role != "lead").collect();
+    if crew.is_empty() {
+        return Err("roster has no crew slots (lead only)".to_string());
+    }
+    for agent in &crew {
+        if role_from_str(&agent.role).is_none() {
+            return Err(format!("unknown role \"{}\" for agent \"{}\"", agent.role, agent.id));
+        }
+    }
+    let mut seen: Vec<Role> = Vec::new();
+    for agent in &crew {
+        let role = role_from_str(&agent.role).expect("checked unknown-role above");
+        if seen.contains(&role) {
+            return Err(format!("duplicate role \"{}\" (agent \"{}\")", agent.role, agent.id));
+        }
+        seen.push(role);
+    }
+    Ok(())
 }
 
 fn roster_to_dto(roster: &Roster) -> Vec<RosterAgentDto> {
@@ -201,7 +257,14 @@ async fn spawn_sprint(
 ) -> Result<SpawnedSprint, RunError> {
     let mut worker_aborts = Vec::new();
     let mut controls: HashMap<String, mpsc::Sender<AgentControl>> = HashMap::new();
-    for (agent_id, role) in roles_all() {
+    // Vary-roster spawn/routing (contracts-m7.md §E4): `crew` replaces the
+    // fixed `roles_all()` here and feeds `LeadBehavior`'s routing table
+    // below, so both reflect exactly this roster's non-lead, recognized-role
+    // slots.
+    let crew = crew_agents(roster);
+    for (agent_id, role) in &crew {
+        let agent_id: &str = agent_id.as_str();
+        let role = *role;
         let conn = BusConn::connect(url, token, agent_id).await?;
         // Every worker (Scripted included, plan D3) gets a control channel
         // so `swap_harness` step 3 has a real send target to test against;
@@ -256,12 +319,13 @@ async fn spawn_sprint(
     }
 
     let lead_conn = BusConn::connect(url, token, "agent:lead").await?;
+    let routing: Vec<(Role, String)> = crew.iter().map(|(id, role)| (*role, id.clone())).collect();
     let prior_states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
     let lead_behavior = LeadBehavior::new(
         "agent:lead",
         dag.clone(),
         sprint_tasks.to_vec(),
-        roles_routing(),
+        routing,
         max_rework,
     )
     .with_prior_states(prior_states)
@@ -304,17 +368,112 @@ async fn drain_subscription_backlog(drain_tx: &mpsc::UnboundedSender<oneshot::Se
     }
 }
 
+/// Capacity for the `RunHandle::resolve_gate` -> human proxy command
+/// channel (plan D2) — gate decisions are rare, human-paced events, not a
+/// throughput path.
+const GATE_CHANNEL_CAPACITY: usize = 8;
+
+/// One `RunHandle::resolve_gate` request routed to the human proxy task
+/// (contracts-m7.md §E5, plan D2). `reply` carries the bus-publish outcome
+/// back so `resolve_gate` can distinguish "published" from a bus-level
+/// failure; a dropped `reply` (proxy aborted mid-flight) is treated by
+/// `resolve_gate` the same as a closed `gate_tx`.
+struct GateCmd {
+    task_id: String,
+    decision: GateDecision,
+    reason: String,
+    reply: oneshot::Sender<Result<(), String>>,
+}
+
+/// Run-resident `agent:human` proxy (contracts-m7.md §E5, plan D1/D3): its
+/// own `recv()` is drained and discarded — `agent:human` is never itself a
+/// message *source* except through `resolve_gate` — which is enough for the
+/// bus to treat `agent:human` as a live recipient, turning what used to be
+/// an `unknown_recipient` rejection for `human.gate` into normal delivery.
+/// `GateCmd`s arriving on `gate_rx` are published as `human.response`
+/// envelopes (§E2 verbatim) over this same connection.
+///
+/// `shutdown_rx` (rather than an `AbortHandle`) is the *natural*-end signal
+/// (`RunController::start`'s finisher, plan D1): the bus never sends a
+/// requires_ack=false envelope's own publish `Receipt` back to its sender on
+/// first attempt (only a later retry's dedup path does, contracts-m7.md
+/// §E2's fixed `requires_ack: false` runs straight into that), so a
+/// resolve_gate call whose decision itself completes the run can still be
+/// mid-flight in `conn.send` when the lead task finishes. `biased` ensures a
+/// pending `GateCmd` is always drained ahead of a same-tick shutdown signal,
+/// and — because a `select!` arm always runs its body to completion once
+/// chosen — an *in-flight* `conn.send` is never interrupted by it either.
+/// `RunHandle::shutdown` (an already-running, not-yet-finished run) instead
+/// aborts this task outright via its `AbortHandle`, matching every other
+/// resource's forceful teardown there.
+async fn human_proxy_loop(
+    mut conn: BusConn,
+    mut gate_rx: mpsc::Receiver<GateCmd>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            cmd = gate_rx.recv() => {
+                let Some(cmd) = cmd else { break };
+                let decision_str = match cmd.decision {
+                    GateDecision::Approve => "approve",
+                    GateDecision::Reject => "reject",
+                };
+                let envelope = Envelope::new(
+                    // Literal duplicate of crew-lead::dispatch's private
+                    // `SPRINT_LABEL`/`DEADLINE_MS` (mirrors `swap_harness`'s
+                    // same tradeoff above — that crate is out of scope here).
+                    "sp-m3".to_string(),
+                    format!("th-gate-{}", cmd.task_id),
+                    "agent:human".to_string(),
+                    vec!["agent:lead".to_string()],
+                    MessageKind::HumanResponse,
+                    None,
+                    format!("gate-{}", uuid::Uuid::new_v4()),
+                    serde_json::json!({
+                        "task_id": cmd.task_id,
+                        "decision": decision_str,
+                        "reason": cmd.reason,
+                    }),
+                    Vec::new(),
+                    false,
+                    900_000,
+                );
+                let result = conn.send(envelope).await.map_err(|e| e.to_string());
+                let _ = cmd.reply.send(result);
+            }
+            recv = conn.recv() => {
+                if recv.is_none() {
+                    break;
+                }
+                // Drain-only: `human.gate`/other inbound envelopes are
+                // observed by the controller's own `subscription_loop` off
+                // the bus's broadcast, not through this connection.
+            }
+            _ = &mut shutdown_rx => {
+                break;
+            }
+        }
+    }
+}
+
 pub struct RunController;
 
 impl RunController {
     pub async fn start(cfg: RunConfig) -> Result<RunHandle, RunError> {
+        // Validated before any spec/dag/ledger/spawn work (contracts-m7.md
+        // §E4 plan D5) — a rejected roster leaves zero partial run state.
+        let roster = cfg.roster.clone().unwrap_or_else(default_roster);
+        validate_roster(&roster).map_err(RunError::RosterInvalid)?;
+        let present_roles: Vec<Role> = crew_agents(&roster).into_iter().map(|(_, role)| role).collect();
+
         let spec = match &cfg.mode {
             RunMode::Scripted { .. } => LeadPlanner::specify(&cfg.goal)?,
             RunMode::RealCli => {
                 // Lead slot's harness id, falling back to claude-code if the
                 // roster names an id with no adapter (contracts-m5.md §C3c
                 // controller wiring — mirrors spawn_sprint's RealCli branch).
-                let roster = cfg.roster.clone().unwrap_or_else(default_roster);
                 let harness_id = harness_id_for(&roster, "agent:lead");
                 let harness = HarnessRegistry::make(&harness_id)
                     .or_else(|| HarnessRegistry::make("claude-code"))
@@ -326,7 +485,9 @@ impl RunController {
                 LlmLeadPlanner::specify(harness, &cfg.goal).await?
             }
         };
-        let dag = LeadPlanner::plan_dag(&spec)?;
+        // present = crew_agents' roles (contracts-m7.md §E4) — the LLM path
+        // varies only the SpecDoc, DAG shaping is the same function either way.
+        let dag = LeadPlanner::plan_dag_for(&spec, &present_roles)?;
         let effective_max = if cfg.max_per_sprint == 0 {
             dag.tasks.len().max(1)
         } else {
@@ -369,8 +530,9 @@ impl RunController {
         });
 
         // RosterChanged fires once right after RunStarted/SpecReady (plan
-        // D4/contract C5a) — before any sprint's workers spawn.
-        let roster = Arc::new(Mutex::new(cfg.roster.clone().unwrap_or_else(default_roster)));
+        // D4/contract C5a) — before any sprint's workers spawn. Reuses the
+        // already-validated `roster` resolved at the top of `start`.
+        let roster = Arc::new(Mutex::new(roster));
         let _ = run_tx.send(RunEvent::RosterChanged {
             agents: roster_to_dto(&roster.lock().expect("roster mutex poisoned")),
             ts: now_ts(),
@@ -415,6 +577,16 @@ impl RunController {
         let (ts_tx, ts_rx) = mpsc::unbounded_channel::<TaskStateChange>();
         let relay_task = tokio::spawn(relay_loop(ts_rx, run_tx.clone(), snapshot.clone()));
         let relay_abort = relay_task.abort_handle();
+
+        // Run-resident `agent:human` proxy (contracts-m7.md §E5, plan D1):
+        // connected once here, after `bus_events_rx` subscribes (so its own
+        // `Registered` bus lifecycle event isn't missed) and before any
+        // sprint's workers/lead spawn.
+        let human_conn = BusConn::connect(&url, &token, "agent:human").await?;
+        let (gate_tx, gate_rx) = mpsc::channel::<GateCmd>(GATE_CHANNEL_CAPACITY);
+        let (human_shutdown_tx, human_shutdown_rx) = oneshot::channel::<()>();
+        let human_task = tokio::spawn(human_proxy_loop(human_conn, gate_rx, human_shutdown_rx));
+        let human_abort = human_task.abort_handle();
 
         // One cumulative terminal-state map for the whole run (plan
         // D1/C3a): every sprint's `ObservingLead` writes its own task ids
@@ -574,6 +746,24 @@ impl RunController {
             drop(ts_tx);
             let _ = relay_task.await;
 
+            // Run has ended (plan D1: "런 종료(join/shutdown) 경로에서
+            // abort") — signal the human proxy to stop *gracefully* (never
+            // interrupting an in-flight `resolve_gate` publish, see
+            // `human_proxy_loop`'s doc comment) and wait for it to actually
+            // stop before `join()` can return, so a `resolve_gate` call
+            // arriving right after `join()` deterministically observes a
+            // closed `gate_tx` receiver rather than racing a live proxy.
+            let _ = human_shutdown_tx.send(());
+            let _ = human_task.await;
+            // The human proxy's own disconnect is detected by the bus
+            // server on a separate task (not synchronized with the
+            // `human_task.await` above) — one more drain, mirroring every
+            // sprint boundary's own drain after aborting that sprint's
+            // workers, gives `subscription_loop` a chance to observe and
+            // broadcast its `Unregistered` before `RunFinished` so the
+            // latter stays the true last event.
+            drain_subscription_backlog(&drain_tx).await;
+
             let _ = finisher_run_tx.send(RunEvent::RunFinished {
                 outcome,
                 ts: now_ts(),
@@ -595,6 +785,8 @@ impl RunController {
             joined_outcome: None,
             roster: roster_for_handle,
             summaries: summaries_for_handle,
+            human_abort,
+            gate_tx,
         })
     }
 }
@@ -762,6 +954,14 @@ pub struct RunHandle {
     /// summary text to (t-swap plan D7) — `swap_harness` step 3 reads a
     /// snapshot to assemble the swapped-in worker's injected context.
     summaries: Arc<Mutex<Vec<String>>>,
+    /// Aborts the human proxy task (contracts-m7.md §E5) — the finisher
+    /// already aborts+awaits it on natural run end (plan D1); this is
+    /// `shutdown()`'s defensive counterpart for an in-progress run
+    /// (aborting an already-finished task is a no-op).
+    human_abort: AbortHandle,
+    /// Sends `resolve_gate` requests to the human proxy task (plan D2) — a
+    /// closed receiver (proxy ended) surfaces as `RunError::GateUnavailable`.
+    gate_tx: mpsc::Sender<GateCmd>,
 }
 
 /// One control-channel swap attempt against a specific worker's sender —
@@ -830,6 +1030,14 @@ impl RunHandle {
             last_seq: snap.last_seq,
             ts: now_ts(),
         }
+    }
+
+    /// Full-text search over this run's ledger (contracts-m7.md §E7
+    /// verbatim, t-bridge3 plan D1) — delegates to `EventLedger::
+    /// search_messages`; `LedgerError` converts via `RunError::Ledger`
+    /// (`#[from]`).
+    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<StoredMessage>, RunError> {
+        Ok(self.ledger.search_messages(query, limit)?)
     }
 
     /// Swaps the harness assigned to `agent_id`'s roster slot — contract
@@ -968,6 +1176,32 @@ impl RunHandle {
         Ok(())
     }
 
+    /// Publishes a `human.response` envelope for `task_id` (contracts-m7.md
+    /// §E5, §E2 verbatim) via the run-resident `agent:human` proxy.
+    /// `Err(RunError::GateUnavailable)` once the run has ended (the proxy's
+    /// receiver is closed) or the bus itself rejects the publish. Never
+    /// errors on an unknown `task_id` — the envelope still publishes; it's
+    /// `LeadBehavior::handle_human_response` (contract §E3) that silently
+    /// ignores anything not currently `Escalated`.
+    pub async fn resolve_gate(&self, task_id: &str, decision: GateDecision, reason: &str) -> Result<(), RunError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = GateCmd {
+            task_id: task_id.to_string(),
+            decision,
+            reason: reason.to_string(),
+            reply: reply_tx,
+        };
+        self.gate_tx
+            .send(cmd)
+            .await
+            .map_err(|_| RunError::GateUnavailable("run ended".to_string()))?;
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(RunError::GateUnavailable(reason)),
+            Err(_) => Err(RunError::GateUnavailable("run ended".to_string())),
+        }
+    }
+
     /// Waits for the Lead runner to finish (contract §C3). Idempotent: a
     /// second call returns the same cached outcome instead of panicking on
     /// an already-consumed join handle.
@@ -1007,6 +1241,7 @@ impl RunHandle {
         }
         self.sub_task.abort();
         self.relay_abort.abort();
+        self.human_abort.abort();
         self.bus.shutdown().await;
     }
 }

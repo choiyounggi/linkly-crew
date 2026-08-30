@@ -133,6 +133,11 @@ impl LeadBehavior {
         self.states.get(task_id).copied()
     }
 
+    #[cfg(test)]
+    fn has_pending_escalation(&self, task_id: &str) -> bool {
+        self.pending_escalations.contains_key(task_id)
+    }
+
     fn task_by_id(&self, id: &str) -> Option<&TaskSpec> {
         self.dag.tasks.iter().find(|t| t.id == id)
     }
@@ -383,6 +388,54 @@ impl LeadBehavior {
             }
         }
     }
+
+    /// `human.response` handling (plan D2~D5, contract E3): acts only when
+    /// the referenced task is currently `Escalated` — any other state,
+    /// unknown `task_id`, or malformed body is silently ignored (0
+    /// envelopes, no state change, no panic). `is_done`/`is_terminal` stay
+    /// unchanged by design: a sprint the Lead already considers fully
+    /// terminal (every task `Escalated`/`Accepted`/`Blocked`) cannot be
+    /// reopened by a late `human.response` — the runner has already
+    /// stopped polling for envelopes by then.
+    fn handle_human_response(&mut self, env: Envelope) -> Vec<Envelope> {
+        let Some(task_id) = env.body.get("task_id").and_then(Value::as_str) else {
+            return vec![];
+        };
+        let decision = env.body.get("decision").and_then(Value::as_str);
+        if self.states.get(task_id) != Some(&TaskState::Escalated) {
+            return vec![];
+        }
+        let task_id = task_id.to_string();
+
+        match decision {
+            Some("approve") => self.approve_escalation(task_id),
+            Some("reject") => {
+                self.pending_escalations.remove(&task_id);
+                self.states.insert(task_id.clone(), TaskState::Blocked);
+                self.cascade_blocked(&[task_id]);
+                vec![]
+            }
+            _ => vec![],
+        }
+    }
+
+    /// Approve arm of `handle_human_response` (plan D3, contract E3):
+    /// resets `task_id`'s `AcceptanceLoop` to a fresh `max_rework` budget
+    /// (re-inserted, not `or_insert_with` — the prior exhausted loop must
+    /// not survive), clears its pending-escalation bookkeeping, and drops
+    /// it back to `Pending` so `dispatch_ready` (the existing dispatch
+    /// path) re-assigns it with a fresh `task.assign` on the same
+    /// deterministic `corr-{task_id}` — reusing that path rather than
+    /// hand-building the envelope also means the pre-existing "role has no
+    /// routed agent" fallback (re-escalate via `human_gate`) applies here
+    /// for free if the routing table changed underneath an escalation.
+    fn approve_escalation(&mut self, task_id: String) -> Vec<Envelope> {
+        self.loops
+            .insert(task_id.clone(), AcceptanceLoop::new(self.max_rework));
+        self.pending_escalations.remove(&task_id);
+        self.states.insert(task_id, TaskState::Pending);
+        self.dispatch_ready()
+    }
 }
 
 /// Same violation-string shape as `accept::AcceptanceLoop::decide`'s
@@ -413,6 +466,7 @@ impl RoleBehavior for LeadBehavior {
         match env.kind {
             MessageKind::TaskResult => self.handle_task_result(env),
             MessageKind::Blocked => self.handle_blocked(env),
+            MessageKind::HumanResponse => self.handle_human_response(env),
             _ => vec![],
         }
     }
@@ -554,6 +608,37 @@ mod tests {
             true,
             DEADLINE_MS,
         )
+    }
+
+    fn human_response_envelope(body: Value) -> Envelope {
+        Envelope::new(
+            SPRINT_LABEL.to_string(),
+            "th-agent:lead".to_string(),
+            "agent:human".to_string(),
+            vec!["agent:lead".to_string()],
+            MessageKind::HumanResponse,
+            None,
+            "corr-human".to_string(),
+            body,
+            vec![],
+            false,
+            DEADLINE_MS,
+        )
+    }
+
+    /// Drives `t-pm` to `Escalated` via rework-budget exhaustion (mirrors
+    /// `budget_exhausted_escalates_via_human_gate_and_rest_of_dag_stays_pending`),
+    /// returning the initial `task.assign` for reuse by callers that need
+    /// its `corr`/`to`.
+    async fn escalate_pm(lead: &mut super::LeadBehavior) -> Envelope {
+        let assign = lead.on_start().await.remove(0);
+        let first = task_result_envelope(&assign, "agent:pm", failing_result_body());
+        let rework = lead.on_envelope(first).await;
+        let second = task_result_envelope(&rework[0], "agent:pm", failing_result_body());
+        let escalation = lead.on_envelope(second).await;
+        assert_eq!(escalation[0].kind, MessageKind::HumanGate);
+        assert_eq!(lead.state_of("t-pm"), Some(TaskState::Escalated));
+        assign
     }
 
     #[tokio::test]
@@ -757,5 +842,111 @@ mod tests {
             above_ceiling.tick_interval(),
             Some(std::time::Duration::from_millis(1_000))
         );
+    }
+
+    #[tokio::test]
+    async fn approve_resets_budget_reassigns_and_reaches_accepted() {
+        let mut lead = lead(1).escalation_timeout_ms(1_000);
+        let _ = escalate_pm(&mut lead).await;
+        let _ = lead.on_tick(0).await;
+        assert!(lead.has_pending_escalation("t-pm"));
+
+        let approve = human_response_envelope(
+            json!({"task_id": "t-pm", "decision": "approve", "reason": "looks fine now"}),
+        );
+        let reassign = lead.on_envelope(approve).await;
+
+        assert_eq!(reassign.len(), 1);
+        assert_eq!(reassign[0].kind, MessageKind::TaskAssign);
+        assert_eq!(reassign[0].to, vec!["agent:pm".to_string()]);
+        assert_eq!(reassign[0].corr, "corr-t-pm");
+        assert_eq!(lead.state_of("t-pm"), Some(TaskState::Assigned));
+        assert!(!lead.has_pending_escalation("t-pm"));
+
+        let pm_task: TaskSpec = serde_json::from_value(reassign[0].body["task"].clone()).unwrap();
+        let result = task_result_envelope(&reassign[0], "agent:pm", passing_result_body(&pm_task));
+        let replies = lead.on_envelope(result).await;
+
+        assert_eq!(lead.state_of("t-pm"), Some(TaskState::Accepted));
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].kind, MessageKind::TaskAssign);
+        assert_eq!(replies[0].to, vec!["agent:designer".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn reject_blocks_target_and_cascades_to_transitive_dependents() {
+        let mut lead = lead(1).escalation_timeout_ms(1_000);
+        let pm_assign = lead.on_start().await.remove(0);
+        let pm_task: TaskSpec = serde_json::from_value(pm_assign.body["task"].clone()).unwrap();
+        let pm_result = task_result_envelope(&pm_assign, "agent:pm", passing_result_body(&pm_task));
+        let design_assign = lead.on_envelope(pm_result).await.remove(0);
+        assert_eq!(design_assign.to, vec!["agent:designer".to_string()]);
+
+        let first = task_result_envelope(&design_assign, "agent:designer", failing_result_body());
+        let rework = lead.on_envelope(first).await;
+        let second = task_result_envelope(&rework[0], "agent:designer", failing_result_body());
+        let escalation = lead.on_envelope(second).await;
+        assert_eq!(escalation[0].kind, MessageKind::HumanGate);
+        assert_eq!(lead.state_of("t-design"), Some(TaskState::Escalated));
+        let _ = lead.on_tick(0).await;
+        assert!(lead.has_pending_escalation("t-design"));
+
+        let reject = human_response_envelope(
+            json!({"task_id": "t-design", "decision": "reject", "reason": "wrong direction"}),
+        );
+        let replies = lead.on_envelope(reject).await;
+
+        assert!(replies.is_empty());
+        assert!(!lead.has_pending_escalation("t-design"));
+        assert_eq!(lead.state_of("t-design"), Some(TaskState::Blocked));
+        assert_eq!(lead.state_of("t-publish"), Some(TaskState::Blocked));
+        assert_eq!(lead.state_of("t-dev"), Some(TaskState::Blocked));
+        assert_eq!(lead.state_of("t-qa"), Some(TaskState::Blocked));
+        assert_eq!(lead.state_of("t-pm"), Some(TaskState::Accepted));
+        assert!(lead.is_done());
+    }
+
+    #[tokio::test]
+    async fn human_response_for_non_escalated_task_is_ignored() {
+        let mut lead = lead(AcceptanceLoop::default_budget());
+        let _ = lead.on_start().await;
+        assert_eq!(lead.state_of("t-pm"), Some(TaskState::Assigned));
+
+        let approve =
+            human_response_envelope(json!({"task_id": "t-pm", "decision": "approve", "reason": "premature"}));
+        let replies = lead.on_envelope(approve).await;
+
+        assert!(replies.is_empty());
+        assert_eq!(lead.state_of("t-pm"), Some(TaskState::Assigned));
+    }
+
+    #[tokio::test]
+    async fn human_response_for_unknown_task_id_produces_no_reply_and_no_panic() {
+        let mut lead = lead(1);
+        let _ = escalate_pm(&mut lead).await;
+
+        let stray =
+            human_response_envelope(json!({"task_id": "t-does-not-exist", "decision": "approve", "reason": "n/a"}));
+        let replies = lead.on_envelope(stray).await;
+
+        assert!(replies.is_empty());
+        assert_eq!(lead.state_of("t-pm"), Some(TaskState::Escalated));
+    }
+
+    #[tokio::test]
+    async fn human_response_with_malformed_body_is_ignored() {
+        let mut lead = lead(1);
+        let _ = escalate_pm(&mut lead).await;
+
+        let unknown_decision =
+            human_response_envelope(json!({"task_id": "t-pm", "decision": "maybe", "reason": "unsure"}));
+        let replies = lead.on_envelope(unknown_decision).await;
+        assert!(replies.is_empty());
+        assert_eq!(lead.state_of("t-pm"), Some(TaskState::Escalated));
+
+        let missing_task_id = human_response_envelope(json!({"decision": "approve"}));
+        let replies2 = lead.on_envelope(missing_task_id).await;
+        assert!(replies2.is_empty());
+        assert_eq!(lead.state_of("t-pm"), Some(TaskState::Escalated));
     }
 }

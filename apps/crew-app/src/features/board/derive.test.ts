@@ -118,7 +118,7 @@ describe("deriveBoard — C7c avatar initials: 6 roles map to distinct 2-letter 
   });
 });
 
-describe("deriveBoard — normal: full scenario replay reaches all-accepted", () => {
+describe("deriveBoard — normal: full scenario replay reaches accepted/escalated", () => {
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -127,7 +127,10 @@ describe("deriveBoard — normal: full scenario replay reaches all-accepted", ()
     vi.useRealTimers();
   });
 
-  it("puts every task in the 완료 column once the mock scenario finishes", async () => {
+  // M7 §E8 (t-ui-shell2): the mock scenario now ends t-qa on "escalated" (a
+  // blocked->human.gate demo for the inbox), not "accepted" — the other 4
+  // tasks are unaffected.
+  it("puts the 4 non-qa tasks in 완료 and t-qa in 차단 once the mock scenario finishes", async () => {
     const source = new MockEventSource(0);
     const store = createRunStore(source);
     source.onEvent(store.getState().applyEvent);
@@ -137,11 +140,13 @@ describe("deriveBoard — normal: full scenario replay reaches all-accepted", ()
 
     const s = store.getState();
     const board = deriveBoard(s.dag, s.taskStates, s.messages);
-    expect(board.accepted).toHaveLength(5);
+    expect(board.accepted).toHaveLength(4);
     expect(board.pending).toHaveLength(0);
     expect(board.assigned).toHaveLength(0);
     expect(board.review).toHaveLength(0);
-    expect(board.escalated).toHaveLength(0);
+    expect(board.escalated).toHaveLength(1);
+    expect(board.escalated[0].task.id).toBe("t-qa");
+    expect(board.escalated[0].blockReason).toBe("escalated");
   });
 });
 
