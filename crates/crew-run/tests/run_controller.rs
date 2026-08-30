@@ -251,3 +251,28 @@ async fn snapshot_matches_c3_shape_with_last_seq_and_messages() {
     handle.shutdown().await;
     cleanup(&data_dir);
 }
+
+/// Normal case (contracts-m7.md §E7, t-bridge3 plan D1): `RunHandle::
+/// search_messages` delegates to the run's own ledger against a real
+/// completed run. Every scripted `task.result` carries at least one
+/// artifact whose `content` is built as `"[{role:?}] {name} — covers
+/// {req_ids}"` (`crew_agent::ScriptedCrewMember::build_artifacts`), so the
+/// literal "covers" is guaranteed present without depending on the goal
+/// text or requirement ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn search_messages_matches_a_real_runs_task_result() {
+    let data_dir = test_data_dir("search");
+    let mut handle = start(scripted_config(data_dir.clone(), vec![])).await;
+    join_ok(&mut handle).await;
+
+    let results = handle
+        .search_messages("covers", 50)
+        .expect("search_messages must delegate to the ledger without erroring");
+    assert!(
+        !results.is_empty(),
+        "a completed scripted run's task.result artifacts must contain \"covers\""
+    );
+
+    handle.shutdown().await;
+    cleanup(&data_dir);
+}

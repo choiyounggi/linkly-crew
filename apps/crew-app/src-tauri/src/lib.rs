@@ -76,6 +76,27 @@ async fn swap_harness(agent_id: String, harness: String, state: State<'_, AppSta
     core::swap_harness_core(&state, &agent_id, &harness).await
 }
 
+/// contracts-m7.md §E7 (t-bridge3): frontend already calls
+/// `invoke("resolve_gate", { taskId, decision, reason })`
+/// (`tauri-source.ts`, merged by t-ui-shell2) — name/args unchanged here.
+#[tauri::command]
+async fn resolve_gate(
+    task_id: String,
+    decision: String,
+    reason: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    core::resolve_gate_core(&state, &task_id, &decision, &reason).await
+}
+
+/// contracts-m7.md §E7 (t-bridge3): frontend already calls
+/// `invoke("search_messages", { query })` (`tauri-source.ts`, merged by
+/// t-ui-shell2) — name/args unchanged here.
+#[tauri::command]
+async fn search_messages(query: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    core::search_messages_core(&state, &query).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -88,7 +109,9 @@ pub fn run() {
             get_roster,
             set_roster,
             list_presets,
-            swap_harness
+            swap_harness,
+            resolve_gate,
+            search_messages
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
