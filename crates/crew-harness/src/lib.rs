@@ -2,6 +2,7 @@ pub mod claude;
 pub mod error;
 pub mod event;
 pub mod opencode;
+pub mod pi;
 pub mod pool;
 pub mod registry;
 
@@ -13,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 pub use error::HarnessError;
@@ -43,6 +44,10 @@ impl fmt::Display for HarnessId {
 pub struct AgentCfg {
     /// Working directory the CLI process runs in.
     pub cwd: PathBuf,
+    /// Model identifier passed to the CLI (`--model <m>`), harness-specific.
+    /// Only `PiHarness` reads this (contracts-m8.md §F3); `claude`/`opencode`
+    /// ignore it. `None` preserves each adapter's existing default behavior.
+    pub model: Option<String>,
 }
 
 /// A single user turn sent to a live session.
@@ -58,7 +63,11 @@ pub struct UserTurn {
 pub struct Session {
     pub(crate) session_id: uuid::Uuid,
     pub(crate) child: Child,
-    pub(crate) stdin: ChildStdin,
+    /// Shared so a `pi` reader task can write dialog `ui_response`s to the
+    /// same pipe `send` writes turns to, without racing it (contracts-m8.md
+    /// §F3 — Session.stdin type correction). `claude`/`opencode` just lock
+    /// around their existing single-writer path; behavior is unchanged.
+    pub(crate) stdin: Arc<Mutex<ChildStdin>>,
     /// Every parsed event, for [`Harness::take_events`] consumers.
     pub(crate) events_rx: Option<mpsc::Receiver<HarnessEvent>>,
     /// The reader task's judged outcome for the in-flight turn, one slot at

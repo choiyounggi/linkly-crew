@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStderr, ChildStdout, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 use crate::{
@@ -113,7 +113,7 @@ impl ClaudeCodeHarness {
         Ok(Session {
             session_id,
             child,
-            stdin,
+            stdin: Arc::new(Mutex::new(stdin)),
             events_rx: Some(events_rx),
             turn_rx,
             reader_task,
@@ -169,17 +169,15 @@ impl Harness for ClaudeCodeHarness {
         }))
         .expect("UserTurn always serializes to JSON");
 
-        session
-            .stdin
-            .write_all(line.as_bytes())
-            .await
-            .map_err(HarnessError::Write)?;
-        session
-            .stdin
-            .write_all(b"\n")
-            .await
-            .map_err(HarnessError::Write)?;
-        session.stdin.flush().await.map_err(HarnessError::Write)?;
+        {
+            let mut stdin = session.stdin.lock().await;
+            stdin
+                .write_all(line.as_bytes())
+                .await
+                .map_err(HarnessError::Write)?;
+            stdin.write_all(b"\n").await.map_err(HarnessError::Write)?;
+            stdin.flush().await.map_err(HarnessError::Write)?;
+        }
 
         match tokio::time::timeout(timeout, session.turn_rx.recv()).await {
             Ok(Some(outcome)) => Ok(outcome),
@@ -275,8 +273,9 @@ async fn read_events(
 }
 
 /// Drains stderr into `tracing::warn` so the pipe never fills and deadlocks
-/// the child (D10).
-async fn drain_stderr(stderr: ChildStderr) {
+/// the child (D10). `pub(crate)` so `pi.rs` reuses it verbatim (contracts-m8.md
+/// §F3 D1 — same spawn/drain convention, no per-adapter reimplementation).
+pub(crate) async fn drain_stderr(stderr: ChildStderr) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         tracing::warn!("crew-harness: claude stderr: {line}");

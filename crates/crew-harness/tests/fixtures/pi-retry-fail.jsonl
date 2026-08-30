@@ -1,0 +1,4 @@
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"auto_retry_end","success":false,"finalError":"rate limited after 3 attempts"}
+{"type":"agent_end","messages":[],"willRetry":false}

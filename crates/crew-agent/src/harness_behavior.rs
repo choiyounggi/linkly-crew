@@ -595,6 +595,7 @@ mod role_harness_behavior_tests {
             Arc::new(crew_harness::claude::ClaudeCodeHarness::with_binary("/bin/false")),
             AgentCfg {
                 cwd: std::env::current_dir().expect("current dir"),
+                model: None,
             },
             Role::Developer,
             // Deliberately does NOT mention tools or JSON — proves the

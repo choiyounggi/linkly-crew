@@ -256,6 +256,7 @@ async fn m2_roundtrip_real_claude() {
     let harness: Arc<dyn crew_harness::Harness> = Arc::new(ClaudeCodeHarness::new());
     let cfg = AgentCfg {
         cwd: isolated_cli_cwd(),
+        model: None,
     };
     let system_hint = "도구를 절대 사용하지 말고, 파일을 읽거나 쓰거나 명령을 실행하지 말 것. \
         아래 프롬프트 내용만 보고 즉시 답하라. \
