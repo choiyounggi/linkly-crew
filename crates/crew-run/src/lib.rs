@@ -8,5 +8,5 @@ mod events;
 mod observe;
 
 pub use config::{GateDecision, RunConfig, RunError, RunMode};
-pub use controller::{RunController, RunHandle};
+pub use controller::{validate_roster, RunController, RunHandle};
 pub use events::{RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};

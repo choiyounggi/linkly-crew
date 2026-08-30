@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crew_lead::accept::AcceptanceLoop;
 use crew_proto::{Role, Roster, RosterAgent};
-use crew_run::{RunConfig, RunController, RunEvent, RunHandle, RunMode};
+use crew_run::{validate_roster, GateDecision, RunConfig, RunController, RunEvent, RunHandle, RunMode, StoredMessageDto};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -207,12 +207,32 @@ fn mixed_experiment() -> Roster {
     }
 }
 
-/// The 3 built-in presets, contract order — pure, no I/O.
+/// "미니 2인팀" slots (contracts-m7.md §E7, t-bridge3 plan D4): only 3 of
+/// the 5 roles — lead/developer/qa — unlike the other 3 presets' fixed
+/// 6-slot `ROSTER_SLOTS`.
+const MINI_TEAM_SLOTS: [(&str, &str); 3] = [
+    ("agent:lead", "lead"),
+    ("agent:developer", "developer"),
+    ("agent:qa", "qa"),
+];
+
+/// "미니 2인팀": every slot `claude-code`/`"default"` (contract verbatim).
+fn mini_two_person_team() -> Roster {
+    Roster {
+        agents: MINI_TEAM_SLOTS
+            .iter()
+            .map(|(id, role)| preset_slot(id, role, "claude-code", "default"))
+            .collect(),
+    }
+}
+
+/// The 4 built-in presets, contract order — pure, no I/O.
 fn built_in_presets() -> Vec<RosterPreset> {
     vec![
         RosterPreset { name: "클로드 5인팀".to_string(), roster: claude_five_team() },
         RosterPreset { name: "절약 모드".to_string(), roster: saving_mode() },
         RosterPreset { name: "혼합 실험".to_string(), roster: mixed_experiment() },
+        RosterPreset { name: "미니 2인팀".to_string(), roster: mini_two_person_team() },
     ]
 }
 
@@ -256,11 +276,14 @@ pub fn get_roster_core(path: &Path) -> Result<serde_json::Value, String> {
     serde_json::to_value(roster).map_err(|e| e.to_string())
 }
 
-/// `set_roster` command body: persists only — an already-running run's
-/// roster changes only through `swap_harness_core` (plan D5) or the next
-/// `start_run` (contracts-m5.md §C6).
+/// `set_roster` command body: validates before persisting (contracts-m7.md
+/// §E7, t-bridge3 plan D3) — `validate_roster` rejection leaves the file
+/// untouched. An already-running run's roster changes only through
+/// `swap_harness_core` (plan D5) or the next `start_run` (contracts-m5.md
+/// §C6).
 pub fn set_roster_core(path: &Path, roster: serde_json::Value) -> Result<(), String> {
     let roster: Roster = serde_json::from_value(roster).map_err(|e| e.to_string())?;
+    validate_roster(&roster)?;
     save_roster(path, &roster)
 }
 
@@ -282,6 +305,59 @@ pub async fn swap_harness_core(state: &AppState, agent_id: &str, harness: &str) 
     let guard = state.current.lock().await;
     match guard.as_ref() {
         Some(active) => active.handle.swap_harness(agent_id, harness).await.map_err(|e| e.to_string()),
+        None => Err("no_active_run".to_string()),
+    }
+}
+
+/// `resolve_gate` command body (contracts-m7.md §E7, t-bridge3 plan D2):
+/// `decision` must parse as `"approve"`/`"reject"` — anything else is a
+/// parse `Err` string, checked before touching `state` so an unparseable
+/// decision never depends on whether a run is active. `Err("no_active_run")`
+/// when nothing is running (existing convention, see `swap_harness_core`
+/// above); otherwise delegates to `RunHandle::resolve_gate`, converting its
+/// `RunError` to a string.
+pub async fn resolve_gate_core(
+    state: &AppState,
+    task_id: &str,
+    decision: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let decision = match decision {
+        "approve" => GateDecision::Approve,
+        "reject" => GateDecision::Reject,
+        other => return Err(format!("unknown decision \"{other}\" (expected \"approve\" or \"reject\")")),
+    };
+    let guard = state.current.lock().await;
+    match guard.as_ref() {
+        Some(active) => active.handle.resolve_gate(task_id, decision, reason).await.map_err(|e| e.to_string()),
+        None => Err("no_active_run".to_string()),
+    }
+}
+
+/// `search_messages` command body (contracts-m7.md §E7, t-bridge3 plan D2):
+/// limit fixed at 50 (not caller-controlled), `Err("no_active_run")` when
+/// nothing is running, results serialized in the same `{seq, envelope}`
+/// shape `snapshot`'s `messages` field already uses (`StoredMessageDto`).
+/// Runs on the async state lock (`tokio::sync::Mutex`) like `run_snapshot_core`/
+/// `swap_harness_core` above — deviates from the contract sketch's bare `fn`
+/// (Tauri's JS `invoke` returns a `Promise` either way, so callers are
+/// unaffected; see decisions.md).
+const SEARCH_MESSAGES_LIMIT: usize = 50;
+
+pub async fn search_messages_core(state: &AppState, query: &str) -> Result<serde_json::Value, String> {
+    let guard = state.current.lock().await;
+    match guard.as_ref() {
+        Some(active) => {
+            let results = active
+                .handle
+                .search_messages(query, SEARCH_MESSAGES_LIMIT)
+                .map_err(|e| e.to_string())?;
+            let dtos: Vec<StoredMessageDto> = results
+                .into_iter()
+                .map(|m| StoredMessageDto { seq: m.seq, envelope: m.envelope })
+                .collect();
+            serde_json::to_value(dtos).map_err(|e| e.to_string())
+        }
         None => Err("no_active_run".to_string()),
     }
 }
@@ -436,12 +512,15 @@ mod tests {
     }
 
     #[test]
-    fn list_presets_returns_the_three_built_in_presets_with_fixed_slots() {
+    fn list_presets_returns_the_four_built_in_presets_with_fixed_slots() {
         let presets = built_in_presets();
         let names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["클로드 5인팀", "절약 모드", "혼합 실험"]);
-        for preset in &presets {
-            assert_eq!(preset.roster.agents.len(), 6, "{} must have 6 fixed slots", preset.name);
+        assert_eq!(names, vec!["클로드 5인팀", "절약 모드", "혼합 실험", "미니 2인팀"]);
+        // contracts-m7.md §E7: preset len==6 fixed assertion updated to
+        // per-preset expected lengths (not a weakening — contract verbatim).
+        let expected_lens = [6, 6, 6, 3];
+        for (preset, expected) in presets.iter().zip(expected_lens) {
+            assert_eq!(preset.roster.agents.len(), expected, "{} must have {expected} fixed slots", preset.name);
         }
 
         let claude_team = &presets[0].roster;
@@ -465,6 +544,14 @@ mod tests {
         assert!(
             mixed.agents.iter().filter(|a| a.id != "agent:publisher").all(|a| a.harness == "claude-code"),
             "혼합 실험 swaps only publisher"
+        );
+
+        let mini = &presets[3].roster;
+        let mini_ids: Vec<&str> = mini.agents.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(mini_ids, vec!["agent:lead", "agent:developer", "agent:qa"]);
+        assert!(
+            mini.agents.iter().all(|a| a.harness == "claude-code" && a.model == "default"),
+            "미니 2인팀 must be all claude-code/default"
         );
     }
 
@@ -501,16 +588,71 @@ mod tests {
         assert_eq!(raw, "not valid json", "the original file must be preserved, not overwritten");
     }
 
+    /// Boundary case, updated for contracts-m7.md §E7/t-bridge3 plan D3:
+    /// `set_roster_core` now runs `validate_roster` before saving, so an
+    /// empty-agents roster (no "lead" slot) is rejected rather than
+    /// round-tripping — this is the intentional behavior `validate_roster`
+    /// (contracts-m7.md §E4, already merged) always specified; `set_roster`
+    /// simply never enforced it until this task. Not a weakening: the
+    /// boundary (empty collection) is still exercised, now proving it is
+    /// guarded.
     #[test]
-    fn empty_agents_roster_round_trips_as_boundary() {
+    fn empty_agents_roster_is_rejected_by_validate_roster_and_leaves_file_unchanged() {
         let root = TestDataRoot::new("roster-empty");
         let path = root.0.join("roster.json");
+        assert!(!path.exists());
         let empty = Roster { agents: vec![] };
 
-        set_roster_core(&path, serde_json::to_value(&empty).unwrap()).expect("saving an empty roster must succeed");
-        let fetched = get_roster_core(&path).expect("get_roster should succeed for an empty roster");
-        let fetched: Roster = serde_json::from_value(fetched).unwrap();
-        assert_eq!(fetched, empty);
+        let err = set_roster_core(&path, serde_json::to_value(&empty).unwrap())
+            .expect_err("an empty roster has no \"lead\" slot and must be rejected");
+        assert!(!err.is_empty());
+        assert!(!path.exists(), "a rejected roster must never create/overwrite the file");
+    }
+
+    /// Error case (contracts-m7.md §E7, t-bridge3 plan D5 ②): a roster with
+    /// a duplicate non-lead role is rejected by `validate_roster` before
+    /// any write, and the previously-saved valid roster is left byte-for-
+    /// byte unchanged.
+    #[test]
+    fn set_roster_with_duplicate_role_errors_and_leaves_file_unchanged() {
+        let root = TestDataRoot::new("roster-dup-role");
+        let path = root.0.join("roster.json");
+        let valid = claude_five_team();
+        set_roster_core(&path, serde_json::to_value(&valid).unwrap()).expect("a valid roster must save");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let invalid = Roster {
+            agents: vec![
+                RosterAgent {
+                    id: "agent:lead".to_string(),
+                    role: "lead".to_string(),
+                    harness: "claude-code".to_string(),
+                    model: "default".to_string(),
+                    instructions: String::new(),
+                },
+                RosterAgent {
+                    id: "agent:developer".to_string(),
+                    role: "developer".to_string(),
+                    harness: "claude-code".to_string(),
+                    model: "default".to_string(),
+                    instructions: String::new(),
+                },
+                RosterAgent {
+                    id: "agent:developer-2".to_string(),
+                    role: "developer".to_string(),
+                    harness: "claude-code".to_string(),
+                    model: "default".to_string(),
+                    instructions: String::new(),
+                },
+            ],
+        };
+
+        let err = set_roster_core(&path, serde_json::to_value(&invalid).unwrap())
+            .expect_err("a duplicate non-lead role must be rejected");
+        assert!(err.contains("duplicate role"), "error must name the violation, got {err:?}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, before, "a rejected roster must leave the previously-saved file unchanged");
     }
 
     #[tokio::test]
@@ -519,6 +661,41 @@ mod tests {
         let err = swap_harness_core(&state, "agent:designer", "opencode")
             .await
             .expect_err("swap with no active run must error, not panic");
+        assert_eq!(err, "no_active_run");
+    }
+
+    /// Boundary case (contracts-m7.md §E7, t-bridge3 plan D5 ④): an
+    /// unparseable `decision` errors even with no active run — the parse
+    /// check runs before the run-state lookup.
+    #[tokio::test]
+    async fn resolve_gate_with_an_unparseable_decision_errors() {
+        let state = AppState::default();
+        let err = resolve_gate_core(&state, "t-dev", "banana", "reason")
+            .await
+            .expect_err("an unrecognized decision string must error, not panic");
+        assert!(err.contains("unknown decision"), "error must name the violation, got {err:?}");
+    }
+
+    /// Error case (contracts-m7.md §E7, t-bridge3 plan D5 ④): a valid
+    /// decision with no active run errors via the existing "no_active_run"
+    /// convention (`swap_harness_core` above), not a panic.
+    #[tokio::test]
+    async fn resolve_gate_without_an_active_run_errors() {
+        let state = AppState::default();
+        let err = resolve_gate_core(&state, "t-dev", "approve", "looks good")
+            .await
+            .expect_err("resolve_gate with no active run must error, not panic");
+        assert_eq!(err, "no_active_run");
+    }
+
+    /// Error case (contracts-m7.md §E7, t-bridge3 plan D5 ③): no active run
+    /// errors via the existing "no_active_run" convention, not a panic.
+    #[tokio::test]
+    async fn search_messages_without_an_active_run_errors() {
+        let state = AppState::default();
+        let err = search_messages_core(&state, "anything")
+            .await
+            .expect_err("search_messages with no active run must error, not panic");
         assert_eq!(err, "no_active_run");
     }
 

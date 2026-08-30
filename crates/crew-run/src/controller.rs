@@ -19,7 +19,7 @@ use crew_lead::compress::summarize_sprint;
 use crew_lead::dispatch::{LeadBehavior, TaskState};
 use crew_lead::plan::{LeadPlanner, PlanError, SprintSlicer};
 use crew_lead::plan_llm::LlmLeadPlanner;
-use crew_ledger::EventLedger;
+use crew_ledger::{EventLedger, StoredMessage};
 use crew_proto::{handoff_body, Envelope, HandoffPack, MessageKind, Role, Roster, RosterAgent, SpecDoc, TaskDag};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -1030,6 +1030,14 @@ impl RunHandle {
             last_seq: snap.last_seq,
             ts: now_ts(),
         }
+    }
+
+    /// Full-text search over this run's ledger (contracts-m7.md §E7
+    /// verbatim, t-bridge3 plan D1) — delegates to `EventLedger::
+    /// search_messages`; `LedgerError` converts via `RunError::Ledger`
+    /// (`#[from]`).
+    pub fn search_messages(&self, query: &str, limit: usize) -> Result<Vec<StoredMessage>, RunError> {
+        Ok(self.ledger.search_messages(query, limit)?)
     }
 
     /// Swaps the harness assigned to `agent_id`'s roster slot — contract
