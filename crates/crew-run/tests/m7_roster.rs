@@ -128,11 +128,16 @@ async fn three_person_team_run_completes_with_two_workers_and_a_two_task_dep_cha
         .collect();
     assert_eq!(
         registered,
-        ["agent:lead", "agent:developer", "agent:qa"]
+        ["agent:lead", "agent:developer", "agent:qa", "agent:human"]
             .into_iter()
             .map(String::from)
             .collect(),
-        "exactly the lead plus the two crew workers must register on the bus (no pm/designer/publisher): {registered:?}"
+        // contracts-m7.md §E5 (t-gate-run): the controller now also connects
+        // a run-resident `agent:human` proxy at start, so it registers on
+        // the bus alongside the lead/crew — this assertion's set is updated
+        // to match that new (not weakened) behavior, same as it would be
+        // for any RejectedUnknownRecipient assertion.
+        "exactly the lead, the two crew workers, and the agent:human proxy must register on the bus (no pm/designer/publisher): {registered:?}"
     );
 
     let changed_task_ids: std::collections::HashSet<String> = events
