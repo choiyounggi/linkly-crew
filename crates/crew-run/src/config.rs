@@ -48,6 +48,15 @@ pub enum RunMode {
     RealCli,
 }
 
+/// A human reviewer's decision on an `Escalated` task (contracts-m7.md §E5),
+/// carried through `RunHandle::resolve_gate` into a `human.response`
+/// envelope (§E2 verbatim: wire values `"approve"`/`"reject"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateDecision {
+    Approve,
+    Reject,
+}
+
 /// Errors from starting or running a `crew-run` (plan D7).
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -79,4 +88,10 @@ pub enum RunError {
     /// creation, so a rejected roster leaves no partial run state.
     #[error("invalid roster: {0}")]
     RosterInvalid(String),
+    /// `RunHandle::resolve_gate` (contracts-m7.md §E5) could not reach the
+    /// run-resident `agent:human` proxy — the run has already ended (the
+    /// proxy is torn down alongside it, plan D1) or the bus rejected the
+    /// `human.response` publish.
+    #[error("gate unavailable: {0}")]
+    GateUnavailable(String),
 }

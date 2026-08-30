@@ -25,7 +25,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::config::{RunConfig, RunError, RunMode};
+use crate::config::{GateDecision, RunConfig, RunError, RunMode};
 use crate::events::{now_ts, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};
 use crate::observe::{ObservingLead, TaskStateChange};
 
@@ -368,6 +368,96 @@ async fn drain_subscription_backlog(drain_tx: &mpsc::UnboundedSender<oneshot::Se
     }
 }
 
+/// Capacity for the `RunHandle::resolve_gate` -> human proxy command
+/// channel (plan D2) — gate decisions are rare, human-paced events, not a
+/// throughput path.
+const GATE_CHANNEL_CAPACITY: usize = 8;
+
+/// One `RunHandle::resolve_gate` request routed to the human proxy task
+/// (contracts-m7.md §E5, plan D2). `reply` carries the bus-publish outcome
+/// back so `resolve_gate` can distinguish "published" from a bus-level
+/// failure; a dropped `reply` (proxy aborted mid-flight) is treated by
+/// `resolve_gate` the same as a closed `gate_tx`.
+struct GateCmd {
+    task_id: String,
+    decision: GateDecision,
+    reason: String,
+    reply: oneshot::Sender<Result<(), String>>,
+}
+
+/// Run-resident `agent:human` proxy (contracts-m7.md §E5, plan D1/D3): its
+/// own `recv()` is drained and discarded — `agent:human` is never itself a
+/// message *source* except through `resolve_gate` — which is enough for the
+/// bus to treat `agent:human` as a live recipient, turning what used to be
+/// an `unknown_recipient` rejection for `human.gate` into normal delivery.
+/// `GateCmd`s arriving on `gate_rx` are published as `human.response`
+/// envelopes (§E2 verbatim) over this same connection.
+///
+/// `shutdown_rx` (rather than an `AbortHandle`) is the *natural*-end signal
+/// (`RunController::start`'s finisher, plan D1): the bus never sends a
+/// requires_ack=false envelope's own publish `Receipt` back to its sender on
+/// first attempt (only a later retry's dedup path does, contracts-m7.md
+/// §E2's fixed `requires_ack: false` runs straight into that), so a
+/// resolve_gate call whose decision itself completes the run can still be
+/// mid-flight in `conn.send` when the lead task finishes. `biased` ensures a
+/// pending `GateCmd` is always drained ahead of a same-tick shutdown signal,
+/// and — because a `select!` arm always runs its body to completion once
+/// chosen — an *in-flight* `conn.send` is never interrupted by it either.
+/// `RunHandle::shutdown` (an already-running, not-yet-finished run) instead
+/// aborts this task outright via its `AbortHandle`, matching every other
+/// resource's forceful teardown there.
+async fn human_proxy_loop(
+    mut conn: BusConn,
+    mut gate_rx: mpsc::Receiver<GateCmd>,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            cmd = gate_rx.recv() => {
+                let Some(cmd) = cmd else { break };
+                let decision_str = match cmd.decision {
+                    GateDecision::Approve => "approve",
+                    GateDecision::Reject => "reject",
+                };
+                let envelope = Envelope::new(
+                    // Literal duplicate of crew-lead::dispatch's private
+                    // `SPRINT_LABEL`/`DEADLINE_MS` (mirrors `swap_harness`'s
+                    // same tradeoff above — that crate is out of scope here).
+                    "sp-m3".to_string(),
+                    format!("th-gate-{}", cmd.task_id),
+                    "agent:human".to_string(),
+                    vec!["agent:lead".to_string()],
+                    MessageKind::HumanResponse,
+                    None,
+                    format!("gate-{}", uuid::Uuid::new_v4()),
+                    serde_json::json!({
+                        "task_id": cmd.task_id,
+                        "decision": decision_str,
+                        "reason": cmd.reason,
+                    }),
+                    Vec::new(),
+                    false,
+                    900_000,
+                );
+                let result = conn.send(envelope).await.map_err(|e| e.to_string());
+                let _ = cmd.reply.send(result);
+            }
+            recv = conn.recv() => {
+                if recv.is_none() {
+                    break;
+                }
+                // Drain-only: `human.gate`/other inbound envelopes are
+                // observed by the controller's own `subscription_loop` off
+                // the bus's broadcast, not through this connection.
+            }
+            _ = &mut shutdown_rx => {
+                break;
+            }
+        }
+    }
+}
+
 pub struct RunController;
 
 impl RunController {
@@ -487,6 +577,16 @@ impl RunController {
         let (ts_tx, ts_rx) = mpsc::unbounded_channel::<TaskStateChange>();
         let relay_task = tokio::spawn(relay_loop(ts_rx, run_tx.clone(), snapshot.clone()));
         let relay_abort = relay_task.abort_handle();
+
+        // Run-resident `agent:human` proxy (contracts-m7.md §E5, plan D1):
+        // connected once here, after `bus_events_rx` subscribes (so its own
+        // `Registered` bus lifecycle event isn't missed) and before any
+        // sprint's workers/lead spawn.
+        let human_conn = BusConn::connect(&url, &token, "agent:human").await?;
+        let (gate_tx, gate_rx) = mpsc::channel::<GateCmd>(GATE_CHANNEL_CAPACITY);
+        let (human_shutdown_tx, human_shutdown_rx) = oneshot::channel::<()>();
+        let human_task = tokio::spawn(human_proxy_loop(human_conn, gate_rx, human_shutdown_rx));
+        let human_abort = human_task.abort_handle();
 
         // One cumulative terminal-state map for the whole run (plan
         // D1/C3a): every sprint's `ObservingLead` writes its own task ids
@@ -646,6 +746,24 @@ impl RunController {
             drop(ts_tx);
             let _ = relay_task.await;
 
+            // Run has ended (plan D1: "런 종료(join/shutdown) 경로에서
+            // abort") — signal the human proxy to stop *gracefully* (never
+            // interrupting an in-flight `resolve_gate` publish, see
+            // `human_proxy_loop`'s doc comment) and wait for it to actually
+            // stop before `join()` can return, so a `resolve_gate` call
+            // arriving right after `join()` deterministically observes a
+            // closed `gate_tx` receiver rather than racing a live proxy.
+            let _ = human_shutdown_tx.send(());
+            let _ = human_task.await;
+            // The human proxy's own disconnect is detected by the bus
+            // server on a separate task (not synchronized with the
+            // `human_task.await` above) — one more drain, mirroring every
+            // sprint boundary's own drain after aborting that sprint's
+            // workers, gives `subscription_loop` a chance to observe and
+            // broadcast its `Unregistered` before `RunFinished` so the
+            // latter stays the true last event.
+            drain_subscription_backlog(&drain_tx).await;
+
             let _ = finisher_run_tx.send(RunEvent::RunFinished {
                 outcome,
                 ts: now_ts(),
@@ -667,6 +785,8 @@ impl RunController {
             joined_outcome: None,
             roster: roster_for_handle,
             summaries: summaries_for_handle,
+            human_abort,
+            gate_tx,
         })
     }
 }
@@ -834,6 +954,14 @@ pub struct RunHandle {
     /// summary text to (t-swap plan D7) — `swap_harness` step 3 reads a
     /// snapshot to assemble the swapped-in worker's injected context.
     summaries: Arc<Mutex<Vec<String>>>,
+    /// Aborts the human proxy task (contracts-m7.md §E5) — the finisher
+    /// already aborts+awaits it on natural run end (plan D1); this is
+    /// `shutdown()`'s defensive counterpart for an in-progress run
+    /// (aborting an already-finished task is a no-op).
+    human_abort: AbortHandle,
+    /// Sends `resolve_gate` requests to the human proxy task (plan D2) — a
+    /// closed receiver (proxy ended) surfaces as `RunError::GateUnavailable`.
+    gate_tx: mpsc::Sender<GateCmd>,
 }
 
 /// One control-channel swap attempt against a specific worker's sender —
@@ -1040,6 +1168,32 @@ impl RunHandle {
         Ok(())
     }
 
+    /// Publishes a `human.response` envelope for `task_id` (contracts-m7.md
+    /// §E5, §E2 verbatim) via the run-resident `agent:human` proxy.
+    /// `Err(RunError::GateUnavailable)` once the run has ended (the proxy's
+    /// receiver is closed) or the bus itself rejects the publish. Never
+    /// errors on an unknown `task_id` — the envelope still publishes; it's
+    /// `LeadBehavior::handle_human_response` (contract §E3) that silently
+    /// ignores anything not currently `Escalated`.
+    pub async fn resolve_gate(&self, task_id: &str, decision: GateDecision, reason: &str) -> Result<(), RunError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = GateCmd {
+            task_id: task_id.to_string(),
+            decision,
+            reason: reason.to_string(),
+            reply: reply_tx,
+        };
+        self.gate_tx
+            .send(cmd)
+            .await
+            .map_err(|_| RunError::GateUnavailable("run ended".to_string()))?;
+        match reply_rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(RunError::GateUnavailable(reason)),
+            Err(_) => Err(RunError::GateUnavailable("run ended".to_string())),
+        }
+    }
+
     /// Waits for the Lead runner to finish (contract §C3). Idempotent: a
     /// second call returns the same cached outcome instead of panicking on
     /// an already-consumed join handle.
@@ -1079,6 +1233,7 @@ impl RunHandle {
         }
         self.sub_task.abort();
         self.relay_abort.abort();
+        self.human_abort.abort();
         self.bus.shutdown().await;
     }
 }
