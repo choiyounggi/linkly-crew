@@ -42,6 +42,17 @@
 
 **남은 미결 2건**: 프로젝트 이름(`agent-crew`는 가칭), Tauri 내부 프론트엔드(React/Svelte/순수 TS)
 
+**M7 확정 사항** (2026-08-30, Phase 0 사용자 결정 — `.orchestration/contracts-m7.md`):
+- 범위: 가변 로스터 인원 + §7 잔여 뷰 3종(승인함 실개입·아티팩트/디프+REQ 매트릭스·FTS5
+  전역 검색).
+- 수동 검증: GUI 1클릭 + 가변 로스터 real-CLI 스팟체크(함정 19).
+- 승인함은 실개입: 반려=즉시 Blocked 캐스케이드, 승인=재할당.
+- FTS5: 기존 테이블 무변경, 별도 가상 테이블을 동일 트랜잭션에서 갱신.
+- 스코프 아웃(E0): 역할당 다중 에이전트, 커스텀 역할(Role enum 5종 밖), 적응형 세마포어,
+  opencode 실 어댑터, 아티팩트 백엔드 버전 저장(디프는 클라이언트 계산), 멀티 런 검색
+  (검색은 현재 런 원장만), 스폰 세션 훅 차단, Cmd/Browser DoD 실행. `--ignored` real-CLI
+  테스트는 전 워커 금지(코디네이터 수동 전용).
+
 ---
 
 ## 3. 검증 상태 (중요)
@@ -146,6 +157,30 @@
 - M6 계약 정본: `archive-20260829-m6a/contracts-m6.md`(예정) — 현재는
   `.orchestration/contracts-m6.md`. D1(제어 채널) D2(스왑 3단계) D7(문서).
 
+**검증됨 — M7** (2026-08-30, 실측):
+- 머지 완료 12/12 태스크: t-dagvar(E1 plan_dag_for), t-gate-lead(E2/E3 human.response+lead
+  개입), t-fts(E6 FTS5), t-ui-shell2(E8 셸 확장), t-rosterrun(E4 crew_agents/
+  validate_roster/가변 스폰), t-inbox(E9 승인함), t-artifacts(E10 아티팩트/디프+REQ
+  매트릭스), t-search(E11 전역 검색), t-roster-ui(E12 가변 슬롯), t-gate-run(E5 human
+  프록시/resolve_gate), t-bridge3(E7 Tauri 커맨드 2종/미니 프리셋/set_roster 검증),
+  t-docs2(E14 본 태스크).
+- 결정론: `cargo test --workspace` 통합 브랜치 green(전 크레이트, 실패 0); vitest
+  (apps/crew-app) 22파일 164 테스트 green.
+- real-CLI 스팟체크(함정 19 근거, 코디네이터 수동): `m7_roster::
+  real_cli_three_person_team_completes_one_sprint` — 3인팀(lead+developer+qa) `RealCli`
+  1스프린트 완주, **78.87s**, 통과(2026-08-30). 상세: `docs/SPIKE-M7.md`.
+- 간헐 플레이크 관측: `cargo test --workspace`가 콜드 빌드 직후 첫 실행에서만 2회 실패
+  목격 — 1차 `m7_roster::three_person_team_run_completes_...`(4회 런 중 1회), 2차 미상
+  3-테스트 바이너리 1건(2 passed; 1 failed; 0.10s). 직후 재실행은 각각 3+·6연속 clean,
+  격리 실행 8/8 clean, 실패 메시지 미포착 — 원인 미상(병렬 부하/콜드 스타트 타이밍
+  의심). §5 함정 20 참고.
+- 오케스트레이션 운영 관측: m7a 재진입 시 4개 태스크(t-artifacts/t-inbox/t-rosterrun/
+  t-search)가 `impl_done` 보고 후 커밋 전 워커 사망 — 구현이 워크트리 dirty로만
+  존재했고 코디네이터가 스냅샷 커밋으로 회수. §5 함정 21 참고.
+- GUI에서 scripted=false 실 런 1클릭: 미실행(사람 몫 — §4에 유지).
+- M7 계약 정본: `.orchestration/contracts-m7.md` (teardown 시
+  `archive-20260830-m7a/contracts-m7.md`로 아카이브 예정 — M6 표기 관례와 동일).
+
 **미검증**:
 - GUI에서 scripted=false 클릭 실행(네이티브 창 — 사람 1클릭 필요; 실 CLI 경로 자체는 위
   E2E 2건으로 증명됨) — Gate 2에서 확인 예정.
@@ -168,29 +203,30 @@ task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ---
 
-## 4. 다음 스텝 — M6 완료 후 잔여
+## 4. 다음 스텝 — M7 완료 후 잔여
 
-M1~M6 완료·실측 검증됨(§3). 다음 후보:
+M1~M7 완료·실측 검증됨(§3). 다음 후보:
 
-**M6 완료 후 잔여 (작은 것부터)**:
+**M7 완료 후 잔여 (작은 것부터)**:
 1. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가;
    현재 코디네이터 수동 진행 중).
-2. 가변 로스터 인원(플래너가 5역할 DAG 고정이라 프리셋은 배치만 다름 — 계약 C0),
-   적응형 세마포어(§13.1), opencode 실 어댑터 — M6 D0로 스코프 아웃, 여전히 미착수.
-3. §7 잔여 뷰: 승인함(`human.gate` 대기 목록), 아티팩트/디프(산출물 미리보기 + 커밋 디프
-   + REQ-id 커버리지 매트릭스), 전역 검색(SQLite FTS5). DAG 뷰·타임라인은 M6에서 구현됨.
-4. 스폰 세션 훅 완전 차단(함정 8, 아직 미해결).
-5. Cmd/Browser DoD 실제 실행 (M3부터 skip 기록만).
+2. 적응형 세마포어(§13.1), opencode 실 어댑터 — M7 E0로 스코프 아웃, 여전히 미착수.
+3. 스폰 세션 훅 완전 차단(함정 8, 아직 미해결).
+4. Cmd/Browser DoD 실제 실행 (M3부터 skip 기록만).
 
 **3단계(DESIGN §11 후순위)**: ed25519 서명, 원격 릴레이, 사람 참여, 모바일.
 
 **재사용 계약**: M3(archive-20260827-m3a/contracts-m3.md) + M4(archive-20260828-m4a/
-contracts-m4.md) + M5(archive-20260829-m5a/contracts-m5.md) + **M6(archive-20260829-m6a/
-contracts-m6.md 예정, 현재 .orchestration/contracts-m6.md)** — RunEvent 3종, TaskStateDto
+contracts-m4.md) + M5(archive-20260829-m5a/contracts-m5.md) + M6(archive-20260829-m6a/
+contracts-m6.md 예정, 현재 .orchestration/contracts-m6.md) + **M7(archive-20260830-m7a/
+contracts-m7.md 예정, 현재 .orchestration/contracts-m7.md)** — RunEvent 3종, TaskStateDto
 "blocked", HandoffPack/Roster, HarnessRegistry/HarnessPool, LlmLeadPlanner,
 `RunHandle::swap_harness`(즉시 실효 + 경계 폴백), `AgentControl`/`on_control`,
-`features/dag`/`features/timeline`, Tauri 커맨드 5종, 로스터 패널/동적 배지/이니셜 맵.
-재발명 금지.
+`features/dag`/`features/timeline`, Tauri 커맨드 5종, 로스터 패널/동적 배지/이니셜 맵,
+`plan_dag_for`(가변 역할 DAG), `agent:human`/`GateDecision`/`RunHandle::resolve_gate`,
+crew-ledger FTS5 `search_messages`/`RunHandle::search_messages`, `features/inbox`/
+`features/artifacts`/`features/search`, 가변 로스터 슬롯 UI(추가/삭제), Tauri
+`resolve_gate`/`search_messages` 커맨드 + 미니 2인팀 프리셋. 재발명 금지.
 
 ---
 
@@ -248,3 +284,14 @@ contracts-m6.md 예정, 현재 .orchestration/contracts-m6.md)** — RunEvent 3�
     수명 전체 보유 시 리밋 초과 워커 영구 대기) 둘 다 결정론(`Scripted`) 스위트는
     통과했지만 실 CLI 2스프린트 런에서만 드러났다 — 새 `RealCli` 경로를 만들면 반드시
     실 CLI 스팟체크 1회를 코디네이터 수동으로 돌릴 것.
+20. **`cargo test --workspace`가 콜드 빌드 직후 첫 실행에서만 간헐 플레이크를 낸다**
+    (M7 실측, 코디네이터 스팟체크): 2회 실패 목격 — 1차 `m7_roster::
+    three_person_team_run_completes_...`(4회 런 중 1회), 2차 미상 3-테스트 바이너리
+    1건(2 passed; 1 failed; 0.10s). 직후 재실행은 각각 3+·6연속 clean, 격리 실행
+    8/8 clean, 실패 메시지도 미포착 — 원인 미상(병렬 부하/콜드 스타트 타이밍 의심).
+    재현 불가·근본원인 미확정이므로 결론 내리지 말 것 — 콜드 빌드 직후 실패를 보면
+    바로 결함으로 단정하지 말고 한 번 더 돌려 재현 여부부터 확인할 것.
+21. **워커가 `impl_done` 보고 후 커밋 전에 죽으면 구현이 워크트리 dirty로만 존재한다**
+    (M7 오케스트레이션 운영 실측, m7a 재진입): 4개 태스크(t-artifacts/t-inbox/
+    t-rosterrun/t-search)가 이 상태로 발견됐고, 코디네이터가 스냅샷 커밋으로 회수했다
+    — merge-prep 프롬프트(§4, 커밋 지시) 전달 전 워커 생존을 확인할 것.
