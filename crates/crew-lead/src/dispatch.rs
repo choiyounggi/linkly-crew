@@ -5,6 +5,8 @@
 //! rest of the DAG keeps moving (§4.4).
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use crew_agent::RoleBehavior;
@@ -12,6 +14,7 @@ use crew_proto::{Envelope, MessageKind, Role, TaskDag, TaskSpec};
 use serde_json::{json, Value};
 
 use crate::accept::{AcceptDecision, AcceptanceLoop};
+use crate::cmd_exec::{self, CmdOutcome, CmdPolicy};
 use crate::dod_exec::{self, DodVerdict};
 
 const DEADLINE_MS: u64 = 900_000;
@@ -81,6 +84,13 @@ pub struct LeadBehavior {
     /// afterward so later ticks can compare `now_ms - t0` against the
     /// timeout. Only populated when `escalation_timeout_ms > 0`.
     pending_escalations: HashMap<String, Option<u64>>,
+    /// 역할 → Cmd 실행 cwd 해석기. `None`(기본)이면 Cmd DoD를 실행하지 않고
+    /// M3 동작(모두 `skipped`) 그대로다 — 결정론 테스트와 기존 호출부가
+    /// 이 기본값에 의존한다 (contracts-m9.md §G3c).
+    /// crew-lead는 crew-run에 의존할 수 없으므로 `role_cli_cwd`를 복제하는 대신
+    /// crew-run이 클로저로 주입한다.
+    cmd_exec_cwd_for_role: Option<Arc<dyn Fn(Role) -> PathBuf + Send + Sync>>,
+    cmd_policy: CmdPolicy,
 }
 
 impl LeadBehavior {
@@ -111,6 +121,8 @@ impl LeadBehavior {
             escalation_timeout_ms: 0,
             prior_states: HashMap::new(),
             pending_escalations: HashMap::new(),
+            cmd_exec_cwd_for_role: None,
+            cmd_policy: CmdPolicy::default_allowlist(),
         }
     }
 
@@ -126,6 +138,21 @@ impl LeadBehavior {
     /// sprint's own DAG.
     pub fn with_prior_states(mut self, states: HashMap<String, TaskState>) -> Self {
         self.prior_states = states;
+        self
+    }
+
+    /// Wires the Cmd DoD executor in (plan D7/D8): `cwd_for_role` resolves a
+    /// task's role to its execution cwd. Default (never calling this) is
+    /// `None`, which keeps Cmd DoD unexecuted — M3 behavior (contract
+    /// §G3c/D6).
+    pub fn with_cmd_exec(mut self, cwd_for_role: Arc<dyn Fn(Role) -> PathBuf + Send + Sync>) -> Self {
+        self.cmd_exec_cwd_for_role = Some(cwd_for_role);
+        self
+    }
+
+    /// Overrides the default `CmdPolicy::default_allowlist()` (plan D7).
+    pub fn with_cmd_policy(mut self, policy: CmdPolicy) -> Self {
+        self.cmd_policy = policy;
         self
     }
 
@@ -277,22 +304,33 @@ impl LeadBehavior {
         }
     }
 
-    /// `task.result` handling (plan D6): unmatched/unknown/non-`Assigned`
-    /// tasks are ignored (defensive — a Lead is a pure state machine with
-    /// no requester to reply to when the corr doesn't resolve).
-    fn handle_task_result(&mut self, env: Envelope) -> Vec<Envelope> {
-        let Some(task_id) = env.corr.strip_prefix("corr-") else {
-            return vec![];
-        };
+    /// Resolves `env`'s target task for `task.result` handling (plan D2):
+    /// unmatched/unknown/non-`Assigned` tasks are ignored (defensive — a
+    /// Lead is a pure state machine with no requester to reply to when the
+    /// corr doesn't resolve). Extracted out of `handle_task_result` so
+    /// `on_envelope` can run the (async) Cmd executor against the resolved
+    /// task before calling into the (sync) `handle_task_result`.
+    fn resolve_task_result(&self, env: &Envelope) -> Option<(String, TaskSpec)> {
+        let task_id = env.corr.strip_prefix("corr-")?;
         let task_id = task_id.to_string();
         if self.states.get(&task_id) != Some(&TaskState::Assigned) {
-            return vec![];
+            return None;
         }
-        let Some(task) = self.task_by_id(&task_id).cloned() else {
-            return vec![];
-        };
+        let task = self.task_by_id(&task_id).cloned()?;
+        Some((task_id, task))
+    }
 
-        let verdict = dod_exec::judge(&task, &env.body);
+    /// `task.result` handling (plan D6/D3): `task_id`/`task` are already
+    /// resolved by `resolve_task_result`, and `cmd_outcomes` is whatever the
+    /// caller's Cmd executor produced (empty when wiring is off, plan D6).
+    fn handle_task_result(
+        &mut self,
+        env: Envelope,
+        task_id: String,
+        task: TaskSpec,
+        cmd_outcomes: &[CmdOutcome],
+    ) -> Vec<Envelope> {
+        let verdict = dod_exec::judge(&task, &env.body, cmd_outcomes);
         let loop_ = self
             .loops
             .entry(task_id.clone())
@@ -464,7 +502,19 @@ impl RoleBehavior for LeadBehavior {
 
     async fn on_envelope(&mut self, env: Envelope) -> Vec<Envelope> {
         match env.kind {
-            MessageKind::TaskResult => self.handle_task_result(env),
+            MessageKind::TaskResult => match self.resolve_task_result(&env) {
+                Some((task_id, task)) => {
+                    let outcomes = match &self.cmd_exec_cwd_for_role {
+                        Some(resolve) => {
+                            let cwd = resolve(task.role);
+                            cmd_exec::execute_cmd_checks(&task, &cwd, &self.cmd_policy).await
+                        }
+                        None => Vec::new(),
+                    };
+                    self.handle_task_result(env, task_id, task, &outcomes)
+                }
+                None => vec![],
+            },
             MessageKind::Blocked => self.handle_blocked(env),
             MessageKind::HumanResponse => self.handle_human_response(env),
             _ => vec![],
@@ -948,5 +998,184 @@ mod tests {
         let replies2 = lead.on_envelope(missing_task_id).await;
         assert!(replies2.is_empty());
         assert_eq!(lead.state_of("t-pm"), Some(TaskState::Escalated));
+    }
+
+    // --- Cmd DoD wiring (plan D1/D6-D8: with_cmd_exec / with_cmd_policy) ---
+
+    fn cmd_task(id: &str, role: Role, dod: Vec<crew_proto::DodCheck>) -> TaskSpec {
+        TaskSpec {
+            id: id.to_string(),
+            role,
+            title: "title".to_string(),
+            brief: "brief".to_string(),
+            dod,
+            deps: vec![],
+            artifacts_expected: vec![],
+        }
+    }
+
+    fn lead_for_tasks(
+        tasks: Vec<TaskSpec>,
+        roles: Vec<(Role, String)>,
+        max_rework: u32,
+    ) -> super::LeadBehavior {
+        let dag = TaskDag { tasks };
+        let sprint = dag.validate().unwrap();
+        super::LeadBehavior::new("agent:lead", dag, sprint, roles, max_rework)
+    }
+
+    /// Not `/tmp` (pitfall 6) — under this crate's own manifest dir.
+    fn cmd_test_cwd() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn empty_result_body() -> Value {
+        json!({"covered_req_ids": [], "artifacts": []})
+    }
+
+    #[tokio::test]
+    async fn cmd_wiring_off_by_default_leaves_a_cmd_check_skipped_same_as_m3() {
+        // `/usr/bin/false` would fail `expect "exit 0"` if actually run —
+        // proving that leaving `with_cmd_exec` uncalled (the default) truly
+        // never executes it, rather than just happening to pass.
+        let cmd_check = crew_proto::DodCheck::Cmd {
+            run: "/usr/bin/false".to_string(),
+            expect: "exit 0".to_string(),
+        };
+        let mut lead = lead_for_tasks(
+            vec![cmd_task("t-cmd", Role::Pm, vec![cmd_check])],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        );
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:pm", empty_result_body());
+        let replies = lead.on_envelope(result).await;
+
+        assert!(replies.is_empty(), "single-task sprint has nothing left to assign");
+        assert_eq!(lead.state_of("t-cmd"), Some(TaskState::Accepted));
+    }
+
+    #[tokio::test]
+    async fn cmd_wiring_on_allowed_command_exit_0_accepts_the_task() {
+        let cmd_check = crew_proto::DodCheck::Cmd {
+            run: "/usr/bin/true".to_string(),
+            expect: "exit 0".to_string(),
+        };
+        let policy = CmdPolicy::default_allowlist().allow(&["/usr/bin/true"]);
+        let mut lead = lead_for_tasks(
+            vec![cmd_task("t-cmd", Role::Pm, vec![cmd_check])],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        )
+        .with_cmd_policy(policy)
+        .with_cmd_exec(Arc::new(|_role| cmd_test_cwd()));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:pm", empty_result_body());
+        let _ = lead.on_envelope(result).await;
+
+        assert_eq!(lead.state_of("t-cmd"), Some(TaskState::Accepted));
+    }
+
+    #[tokio::test]
+    async fn cmd_wiring_on_nonzero_exit_sends_change_request_and_withholds_acceptance() {
+        let cmd_check = crew_proto::DodCheck::Cmd {
+            run: "/usr/bin/false".to_string(),
+            expect: "exit 0".to_string(),
+        };
+        let policy = CmdPolicy::default_allowlist().allow(&["/usr/bin/false"]);
+        let mut lead = lead_for_tasks(
+            vec![cmd_task("t-cmd", Role::Pm, vec![cmd_check])],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        )
+        .with_cmd_policy(policy)
+        .with_cmd_exec(Arc::new(|_role| cmd_test_cwd()));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:pm", empty_result_body());
+        let replies = lead.on_envelope(result).await;
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].kind, MessageKind::ChangeRequest);
+        let violations = replies[0].body["violations"].as_array().unwrap();
+        assert!(violations.iter().any(|v| v.as_str().unwrap().starts_with("cmd:")));
+        assert_eq!(lead.state_of("t-cmd"), Some(TaskState::Assigned));
+    }
+
+    #[tokio::test]
+    async fn cmd_wiring_on_disallowed_prefix_is_refused_and_withholds_acceptance() {
+        let cmd_check = crew_proto::DodCheck::Cmd {
+            run: "rm -rf /".to_string(),
+            expect: "exit 0".to_string(),
+        };
+        let mut lead = lead_for_tasks(
+            vec![cmd_task("t-cmd", Role::Pm, vec![cmd_check])],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        )
+        .with_cmd_exec(Arc::new(|_role| cmd_test_cwd()));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:pm", empty_result_body());
+        let replies = lead.on_envelope(result).await;
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].kind, MessageKind::ChangeRequest);
+        let violations = replies[0].body["violations"].as_array().unwrap();
+        assert!(violations.iter().any(|v| v.as_str().unwrap().contains("refused")));
+        assert_eq!(lead.state_of("t-cmd"), Some(TaskState::Assigned));
+    }
+
+    #[tokio::test]
+    async fn cmd_wiring_on_with_no_cmd_checks_matches_off_verdict() {
+        let mut lead = lead_for_tasks(
+            vec![cmd_task("t-no-cmd", Role::Pm, vec![])],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        )
+        .with_cmd_exec(Arc::new(|_role| cmd_test_cwd()));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:pm", empty_result_body());
+        let _ = lead.on_envelope(result).await;
+
+        assert_eq!(lead.state_of("t-no-cmd"), Some(TaskState::Accepted));
+    }
+
+    #[tokio::test]
+    async fn cmd_wiring_resolves_cwd_per_task_role() {
+        let seen: Arc<std::sync::Mutex<Vec<Role>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_writer = seen.clone();
+        let mut lead = lead_for_tasks(
+            vec![
+                cmd_task("t-pm", Role::Pm, vec![]),
+                cmd_task("t-design", Role::Designer, vec![]),
+            ],
+            vec![
+                (Role::Pm, "agent:pm".to_string()),
+                (Role::Designer, "agent:designer".to_string()),
+            ],
+            AcceptanceLoop::default_budget(),
+        )
+        .with_cmd_exec(Arc::new(move |role| {
+            seen_writer.lock().unwrap().push(role);
+            cmd_test_cwd()
+        }));
+
+        let assigns = lead.on_start().await;
+        assert_eq!(assigns.len(), 2, "both tasks are dep-free and dispatch together");
+
+        for assign in &assigns {
+            let from = assign.to[0].clone();
+            let result = task_result_envelope(assign, &from, empty_result_body());
+            let _ = lead.on_envelope(result).await;
+        }
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen.contains(&Role::Pm));
+        assert!(seen.contains(&Role::Designer));
     }
 }

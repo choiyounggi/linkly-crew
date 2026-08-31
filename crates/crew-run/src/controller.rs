@@ -322,6 +322,7 @@ async fn spawn_sprint(
     let lead_conn = BusConn::connect(url, token, "agent:lead").await?;
     let routing: Vec<(Role, String)> = crew.iter().map(|(id, role)| (*role, id.clone())).collect();
     let prior_states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
+    let cmd_cwd_base = data_dir.to_path_buf();
     let lead_behavior = LeadBehavior::new(
         "agent:lead",
         dag.clone(),
@@ -330,7 +331,8 @@ async fn spawn_sprint(
         max_rework,
     )
     .with_prior_states(prior_states)
-    .escalation_timeout_ms(escalation_timeout_ms);
+    .escalation_timeout_ms(escalation_timeout_ms)
+    .with_cmd_exec(Arc::new(move |role| role_cli_cwd(&cmd_cwd_base, role)));
     let observing = ObservingLead::new(lead_behavior, sprint_tasks.to_vec(), ts_tx, cumulative);
     // Lead never gets a control channel (contracts-m6.md §D2a, plan D2/plan
     // D6, pitfall 14) — lead swaps stay M5 boundary-only via `AgentRunner::run`.

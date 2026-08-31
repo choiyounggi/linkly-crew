@@ -39,9 +39,10 @@ impl AcceptanceLoop {
     }
 
     /// `passed` → `Accept`; otherwise consumes one rework round if the
-    /// budget allows (`Rework` with `uncovered` prefixed `"REQ-"` and
-    /// `missing_artifacts` prefixed `"artifact:"`, concatenated), else
-    /// `Escalate`.
+    /// budget allows (`Rework` with `uncovered` prefixed `"REQ-"`,
+    /// `missing_artifacts` prefixed `"artifact:"`, and `failed_cmds`
+    /// (already `cmd:<run> — <reason>`-formatted by `dod_exec::judge`,
+    /// M9 §G2d), concatenated), else `Escalate`.
     pub fn decide(&mut self, verdict: &DodVerdict) -> AcceptDecision {
         if verdict.passed {
             return AcceptDecision::Accept;
@@ -64,6 +65,7 @@ impl AcceptanceLoop {
                     .iter()
                     .map(|name| format!("artifact:{name}")),
             )
+            .chain(verdict.failed_cmds.iter().cloned())
             .collect();
         AcceptDecision::Rework { violations }
     }
@@ -78,6 +80,7 @@ mod tests {
             passed: true,
             uncovered: vec![],
             missing_artifacts: vec![],
+            failed_cmds: vec![],
             skipped: vec![],
         }
     }
@@ -87,6 +90,7 @@ mod tests {
             passed: false,
             uncovered: vec!["REQ-1".to_string()],
             missing_artifacts: vec!["spec.md".to_string()],
+            failed_cmds: vec![],
             skipped: vec![],
         }
     }
@@ -136,5 +140,29 @@ mod tests {
 
         assert!(matches!(decision, AcceptDecision::Escalate { .. }));
         assert_eq!(loop_.rounds_used(), 0);
+    }
+
+    #[test]
+    fn failed_cmd_alone_still_reworks_with_a_non_empty_diagnostic() {
+        // Regression for review t-cmd-r1 F1: ReqCover/artifacts fully
+        // satisfied, only a Cmd check failed — the Rework violations must
+        // still carry the failure, not come back empty.
+        let verdict = DodVerdict {
+            passed: false,
+            uncovered: vec![],
+            missing_artifacts: vec![],
+            failed_cmds: vec!["cmd:cargo test — exit 1 (expected 0)".to_string()],
+            skipped: vec![],
+        };
+        let mut loop_ = AcceptanceLoop::new(AcceptanceLoop::default_budget());
+
+        let decision = loop_.decide(&verdict);
+
+        assert_eq!(
+            decision,
+            AcceptDecision::Rework {
+                violations: vec!["cmd:cargo test — exit 1 (expected 0)".to_string()]
+            }
+        );
     }
 }

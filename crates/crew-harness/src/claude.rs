@@ -21,12 +21,20 @@ use crate::{
 const HARNESS_ID: HarnessId = HarnessId("claude-code");
 const EVENTS_CHANNEL_CAPACITY: usize = 64;
 const TURN_CHANNEL_CAPACITY: usize = 8;
+const DEFAULT_SETTING_SOURCES: &str = "project,local";
 
 /// Adapter for a `claude` CLI on `$PATH` (or another binary of the same
 /// stream-json protocol, for fake-CLI-driven tests — see `with_binary`).
 pub struct ClaudeCodeHarness {
     claude_bin: String,
     extra_env: Vec<(String, String)>,
+    /// `--setting-sources` value. Scopes the settings a spawned session
+    /// loads so a user-global hook (`~/.claude/settings.json`) can't fire
+    /// inside it (trap 8). Default `Some("project,local")` — excludes only
+    /// the user-global source; project/local settings still load. `None`
+    /// omits the flag, falling back to the CLI's default (load everything).
+    /// Evidence: `docs/SPIKE-M9.md`. Requires `claude` >= 2.1.236.
+    setting_sources: Option<String>,
 }
 
 impl ClaudeCodeHarness {
@@ -34,6 +42,7 @@ impl ClaudeCodeHarness {
         Self {
             claude_bin: "claude".to_string(),
             extra_env: Vec::new(),
+            setting_sources: Some(DEFAULT_SETTING_SOURCES.to_string()),
         }
     }
 
@@ -43,6 +52,7 @@ impl ClaudeCodeHarness {
         Self {
             claude_bin: claude_bin.into(),
             extra_env: Vec::new(),
+            setting_sources: Some(DEFAULT_SETTING_SOURCES.to_string()),
         }
     }
 
@@ -54,6 +64,21 @@ impl ClaudeCodeHarness {
         self
     }
 
+    /// Override the spawned session's `--setting-sources` value. `None`
+    /// omits the flag entirely rather than passing an empty value.
+    pub fn with_setting_sources(mut self, sources: Option<impl Into<String>>) -> Self {
+        self.setting_sources = sources.map(Into::into);
+        self
+    }
+
+    /// `["--setting-sources", "<value>"]` if set, else empty.
+    fn setting_sources_args(&self) -> Vec<String> {
+        match &self.setting_sources {
+            Some(value) => vec!["--setting-sources".to_string(), value.clone()],
+            None => Vec::new(),
+        }
+    }
+
     /// Resume a previous session (D8). Real-CLI-only: fake CLI has no
     /// persisted session state to resume.
     pub async fn spawn_resumed(
@@ -61,21 +86,18 @@ impl ClaudeCodeHarness {
         cfg: &AgentCfg,
         session_id: Uuid,
     ) -> Result<Session, HarnessError> {
-        self.spawn_with_args(
-            cfg,
-            &[
-                "-p".to_string(),
-                "-r".to_string(),
-                session_id.to_string(),
-                "--input-format".to_string(),
-                "stream-json".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-            ],
-            session_id,
-        )
-        .await
+        let mut args = vec![
+            "-p".to_string(),
+            "-r".to_string(),
+            session_id.to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+        ];
+        args.extend(self.setting_sources_args());
+        self.spawn_with_args(cfg, &args, session_id).await
     }
 
     async fn spawn_with_args(
@@ -137,21 +159,18 @@ impl Harness for ClaudeCodeHarness {
 
     async fn spawn(&self, cfg: &AgentCfg) -> Result<Session, HarnessError> {
         let session_id = Uuid::new_v4();
-        self.spawn_with_args(
-            cfg,
-            &[
-                "-p".to_string(),
-                "--input-format".to_string(),
-                "stream-json".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--session-id".to_string(),
-                session_id.to_string(),
-            ],
-            session_id,
-        )
-        .await
+        let mut args = vec![
+            "-p".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--session-id".to_string(),
+            session_id.to_string(),
+        ];
+        args.extend(self.setting_sources_args());
+        self.spawn_with_args(cfg, &args, session_id).await
     }
 
     async fn send(

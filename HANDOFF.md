@@ -216,10 +216,46 @@
 - M8 계약 정본: `.orchestration/contracts-m8.md` (teardown 시
   `archive-20260831-m8a/contracts-m8.md`로 아카이브 예정 — M7 표기 관례와 동일).
 
+**검증됨 — M9** (2026-08-31, 실측: 통합 브랜치 703bf18):
+- 머지 완료 3/3 코드 태스크 + 본 문서: t-hook(스폰 세션 유저 전역 훅 차단),
+  t-cmd(`DodCheck::Cmd` 허용목록 argv 실행기 + 판정), t-wire(실 `task.result` 경로 배선).
+- t-hook: `ClaudeCodeHarness::with_setting_sources`(기본 `Some("project,local")`)를
+  `spawn`·`spawn_resumed` 양쪽에 적용(`crates/crew-harness/src/claude.rs`). 실측
+  (`docs/SPIKE-M9.md`, claude 2.1.236): `hook_started` 이벤트 9→0, `apiKeySource:"none"`
+  (구독 OAuth 유지) A/B 동일, 부수 효과로 프리앰블 24,667→9,998 토큰(-14,669, 함정 2 완화).
+  프로덕션 형상(`--session-id` + stream-json stdin) 조합에서도 훅 0건 확인.
+- t-cmd: `crates/crew-lead/src/cmd_exec.rs` 신규 — `CmdPolicy::default_allowlist()`(프리픽스
+  9종, 타임아웃 120s), 위치별 허용목록(셸 미경유, `tokio::process::Command` argv 직접
+  실행 — 프리픽스 토큰은 리터럴 동등 비교, 프리픽스 뒤 모든 토큰은 `is_bare_trailing_token`
+  으로 영숫자 시작 + `[A-Za-z0-9._-]`만 + `..` 금지, 그 결과 플래그·절대/상대경로는 트레일링
+  위치에서 전부 거부), `parse_expect`(`"exit <N>"`만 인식). `dod_exec::judge`가 `judge/3`으로
+  확장되어 `DodVerdict.failed_cmds` 추가. `accept.rs`도 함께 수정됨(계약 밖 추가) —
+  `AcceptanceLoop::decide`가 `failed_cmds`를 `Rework.violations`에 체이닝(리뷰 t-cmd-r1 F1
+  회귀 방지 — Cmd 체크 단독 실패도 진단 없이 빈 violations로 돌아가지 않는다).
+- **r2 보안 수정** (`ff9636a`, Phase 5 통합 리뷰 발견): 초기 구현은 프리픽스만 검사했다 —
+  `cargo test --manifest-path=<레포 밖>`이 `vet()`을 통과해 cwd 샌드박스를 벗어나 임의
+  `build.rs`를 실행하면서도 exit 0으로 DoD를 통과시켰다. 위 위치별 허용목록(트레일링 토큰의
+  `is_bare_trailing_token` 규칙)이 이 플래그 인젝션 경로를 닫은 것 — §5 함정 27 참고.
+- t-wire: `LeadBehavior::with_cmd_exec`/`with_cmd_policy`가 `crew-run`
+  `controller.rs`의 `spawn_sprint`에서 무조건 배선됨(`role_cli_cwd(data_dir, role)` 클로저로
+  실행 cwd 주입). `resolve_task_result`를 `handle_task_result`에서 분리(동기 유지) —
+  비동기 Cmd 실행은 `on_envelope` 안에서 `handle_task_result` 호출 전에 일어난다.
+  `ObservingLead::on_envelope`는 변경 없이 그대로 위임.
+- **Cmd DoD는 실 런에서는 아직 휴면이다.** 실행기·판정·배선은 완성·테스트됐지만
+  `LeadPlanner::plan_dag_for`(`crates/crew-lead/src/plan.rs:93`)는 `DodCheck::ReqCover`만
+  방출하고, `plan_llm.rs`엔 `DodCheck` 참조가 아예 없으며(스펙 문서만 생성),
+  `RunConfig`에도 DAG 직접 주입 필드가 없다 — scripted/LLM 두 경로 모두
+  `controller.rs:493`에서 같은 `plan_dag_for`를 호출한다. 즉 **현재 어떤 코드 경로도
+  `DodCheck::Cmd`를 만들지 않는다** — §4 잔여 1번 참고.
+- 결정론: `cargo test --workspace` rc=0, **357 passed, 0 failed, 9 ignored**(직접 실행,
+  `--ignored` 미실행 — 함정 19; r2 보안 수정으로 `cmd_exec.rs` 테스트가 7개 늘어
+  350→357).
+
 **미검증**:
 - GUI에서 scripted=false 클릭 실행(네이티브 창 — 사람 1클릭 필요; 실 CLI 경로 자체는 위
   E2E 2건으로 증명됨) — Gate 2에서 확인 예정.
-- Cmd/Browser DoD 실제 실행(M3부터 skip 기록만).
+- Browser DoD 실제 실행(M3부터 skip 기록만, M9 G0로 스코프 아웃 — 착수 전).
+- Cmd DoD의 실 런 발화(§3 M9 참고 — 메커니즘은 완성됐으나 플래너 미방출로 휴면).
 
 **환경** (2026-08-27 갱신):
 - `rustup` 설치 완료, `cargo 1.98.0`(`rustc 1.98.0`) 사용 가능
@@ -238,15 +274,20 @@ task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ---
 
-## 4. 다음 스텝 — M8 완료 후 잔여
+## 4. 다음 스텝 — M9 완료 후 잔여
 
-M1~M8 완료·실측 검증됨(§3). 다음 후보:
+M1~M9 완료·실측 검증됨(§3). 다음 후보:
 
-**M8 완료 후 잔여 (작은 것부터)**:
-1. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가;
+**M9 완료 후 잔여 (작은 것부터)**:
+1. `LeadPlanner::plan_dag_for`가 `DodCheck::Cmd`를 방출하게 하기 (웹앱 도메인 태스크에
+   `cargo test`/`npm test` 부여) — Cmd DoD의 실행기·판정·배선은 M9에서 이미 완성됐으나
+   이 스텝이 빠져 있어 실 런에서 발화하지 않는다(§3 M9). 이게 M9를 실제로 살리는
+   다음 한 걸음이다.
+2. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가;
    현재 코디네이터 수동 진행 중).
-2. 스폰 세션 훅 완전 차단(함정 8, 아직 미해결).
-3. Cmd/Browser DoD 실제 실행 (M3부터 skip 기록만).
+3. Browser DoD 실제 실행 (M3부터 skip 기록만, M9 G0로 스코프 아웃 — 착수 전).
+4. Cmd DoD 타임아웃의 프로세스 그룹 도입(함정 26) — 현재 직계 자식만 죽는다.
+5. auto-memory 스폰 세션 주입 차단(함정 8 잔여 한계 ① — `--setting-sources`로는 못 막는다).
 
 opencode 실 어댑터는 PiHarness로 대체됨(스텁 존치, DESIGN §2.3) — M8 F0로 스코프
 아웃 항목에서 제거. 적응형 세마포어는 M8 F1로 완료.
@@ -256,8 +297,9 @@ opencode 실 어댑터는 PiHarness로 대체됨(스텁 존치, DESIGN §2.3) �
 **재사용 계약**: M3(archive-20260827-m3a/contracts-m3.md) + M4(archive-20260828-m4a/
 contracts-m4.md) + M5(archive-20260829-m5a/contracts-m5.md) + M6(archive-20260829-m6a/
 contracts-m6.md 예정, 현재 .orchestration/contracts-m6.md) + M7(archive-20260830-m7a/
-contracts-m7.md 예정, 현재 .orchestration/contracts-m7.md) + **M8(archive-20260831-m8a/
-contracts-m8.md 예정, 현재 .orchestration/contracts-m8.md)** — RunEvent 3종, TaskStateDto
+contracts-m7.md 예정, 현재 .orchestration/contracts-m7.md) + M8(archive-20260831-m8a/
+contracts-m8.md 예정, 현재 .orchestration/contracts-m8.md) + **M9(archive-20260901-m9a/
+contracts-m9.md 예정, 현재 .orchestration/contracts-m9.md)** — RunEvent 3종, TaskStateDto
 "blocked", HandoffPack/Roster, HarnessRegistry/HarnessPool, LlmLeadPlanner,
 `RunHandle::swap_harness`(즉시 실효 + 경계 폴백), `AgentControl`/`on_control`,
 `features/dag`/`features/timeline`, Tauri 커맨드 5종, 로스터 패널/동적 배지/이니셜 맵,
@@ -268,7 +310,10 @@ crew-ledger FTS5 `search_messages`/`RunHandle::search_messages`, `features/inbox
 세마포어(`report_rate_limit` 한도 축소/회복, `RATE_RECOVERY_SECS=300`),
 `crew_harness::pi::PiHarness`(`HarnessId("pi")`), `AgentCfg.model`,
 `Session.stdin`(`Arc<Mutex<ChildStdin>>`), `crew_agent::harness_behavior::
-looks_like_rate_limit`. 재발명 금지.
+looks_like_rate_limit`, `ClaudeCodeHarness::with_setting_sources`(기본
+`Some("project,local")`), `crew_lead::cmd_exec::{CmdPolicy,CmdOutcome,parse_expect,
+execute_cmd_checks}`, `dod_exec::judge/3`·`DodVerdict::failed_cmds`,
+`LeadBehavior::with_cmd_exec`/`with_cmd_policy`. 재발명 금지.
 
 ---
 
@@ -283,12 +328,22 @@ looks_like_rate_limit`. 재발명 금지.
 7. crew-harness 이벤트 채널(64)은 소비자가 send와 동시에 드레인해야 함 — 순차 드레인은
    실 CLI에서 교착 (`DesignerHarnessBehavior`가 `drain_until_terminal`을 `harness.send()`
    호출 *전에* `tokio::spawn`하는 이유. M2 real-CLI E2E로 실측: `docs/SPIKE-M2.md` 참고)
-8. **cwd 격리는 유저 전역 훅을 못 막는다** (M3 real-CLI E2E 실측, 2026-08-27): 스폰된
-   claude 세션 안에서 유저 전역 Stop 훅(learning-nudge 등)이 발화해 유효한 계약 JSON 뒤에
-   프로즈 턴("Learning review: …")이 붙었고, 드레인 텍스트 전체 파싱만 하던 `extract_json`이
-   실패 → Blocked → 에스컬레이션 → 후속 태스크 영구 대기로 E2E 타임아웃. 현재 `extract_json`
-   (crew-agent/harness_behavior.rs)은 문자열 인지 균형 중괄호 스캔 폴백으로 완화되어 있다 —
-   이 폴백을 제거하지 말 것. 스폰 세션의 훅 완전 차단은 미해결 과제.
+8. **cwd 격리는 유저 전역 훅을 못 막는다 — M9에서 해결** (M3 real-CLI E2E 실측,
+   2026-08-27; 해소: M9 t-hook, 2026-08-31): 스폰된 claude 세션 안에서 유저 전역 Stop 훅
+   (learning-nudge 등)이 발화해 유효한 계약 JSON 뒤에 프로즈 턴("Learning review: …")이
+   붙었고, 드레인 텍스트 전체 파싱만 하던 `extract_json`이 실패 → Blocked → 에스컬레이션
+   → 후속 태스크 영구 대기로 E2E 타임아웃. **해결**: `ClaudeCodeHarness::with_setting_sources`
+   기본값 `Some("project,local")`를 `spawn`·`spawn_resumed` 양쪽에 적용해 스폰 세션이
+   유저 전역 설정 소스를 아예 로드하지 않게 했다(`crates/crew-harness/src/claude.rs`).
+   실측(`docs/SPIKE-M9.md`, claude 2.1.236): `hook_started` 이벤트 9→0,
+   `apiKeySource:"none"`(구독 OAuth 유지)는 적용 전/후 동일 — 부수 효과로 프리앰블
+   24,667→9,998 토큰(-14,669, 함정 2 완화)도 확인. **잔여 한계 3건**: ① auto-memory는
+   여전히 주입된다(`memory_paths.auto`가 적용 전/후 동일 경로 — 설정 소스와 무관해
+   `--setting-sources`로 막히지 않는다, SPIKE-M9 §4) ② `extract_json`의 문자열 인지
+   균형 중괄호 스캔 폴백은 **제거 금지** — 훅 차단이 막는 건 훅발 프로즈 오염뿐이고,
+   모델 자체가 JSON 앞뒤에 설명을 붙이는 경우엔 여전히 이 폴백이 유일한 방어선이다
+   ③ 프로젝트 훅은 계속 로드된다 — `project,local`을 남긴 선택의 귀결이며, 스폰 대상
+   워크스페이스가 자체 훅을 두면 그대로 발화하는 것은 의도된 동작이다.
 9. 에스컬레이션(`Escalated`)된 태스크의 스프린트 내 후속 태스크는 영구 `Pending`
    (is_done 도달 불가 가능) — M3 수용 결정. 멀티 스프린트(M5)에선 타임아웃/캐스케이드 정책 필요.
 10. **열린 SQLite 원장 밑에서 디렉토리 rename 금지** (M4 결정): SQLite는 저널/WAL을
@@ -333,6 +388,16 @@ looks_like_rate_limit`. 재발명 금지.
     8/8 clean, 실패 메시지도 미포착 — 원인 미상(병렬 부하/콜드 스타트 타이밍 의심).
     재현 불가·근본원인 미확정이므로 결론 내리지 말 것 — 콜드 빌드 직후 실패를 보면
     바로 결함으로 단정하지 말고 한 번 더 돌려 재현 여부부터 확인할 것.
+    3차(m9a Phase 5 통합 테스트, 2026-08-31, 코디네이터 실측): `crew-bus`의
+    `tests/integration.rs:171` `test_redelivery_after_no_receipt_succeeds`가 콜드 빌드 직후
+    `cargo test --workspace` 첫 실행에서만 실패. **이번에 처음으로 실패 메시지가 포착됐다** —
+    `assertion left == right failed / left: Error { code: "delivery_failed", message:
+    "msg_01M1B169TRTQQ8FT89AC13NB97" } / right: Receipt { id: "msg_..." }`. 즉 무수신 후
+    재배달이 `Receipt` 대신 `delivery_failed`를 돌려줬다 — 재배달 타이밍이 병렬 부하에서
+    밀리는 쪽을 시사한다(확정 아님). 직후 재현 시도: 격리 실행 3/3 clean, `-p crew-bus`
+    스위트 3/3 clean, `cargo test --workspace` 2연속 clean(357 passed). M9는 `crates/crew-bus`를
+    **한 줄도 건드리지 않았다**(`git diff 8e331e7..crew-m9-integration -- crates/crew-bus`가 빈
+    출력) — M9 회귀가 아니다.
 21. **워커가 `impl_done` 보고 후 커밋 전에 죽으면 구현이 워크트리 dirty로만 존재한다**
     (M7 오케스트레이션 운영 실측, m7a 재진입): 4개 태스크(t-artifacts/t-inbox/
     t-rosterrun/t-search)가 이 상태로 발견됐고, 코디네이터가 스냅샷 커밋으로 회수했다
@@ -351,3 +416,22 @@ looks_like_rate_limit`. 재발명 금지.
     그중 다이얼로그형(select/confirm/input/editor)은 응답이 없으면 진행이 막힌다 —
     PiHarness는 즉시 `{"type":"extension_ui_response","id":<id>,"cancelled":true}`로
     자동 응답해 스톨을 방지한다.
+25. **`test-floor.sh`의 파일 분류기에 Rust 항목이 없다** (m9a 오케스트레이션 운영 실측,
+    t-cmd): `src/*.rs` 안의 인라인 `#[cfg(test)] mod tests`를 인식하지 못해
+    `no-tests`(exit 3)를 낸다 — 실제로는 `cmd_exec.rs` 한 파일에만 테스트 10개·assert
+    16개가 있었다. 이 도구의 `no-tests` 판정을 리워크 사유로 삼지 말고 `floor=unknown`으로
+    취급할 것.
+26. **Cmd DoD 타임아웃은 직계 자식만 죽인다** (`crates/crew-lead/src/cmd_exec.rs`
+    `execute_cmd_checks` — `kill_on_drop`/`child.kill()` 둘 다 직접 spawn한 자식
+    프로세스 핸들에만 작용): `cargo test`/`npm test`처럼 자기 자식을 낳는 런처가
+    타임아웃되면 손자 프로세스가 남을 수 있고, 이들이 `target/` 락을 쥐면 같은 런의 다음
+    `cargo build` 체크도 연쇄 타임아웃될 수 있다. M9 의도적 스코프 아웃(리뷰 t-cmd-r1
+    N1에서 "stands"로 수용) — 프로세스 그룹(setsid + 그룹 kill) 도입은 후속 과제.
+27. **명령 허용목록에서 프리픽스만 검사하면 플래그 인젝션으로 뚫린다** (Phase 5 통합 리뷰
+    실측, m9a — `crates/crew-lead/src/cmd_exec.rs` `vet()`, t-cmd r2 `ff9636a`로 수정):
+    초기 구현은 `["cargo","test"]` 같은 프리픽스만 리터럴 비교하고 그 뒤 토큰은 검사하지
+    않았다 — `cargo test --manifest-path=<레포 밖>`이 그대로 통과해 cwd 샌드박스를 벗어난
+    임의 `build.rs`를 실행하면서도 exit 0으로 DoD를 통과시켰다. 수정: 프리픽스 뒤 모든
+    토큰에 `is_bare_trailing_token`(영숫자 시작 + `[A-Za-z0-9._-]`만 + `..` 금지)을 적용해
+    플래그(`-`)·절대/상대경로(`/`·`.`)를 전부 거부. **새 프리픽스를 추가할 때마다 그 명령의
+    플래그가 cwd/manifest/config를 바꿀 수 있는지 확인할 것.**
