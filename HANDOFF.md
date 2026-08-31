@@ -577,3 +577,26 @@ PlanOptions}`, `LeadPlanner::plan_dag_with`, `RunConfig.dev_cmd_checks`,
     남은 상태: `project_root`를 지정하고 `dev_cmd_checks`에 `npm run`/`npm test`류를
     포함시키면, 함정 29가 조용히 통과한다. 봉쇄는 argv 허용목록이 아니라 `project_root`를
     지정하는 사람의 판단뿐이다(DESIGN §4.2 신뢰 경계 문단).
+30. **`project_root: Some`이면 로스터 전원의 CLI 세션 cwd가 동일하다 — 락·역할별 브랜치·
+    충돌 감지가 전부 없다** (Phase 5 통합 리뷰 발, 코디네이터 재현, 2026-08-31):
+    1. `role_cli_cwd`의 `Some(root)` 분기(`controller.rs:98-101`)는 역할과 무관하게
+       `root.to_path_buf()`를 그대로 반환한다 — 역할별 하위 디렉토리를 만들지 않는다.
+    2. `spawn_sprint`(`controller.rs:277`)는 `crew_agents(roster)`로 얻은 로스터 전원을
+       매 스프린트 동시에 `tokio::spawn`한다 — 이번 스프린트에 태스크가 있는 역할만이
+       아니다. `RealCli` 모드에서는 5개 CLI 세션이 동시에 산다. `SprintSlicer::slice`
+       (`plan.rs:232`)는 위상 순서를 `max_per_sprint` 단위로 `chunks()`할 뿐이라, 한
+       스프린트에 서로 다른 역할의 태스크가 함께 들어간다.
+    3. 귀결: 락·역할별 브랜치·충돌 감지가 **전부 없으므로** 마지막 writer가 조용히
+       이긴다. 더해서 Lead의 `Cmd DoD`(`cmd_exec::execute_cmd_checks`)도 같은 cwd에서
+       도므로, 아직 쓰는 중인 형제 세션의 파일을 읽어 **코드 정확성과 무관한 DoD
+       판정**이 나올 수 있다.
+    4. **DESIGN §6의 "에이전트마다 git worktree + 전용 브랜치"는 미구현이다**
+       (`grep -rn "worktree" crates/ apps/crew-app/src-tauri/src/`의 히트는 전부
+       dev-loop 워크트리를 가리키는 테스트 주석 — 제품 코드의 역할별 git
+       worktree/브랜치는 어디에도 구현돼 있지 않다). M10까지는 역할별 scratch
+       디렉토리(`<data_dir>/cli-cwd/<role>`)가 우연히 그 역할을 대신하고 있었고,
+       M11이 `project_root: Some`으로 그것을 없앴다.
+    5. **오늘은 발화하지 않는다** — `project_root` 기본값이 `None`이고 GUI에 피커가
+       없다. §4-1(GUI 1클릭)이나 `project_root` 피커를 붙이는 것이 이것을 무장시킨다.
+    6. 검증은 런 시작 1회뿐이며, 실행 중 그 트리가 사라지거나 교체되는 것은 재검증하지
+       않는다(에이전트 세션 자신이 그 트리에 쓰기 권한을 갖는다는 점과 함께 읽을 것).
