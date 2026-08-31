@@ -3,18 +3,34 @@
 //! executes DoD itself rather than trusting the worker's self-report
 //! (DESIGN.md §4.2).
 
+use crate::cmd_exec::{parse_expect, CmdOutcome};
 use crew_proto::{DodCheck, TaskSpec};
 use serde_json::Value;
 
-/// Judgment result — contracts-m3.md 커버리지 규칙: `passed` iff `uncovered`
-/// and `missing_artifacts` are both empty; `Cmd`/`Browser` checks never
-/// affect `passed` in M3, they only land in `skipped`.
+/// Judgment result — contracts-m3.md 커버리지 규칙 as extended by M9 §G2d:
+/// `passed` iff `uncovered`, `missing_artifacts`, and `failed_cmds` are all
+/// empty. `Browser` checks never affect `passed`, they only land in
+/// `skipped` (M9 scope-out, G0). A `Cmd` check lands in `skipped` when no
+/// matching `CmdOutcome` was supplied (executor not wired, or `expect`
+/// unparseable) — same as M3 — and in `failed_cmds` when the matching
+/// outcome disagrees with `expect`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DodVerdict {
     pub passed: bool,
     pub uncovered: Vec<String>,
     pub missing_artifacts: Vec<String>,
+    pub failed_cmds: Vec<String>,
     pub skipped: Vec<String>,
+}
+
+/// The `run` field shared by every `CmdOutcome` variant (M9 D12 matching key).
+fn outcome_run(outcome: &CmdOutcome) -> &str {
+    match outcome {
+        CmdOutcome::Ran { run, .. }
+        | CmdOutcome::Refused { run, .. }
+        | CmdOutcome::TimedOut { run }
+        | CmdOutcome::SpawnFailed { run, .. } => run,
+    }
 }
 
 fn artifact_present(artifacts: &[Value], name: &str) -> bool {
@@ -34,9 +50,17 @@ fn artifact_present(artifacts: &[Value], name: &str) -> bool {
 /// `task.artifacts_expected` entry and every `DodCheck::Artifact{name}` in
 /// `task.dod` (plan D2 — the two sources are unioned, deduped by name, since
 /// the M3 planner (`LeadPlanner::plan_dag`) always populates
-/// `artifacts_expected` but never emits a `DodCheck::Artifact`); `Cmd`/
-/// `Browser` are not executed in M3 and are recorded in `skipped` only.
-pub fn judge(task: &TaskSpec, result_body: &Value) -> DodVerdict {
+/// `artifacts_expected` but never emits a `DodCheck::Artifact`); `Cmd` checks
+/// are matched against `cmd_outcomes` by `run` (first unused match wins, M9
+/// D12) — a match whose `Ran{exit_code}` equals `parse_expect(expect)` passes
+/// silently, a mismatched exit code or a `Refused`/`TimedOut`/`SpawnFailed`
+/// outcome lands in `failed_cmds` (`cmd:<run> — <reason>`) and fails
+/// `passed`, and no match (executor not wired, or `expect` unparseable)
+/// lands in `skipped` only — unchanged from M3 (M9 §G2d, D11 regression
+/// invariant: an empty `cmd_outcomes` reproduces M3 exactly). `Browser` is
+/// never executed (M9 scope-out, G0) and is always recorded in `skipped`
+/// only, same as M3.
+pub fn judge(task: &TaskSpec, result_body: &Value, cmd_outcomes: &[CmdOutcome]) -> DodVerdict {
     let covered: Vec<&str> = match result_body.get("covered_req_ids") {
         Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
         _ => vec![],
@@ -48,7 +72,9 @@ pub fn judge(task: &TaskSpec, result_body: &Value) -> DodVerdict {
 
     let mut uncovered = Vec::new();
     let mut missing_artifacts = Vec::new();
+    let mut failed_cmds = Vec::new();
     let mut skipped = Vec::new();
+    let mut used_outcome = vec![false; cmd_outcomes.len()];
 
     for check in &task.dod {
         match check {
@@ -66,7 +92,35 @@ pub fn judge(task: &TaskSpec, result_body: &Value) -> DodVerdict {
                     missing_artifacts.push(name.clone());
                 }
             }
-            DodCheck::Cmd { run, .. } => skipped.push(format!("cmd:{run}")),
+            DodCheck::Cmd { run, expect } => {
+                let Some(want) = parse_expect(expect) else {
+                    skipped.push(format!("cmd:{run}"));
+                    continue;
+                };
+                let matched = cmd_outcomes.iter().enumerate().find(|(i, outcome)| {
+                    !used_outcome[*i] && outcome_run(outcome) == run.as_str()
+                });
+                let Some((i, outcome)) = matched else {
+                    skipped.push(format!("cmd:{run}"));
+                    continue;
+                };
+                used_outcome[i] = true;
+                match outcome {
+                    CmdOutcome::Ran { exit_code, .. } if *exit_code == want => {}
+                    CmdOutcome::Ran { exit_code, .. } => {
+                        failed_cmds.push(format!("cmd:{run} — exit {exit_code} (expected {want})"));
+                    }
+                    CmdOutcome::Refused { reason, .. } => {
+                        failed_cmds.push(format!("cmd:{run} — refused: {reason}"));
+                    }
+                    CmdOutcome::TimedOut { .. } => {
+                        failed_cmds.push(format!("cmd:{run} — timed out"));
+                    }
+                    CmdOutcome::SpawnFailed { error, .. } => {
+                        failed_cmds.push(format!("cmd:{run} — spawn failed: {error}"));
+                    }
+                }
+            }
             DodCheck::Browser { flow, .. } => skipped.push(format!("browser:{flow}")),
         }
     }
@@ -79,17 +133,19 @@ pub fn judge(task: &TaskSpec, result_body: &Value) -> DodVerdict {
         }
     }
 
-    let passed = uncovered.is_empty() && missing_artifacts.is_empty();
+    let passed = uncovered.is_empty() && missing_artifacts.is_empty() && failed_cmds.is_empty();
     DodVerdict {
         passed,
         uncovered,
         missing_artifacts,
+        failed_cmds,
         skipped,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::cmd_exec::CmdOutcome;
     use crew_proto::{ArtifactContract, DodCheck, ReqId, Role, TaskSpec};
     use serde_json::json;
 
@@ -126,7 +182,7 @@ mod tests {
             "artifacts": [{"name": "spec.md", "kind": "doc", "req_ids": ["REQ-1", "REQ-2"], "content": "hello"}]
         });
 
-        let verdict = super::judge(&t, &body);
+        let verdict = super::judge(&t, &body, &[]);
 
         assert!(verdict.passed);
         assert!(verdict.uncovered.is_empty());
@@ -143,7 +199,7 @@ mod tests {
         );
         let body = json!({"covered_req_ids": ["REQ-1"], "artifacts": []});
 
-        let verdict = super::judge(&t, &body);
+        let verdict = super::judge(&t, &body, &[]);
 
         assert!(!verdict.passed);
         assert_eq!(verdict.uncovered, vec!["REQ-2".to_string()]);
@@ -171,7 +227,7 @@ mod tests {
             "artifacts": [{"name": "design.md", "kind": "doc", "req_ids": [], "content": ""}]
         });
 
-        let verdict = super::judge(&t, &body);
+        let verdict = super::judge(&t, &body, &[]);
 
         assert!(!verdict.passed);
         assert_eq!(
@@ -197,7 +253,7 @@ mod tests {
         );
         let body = json!({"covered_req_ids": [], "artifacts": []});
 
-        let verdict = super::judge(&t, &body);
+        let verdict = super::judge(&t, &body, &[]);
 
         assert!(verdict.passed);
         assert_eq!(
@@ -216,9 +272,140 @@ mod tests {
         );
         let body = json!({"covered_req_ids": "REQ-1", "artifacts": []});
 
-        let verdict = super::judge(&t, &body);
+        let verdict = super::judge(&t, &body, &[]);
 
         assert!(!verdict.passed);
         assert_eq!(verdict.uncovered, vec!["REQ-1".to_string()]);
+    }
+
+    fn cmd_check(run: &str, expect: &str) -> DodCheck {
+        DodCheck::Cmd {
+            run: run.to_string(),
+            expect: expect.to_string(),
+        }
+    }
+
+    #[test]
+    fn matching_exit_code_passes_and_is_not_skipped_or_failed() {
+        let t = task(vec![cmd_check("npm test", "exit 0")], vec![]);
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![CmdOutcome::Ran {
+            run: "npm test".to_string(),
+            exit_code: 0,
+        }];
+
+        let verdict = super::judge(&t, &body, &outcomes);
+
+        assert!(verdict.passed);
+        assert!(verdict.failed_cmds.is_empty());
+        assert!(!verdict.skipped.contains(&"cmd:npm test".to_string()));
+    }
+
+    #[test]
+    fn mismatched_exit_code_fails() {
+        let t = task(vec![cmd_check("npm test", "exit 0")], vec![]);
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![CmdOutcome::Ran {
+            run: "npm test".to_string(),
+            exit_code: 1,
+        }];
+
+        let verdict = super::judge(&t, &body, &outcomes);
+
+        assert!(!verdict.passed);
+        assert_eq!(verdict.failed_cmds.len(), 1);
+    }
+
+    #[test]
+    fn refused_outcome_fails() {
+        let t = task(vec![cmd_check("rm -rf /", "exit 0")], vec![]);
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![CmdOutcome::Refused {
+            run: "rm -rf /".to_string(),
+            reason: "matches no allowed prefix".to_string(),
+        }];
+
+        let verdict = super::judge(&t, &body, &outcomes);
+
+        assert!(!verdict.passed);
+        assert_eq!(verdict.failed_cmds.len(), 1);
+    }
+
+    #[test]
+    fn timed_out_outcome_fails() {
+        let t = task(vec![cmd_check("npm test", "exit 0")], vec![]);
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![CmdOutcome::TimedOut {
+            run: "npm test".to_string(),
+        }];
+
+        let verdict = super::judge(&t, &body, &outcomes);
+
+        assert!(!verdict.passed);
+        assert_eq!(verdict.failed_cmds.len(), 1);
+    }
+
+    #[test]
+    fn unparseable_expect_stays_skipped_and_does_not_affect_passed() {
+        let t = task(
+            vec![cmd_check("npm run e2e", "성공 토스트 노출")],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![CmdOutcome::Ran {
+            run: "npm run e2e".to_string(),
+            exit_code: 0,
+        }];
+
+        let verdict = super::judge(&t, &body, &outcomes);
+
+        assert!(verdict.passed);
+        assert!(verdict.failed_cmds.is_empty());
+        assert_eq!(verdict.skipped, vec!["cmd:npm run e2e".to_string()]);
+    }
+
+    #[test]
+    fn browser_check_stays_skipped_and_never_fails() {
+        let t = task(
+            vec![DodCheck::Browser {
+                flow: "signup".to_string(),
+                expect: "success".to_string(),
+            }],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+
+        let verdict = super::judge(&t, &body, &[]);
+
+        assert!(verdict.passed);
+        assert!(verdict.failed_cmds.is_empty());
+        assert_eq!(verdict.skipped, vec!["browser:signup".to_string()]);
+    }
+
+    #[test]
+    fn duplicate_run_consumes_outcomes_in_order() {
+        let t = task(
+            vec![
+                cmd_check("npm test", "exit 0"),
+                cmd_check("npm test", "exit 0"),
+            ],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![
+            CmdOutcome::Ran {
+                run: "npm test".to_string(),
+                exit_code: 0,
+            },
+            CmdOutcome::Ran {
+                run: "npm test".to_string(),
+                exit_code: 1,
+            },
+        ];
+
+        let verdict = super::judge(&t, &body, &outcomes);
+
+        assert!(!verdict.passed);
+        assert_eq!(verdict.failed_cmds.len(), 1);
     }
 }

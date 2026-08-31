@@ -292,7 +292,7 @@ impl LeadBehavior {
             return vec![];
         };
 
-        let verdict = dod_exec::judge(&task, &env.body);
+        let verdict = dod_exec::judge(&task, &env.body, &[]);
         let loop_ = self
             .loops
             .entry(task_id.clone())
