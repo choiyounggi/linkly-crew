@@ -79,6 +79,9 @@ where
         max_per_sprint: 0,
         escalation_timeout_ms: 0,
         roster: Some(roster),
+        // contracts-m10.md §H1g / D8: cmd DoD emission is off by default.
+        // To turn it on, pass crew_run::default_dev_cmd_checks_rust() etc.
+        dev_cmd_checks: Vec::new(),
     };
 
     let handle = RunController::start(cfg).await.map_err(|e| e.to_string())?;

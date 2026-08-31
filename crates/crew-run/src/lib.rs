@@ -7,6 +7,10 @@ mod controller;
 mod events;
 mod observe;
 
-pub use config::{GateDecision, RunConfig, RunError, RunMode};
+pub use config::{
+    default_dev_cmd_checks_node, default_dev_cmd_checks_rust, GateDecision, RunConfig, RunError,
+    RunMode,
+};
+pub use crew_lead::plan::CmdCheck;
 pub use controller::{validate_roster, RunController, RunHandle};
 pub use events::{RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};

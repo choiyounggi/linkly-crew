@@ -41,6 +41,7 @@ fn config(
         max_per_sprint,
         escalation_timeout_ms: 0,
         roster: None,
+        dev_cmd_checks: Vec::new(),
     }
 }
 
