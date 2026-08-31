@@ -310,7 +310,9 @@ M1~M10 완료·실측 검증됨(§3). 다음 후보:
 4. **Cmd DoD 실행 cwd를 실제 프로젝트 루트로** — 이것이 없으면 `dev_cmd_checks` 노브를
    켤 수 없다. 지금 켜면 실행 cwd(`role_cli_cwd`)에 매니페스트가 없어 `cargo test`가
    exit `101`("could not find `Cargo.toml`")로 끝나고 `failed_cmds`에 쌓인다
-   (`docs/SPIKE-M10.md` §3).
+   (`docs/SPIKE-M10.md` §3). 이 변경은 함정 29(`npm|yarn|pnpm run` 간접 실행이 허용목록을
+   무력화)를 무장시키므로, cwd 변경과 함께 `npm|yarn|pnpm run` 허용 여부를 반드시
+   재결정해야 한다.
 5. **허용목록 규칙의 이중 정의 제거** — `crates/crew-run/src/config.rs`의 테스트 모듈이
    `ALLOWED_PREFIXES`와 `is_bare_trailing_token`을 `cmd_exec.rs`에서 복제하고 있다.
    두 태스크가 머지된 지금은 `CmdPolicy`에 `vet_run(&str) -> Result<(), String>`를
@@ -484,3 +486,28 @@ PlanOptions}`, `LeadPlanner::plan_dag_with`, `RunConfig.dev_cmd_checks`,
     `Cargo.toml`을 찾으므로 중첩 `cargo test`가 되고 바깥 런과 `target/` 락을 다툰다.
     통합 테스트는 파싱 불가 sentinel `expect`를 써서 실행을 0으로 만든다
     (`crates/crew-run/tests/m10_cmd_dod.rs` 모듈 doc).
+29. **`npm|yarn|pnpm run <script>`의 간접 실행이 허용목록을 무력화한다** (M10 Phase 5
+    통합 리뷰 발, 코디네이터 재현): 재현(2026-08-31)
+    ```
+    $ mkdir -p ~/.linkly-crew/m10-attack-probe && cd $_
+    $ cat > package.json
+      { "name":"probe", "scripts": { "build": "echo ARBITRARY_CODE_EXECUTED > ./pwned.txt; exit 0" } }
+    $ npm run build ; echo $?
+    0
+    $ cat pwned.txt
+    ARBITRARY_CODE_EXECUTED
+    ```
+    `vet()`가 보는 것: 토큰 `[npm, run, build]` → 프리픽스 `[npm, run]`이 리터럴 일치,
+    트레일링 `build`는 맨 식별자 → **허용**. 셸도, 플래그도, 경로도 없다. 함정 27이
+    막으려던 것을 전부 지켰는데도 임의 코드가 실행됐고, **exit 0이라 DoD가 통과한다**
+    — 함정 27의 플래그 인젝션은 최소한 실패로라도 드러났지만 이쪽은 **조용히 통과**한다.
+    이것이 실제 위협인 이유: `crates/crew-run/src/controller.rs`에서 에이전트의 CLI
+    세션 cwd(298행 `cwd: role_cli_cwd(data_dir, role)`)와 Cmd DoD의 실행
+    cwd(335행 `with_cmd_exec(... role_cli_cwd(&cmd_cwd_base, role))`)가 **같은
+    디렉토리**다 — Developer 에이전트가 자기 작업 디렉토리에 쓰는 `package.json`을
+    그대로 DoD 실행기가 읽는다. 스크립트 이름은 허용목록이 볼 수 없는 간접층이다.
+    **오늘은 발화하지 않는다** — `dev_cmd_checks`의 기본값이 빈 벡터이고 GUI가
+    `Vec::new()`를 하드코딩한다. 그러나 §4 잔여 4번("Cmd DoD 실행 cwd를 실제 프로젝트
+    루트로")이 바로 이것을 무장시키는 변경이다. **완화 방향(선택지, 미확정)**: 실행
+    cwd를 에이전트 쓰기 영역과 분리하거나, `npm/yarn/pnpm run`을 허용목록에서 빼거나,
+    스크립트 본문까지 검증하는 것 중 하나가 §4 잔여 4번과 함께 결정돼야 한다.
