@@ -44,6 +44,7 @@ fn config(data_dir: PathBuf) -> RunConfig {
         max_per_sprint: 0,
         escalation_timeout_ms: 0,
         roster: None,
+        dev_cmd_checks: Vec::new(),
     }
 }
 
@@ -186,6 +187,7 @@ async fn resolve_gate_after_the_run_has_finished_is_gate_unavailable() {
         max_per_sprint: 0,
         escalation_timeout_ms: 0,
         roster: None,
+        dev_cmd_checks: Vec::new(),
     })
     .await;
 
