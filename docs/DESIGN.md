@@ -252,20 +252,39 @@ Lead는 `task.result`를 받으면 위 예시의 `kind:"cmd"` 체크를 셸을 �
   쓸 때 이 제약을 감안해야 한다.
 - **`expect`는 `"exit <N>"` 형식만 인식**한다(`parse_expect`). 그 외 문자열(예: 위 예시의
   `browser` 체크처럼 자연어)은 체크가 아예 실행되지 않고 `skipped`로만 기록된다.
-- **타임아웃 기본 120초**(`CmdPolicy::default_allowlist().timeout`), 초과 시 자식
-  프로세스를 죽이고 `TimedOut`으로 기록한다(§5 함정 26 — 직계 자식만 죽는다).
+- **타임아웃 기본 120초**(`CmdPolicy::default_allowlist().timeout`). M10부터 자식은 spawn
+  시 `process_group(0)`으로 자기 그룹의 리더가 되고(`cmd_exec.rs`), 타임아웃과
+  `ProcessGroupGuard`의 `Drop` **양쪽**에서 `libc::killpg(pgid, SIGKILL)`로 **그룹 전체**를
+  죽인다. 그룹 kill 후 `child.wait()`로 좀비를 수확한다(§5 함정 26 — **해소: M10
+  t-pgroup**). 잔여 한계: 손자가 스스로 `setsid()`/`setpgid()`로 새 세션/그룹을 만들면
+  `killpg`의 사정거리 밖으로 나간다(`cargo`/`npm`/`pnpm`/`yarn`은 그러지 않으므로 허용목록
+  범위 안에서는 영향 없음). 근거: `docs/SPIKE-M10.md` §2 A/B 표(FIX ON: exit `0`·잔존
+  프로세스 **0개** / FIX OFF: exit `101`·잔존 **1개**, 기록된 손자는 타임아웃 후에도
+  `kill(pid,0)`이 생존을 반환).
 - **실행 cwd**는 해당 태스크 역할의 CLI 세션과 같은 디렉토리(`crew-run`의
   `role_cli_cwd(data_dir, role)`) — Lead 자신의 cwd가 아니다.
-- `kind:"browser"`는 **M9에서도 아직 미실행**이다 — 항상 `skipped`로만 기록된다(스코프
+- `kind:"browser"`는 **M10에서도 아직 미실행**이다 — 항상 `skipped`로만 기록된다(스코프
   아웃).
 - 실행 결과 중 하나라도 `Refused`/`TimedOut`/`SpawnFailed`이거나 exit code가 `expect`와
   다르면 `DodVerdict.failed_cmds`에 쌓이고 `passed=false`가 되며, `AcceptanceLoop::decide`가
   이를 그대로 `Rework.violations`에 포함한다.
-- **다만 실 런에서는 이 경로에 아직 도달하지 않는다** — `LeadPlanner::plan_dag_for`가
-  `DodCheck::ReqCover`만 방출하고 `DodCheck::Cmd`를 만드는 코드 경로가 현재 없다
-  (HANDOFF §3 M9, §4 잔여 1번). 실행기·판정·배선은 완성되어 있고 단위/통합 테스트로
-  커버되지만, 위 규칙이 실제 태스크에서 발동하려면 플래너가 먼저 `DodCheck::Cmd`를
-  넣어줘야 한다.
+- **M10부터 노브 기반 방출이 생겼다** — `LeadPlanner::plan_dag_with(spec, roles,
+  &PlanOptions { dev_cmd_checks })`가 **Developer 역할 태스크에만** `ReqCover` 뒤로
+  `DodCheck::Cmd`를 이어붙인다(`plan.rs`; `roles`에 Developer가 없으면 조용히 무방출).
+  `plan_dag_for`/`plan_dag`는 `PlanOptions::default()`로 위임하는 래퍼라 **기존 출력
+  무변경**이다. 호출부 경로는 `RunConfig.dev_cmd_checks` → `crew-run/src/controller.rs`의
+  `plan_dag_with` 호출(HANDOFF §3 M10). **기본값은 빈 벡터 = 방출 없음** — 이유는 아래.
+- **기본값이 OFF인 이유**: 실행 cwd(`crew-run`의 `role_cli_cwd(data_dir, role)`)의 어떤
+  상위에도 프로젝트 매니페스트(`Cargo.toml`)가 없다(`docs/SPIKE-M10.md` §3). 그 모양의
+  디렉토리에서 `cargo test`를 돌리면 `` could not find `Cargo.toml` in `.../cli-cwd/developer`
+  or any parent directory ``로 exit `101`이 나고, `expect "exit 0"`과 불일치해
+  `DodVerdict.failed_cmds`에 쌓여 리워크 루프로 간다. 노브가 쓸모 있어지려면 먼저
+  "에이전트 작업 cwd = 실제 프로젝트 루트"가 성립해야 한다 — 후속 마일스톤 과제
+  (HANDOFF §4 잔여 4번).
+- **기본 상수**: `crew_run::default_dev_cmd_checks_rust()`/`_node()`가 위치별 허용목록
+  (§5 함정 27)을 통과하는 문자열(`cargo test` / `npm test`·`npm run build`)을 제공한다.
+  이는 **기본값이 아니라 호출부가 골라 쓰는 상수**다 — `RunConfig.dev_cmd_checks`의 실제
+  기본값은 여전히 빈 벡터.
 
 ### 4.3 Lead 에이전트의 실제 구현
 - Lead도 LLM 세션이지만, **출력은 반드시 구조화 JSON** (툴 스키마 강제).

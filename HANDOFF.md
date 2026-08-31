@@ -1,8 +1,9 @@
 # 세션 인계 — linkly-crew
 
 **한 줄**: 구독 중인 AI CLI들을 역할별 팀원으로 묶어, 요청 한 줄을 팀장 에이전트가
-스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M5 완료·실측 검증**
-(멀티 스프린트 + 압축 + 핸드오프/스왑 + 하네스 레지스트리/세마포어 + 로스터 UI + LLM 스펙화) — 다음은 M5 잔여·3단계 후보.
+스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M10 완료·실측 검증**
+(멀티 스프린트 + 압축 + 핸드오프/스왑 + 하네스 레지스트리/세마포어 + 로스터 UI + LLM 스펙화 +
+Cmd DoD 플래너 방출 + 타임아웃 프로세스 그룹 kill) — 다음은 §4 잔여·3단계 후보.
 
 **이름 확정(2026-08-28, 사용자 결정)**: 프로젝트명 **linkly-crew** (구 가칭 agent-crew).
 프론트엔드 **React 19 + Vite** (DESIGN §12.6 추천안 채택).
@@ -246,10 +247,33 @@
   방출하고, `plan_llm.rs`엔 `DodCheck` 참조가 아예 없으며(스펙 문서만 생성),
   `RunConfig`에도 DAG 직접 주입 필드가 없다 — scripted/LLM 두 경로 모두
   `controller.rs:493`에서 같은 `plan_dag_for`를 호출한다. 즉 **현재 어떤 코드 경로도
-  `DodCheck::Cmd`를 만들지 않는다** — §4 잔여 1번 참고.
+  `DodCheck::Cmd`를 만들지 않는다** — M10에서 해소(아래 "검증됨 — M10" 참고).
 - 결정론: `cargo test --workspace` rc=0, **357 passed, 0 failed, 9 ignored**(직접 실행,
   `--ignored` 미실행 — 함정 19; r2 보안 수정으로 `cmd_exec.rs` 테스트가 7개 늘어
   350→357).
+
+**검증됨 — M10** (2026-08-31, 실측: `crew-m10-integration`, t-pgroup `6108698` + t-cmdplan
+`2947ad1`, 머지 `cf342f5`; 상세: `docs/SPIKE-M10.md`):
+- t-pgroup: `cmd_exec.rs`가 spawn 시 `#[cfg(unix)] cmd.process_group(0)`로 자식을 새
+  그룹의 리더로 만들고, 타임아웃·`ProcessGroupGuard::Drop` 양쪽에서
+  `libc::killpg(pgid, SIGKILL)`로 그룹 전체를 죽인 뒤 `child.wait()`로 수확한다(§5 함정
+  26 해소). 루트 `Cargo.toml`의 `tokio`를 `"1"` → `"1.40"`으로 핀하고 `libc = "0.2"`를
+  추가했다.
+- t-cmdplan: `LeadPlanner::plan_dag_with(spec, roles, &PlanOptions { dev_cmd_checks })`가
+  Developer 태스크에만 `ReqCover` 뒤로 `DodCheck::Cmd`를 이어붙인다. `plan_dag_for`/
+  `plan_dag`는 `PlanOptions::default()`로 위임하는 래퍼로 기존 출력 무변경.
+  `RunConfig.dev_cmd_checks`(기본 빈 벡터) → `controller.rs`의 `plan_dag_with` 호출로
+  배선. `crew_run::default_dev_cmd_checks_rust()`/`_node()`가 위치별 허용목록을 통과하는
+  상수를 제공(§5 함정 27).
+- 실측(코디네이터, `docs/SPIKE-M10.md` §2 A/B — 함정 26 재현): FIX ON
+  (`process_group(0)`+`killpg`): 테스트 exit `0`, 잔여 `sleep 300` **0개**. FIX OFF(M9
+  의미론): 테스트 exit `101`, **기록된 손자 생존**(`kill(pid,0)`이 0 반환), 잔여
+  `sleep 300` **1개**(포그라운드 손자).
+- 핀 근거(`docs/SPIKE-M10.md` §1): tokio `CHANGELOG.md` — `process_group` 추가
+  `1.22.0`(2022-11-17), stabilize `1.40.0`(2024-08-30).
+- 스위트(`docs/SPIKE-M10.md` §4): t-pgroup 워크트리 `cargo test --workspace` rc=0,
+  **360 passed / 0 failed**(베이스라인 357 + 신규 3). t-cmdplan 워크트리 rc=0,
+  **371 passed / 0 failed**(베이스라인 357 + 신규 14).
 
 **미검증**:
 - GUI에서 scripted=false 클릭 실행(네이티브 창 — 사람 1클릭 필요; 실 CLI 경로 자체는 위
@@ -274,20 +298,26 @@ task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ---
 
-## 4. 다음 스텝 — M9 완료 후 잔여
+## 4. 다음 스텝 — M10 완료 후 잔여
 
-M1~M9 완료·실측 검증됨(§3). 다음 후보:
+M1~M10 완료·실측 검증됨(§3). 다음 후보:
 
-**M9 완료 후 잔여 (작은 것부터)**:
-1. `LeadPlanner::plan_dag_for`가 `DodCheck::Cmd`를 방출하게 하기 (웹앱 도메인 태스크에
-   `cargo test`/`npm test` 부여) — Cmd DoD의 실행기·판정·배선은 M9에서 이미 완성됐으나
-   이 스텝이 빠져 있어 실 런에서 발화하지 않는다(§3 M9). 이게 M9를 실제로 살리는
-   다음 한 걸음이다.
-2. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가;
+**M10 완료 후 잔여 (작은 것부터)**:
+1. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가;
    현재 코디네이터 수동 진행 중).
-3. Browser DoD 실제 실행 (M3부터 skip 기록만, M9 G0로 스코프 아웃 — 착수 전).
-4. Cmd DoD 타임아웃의 프로세스 그룹 도입(함정 26) — 현재 직계 자식만 죽는다.
-5. auto-memory 스폰 세션 주입 차단(함정 8 잔여 한계 ① — `--setting-sources`로는 못 막는다).
+2. Browser DoD 실제 실행 (M3부터 skip 기록만, M9 G0로 스코프 아웃 — 착수 전).
+3. auto-memory 스폰 세션 주입 차단(함정 8 잔여 한계 ① — `--setting-sources`로는 못 막는다).
+4. **Cmd DoD 실행 cwd를 실제 프로젝트 루트로** — 이것이 없으면 `dev_cmd_checks` 노브를
+   켤 수 없다. 지금 켜면 실행 cwd(`role_cli_cwd`)에 매니페스트가 없어 `cargo test`가
+   exit `101`("could not find `Cargo.toml`")로 끝나고 `failed_cmds`에 쌓인다
+   (`docs/SPIKE-M10.md` §3).
+5. **허용목록 규칙의 이중 정의 제거** — `crates/crew-run/src/config.rs`의 테스트 모듈이
+   `ALLOWED_PREFIXES`와 `is_bare_trailing_token`을 `cmd_exec.rs`에서 복제하고 있다.
+   두 태스크가 머지된 지금은 `CmdPolicy`에 `vet_run(&str) -> Result<(), String>`를
+   공개해 프로덕션 판정기를 직접 호출하도록 바꿀 수 있다.
+6. **`plan_dag_with_default_options_equals_plan_dag_for`는 항진 명제** —
+   `plan_dag_for`가 `plan_dag_with`에 위임하므로 자기 자신과 비교한다. 진짜 회귀
+   가드는 `plan.rs`의 기존 5역할 DAG 테스트(`dod == [ReqCover]` 단언)다. 정리 대상.
 
 opencode 실 어댑터는 PiHarness로 대체됨(스텁 존치, DESIGN §2.3) — M8 F0로 스코프
 아웃 항목에서 제거. 적응형 세마포어는 M8 F1로 완료.
@@ -297,7 +327,8 @@ opencode 실 어댑터는 PiHarness로 대체됨(스텁 존치, DESIGN §2.3) �
 **재사용 계약**: M3(archive-20260827-m3a/contracts-m3.md) + M4(archive-20260828-m4a/
 contracts-m4.md) + M5(archive-20260829-m5a/contracts-m5.md) + M6(archive-20260829-m6a/
 contracts-m6.md) + M7(archive-20260830-m7a/contracts-m7.md) + M8(archive-20260831-m8a/
-contracts-m8.md) + **M9(archive-20260831-m9a/contracts-m9.md)** — RunEvent 3종, TaskStateDto
+contracts-m8.md) + M9(archive-20260831-m9a/contracts-m9.md) +
+**M10(archive-20260831-m10a/contracts-m10.md)** — RunEvent 3종, TaskStateDto
 "blocked", HandoffPack/Roster, HarnessRegistry/HarnessPool, LlmLeadPlanner,
 `RunHandle::swap_harness`(즉시 실효 + 경계 폴백), `AgentControl`/`on_control`,
 `features/dag`/`features/timeline`, Tauri 커맨드 5종, 로스터 패널/동적 배지/이니셜 맵,
@@ -311,7 +342,11 @@ crew-ledger FTS5 `search_messages`/`RunHandle::search_messages`, `features/inbox
 looks_like_rate_limit`, `ClaudeCodeHarness::with_setting_sources`(기본
 `Some("project,local")`), `crew_lead::cmd_exec::{CmdPolicy,CmdOutcome,parse_expect,
 execute_cmd_checks}`, `dod_exec::judge/3`·`DodVerdict::failed_cmds`,
-`LeadBehavior::with_cmd_exec`/`with_cmd_policy`. 재발명 금지.
+`LeadBehavior::with_cmd_exec`/`with_cmd_policy`, `crew_lead::plan::{CmdCheck,
+PlanOptions}`, `LeadPlanner::plan_dag_with`, `RunConfig.dev_cmd_checks`,
+`crew_run::{default_dev_cmd_checks_rust, default_dev_cmd_checks_node}`, `cmd_exec`의
+프로세스 그룹 종료(`process_group(0)`/`ProcessGroupGuard`/`killpg`, 타임아웃·드롭
+양쪽). 재발명 금지.
 
 ---
 
@@ -425,6 +460,15 @@ execute_cmd_checks}`, `dod_exec::judge/3`·`DodVerdict::failed_cmds`,
     타임아웃되면 손자 프로세스가 남을 수 있고, 이들이 `target/` 락을 쥐면 같은 런의 다음
     `cargo build` 체크도 연쇄 타임아웃될 수 있다. M9 의도적 스코프 아웃(리뷰 t-cmd-r1
     N1에서 "stands"로 수용) — 프로세스 그룹(setsid + 그룹 kill) 도입은 후속 과제.
+    **해소: M10 t-pgroup**: spawn 시 `#[cfg(unix)] cmd.process_group(0)`로 자식을 새
+    그룹의 리더로 만들고, 타임아웃과 `ProcessGroupGuard`의 `Drop` 양쪽에서
+    `libc::killpg(pgid, SIGKILL)`로 그룹 전체를 죽인 뒤 `child.wait()`로 좀비를
+    수확한다. 실측(`docs/SPIKE-M10.md` §2, A/B): FIX ON은 잔여 `sleep 300` **0개**,
+    FIX OFF(M9 의미론)는 손자가 `kill(pid,0)`에 생존을 반환하며 잔여 **1개**로 남는다.
+    **잔여 한계 2건**: ① 손자가 스스로 `setsid()`/`setpgid()`로 새 세션/그룹을 만들면
+    `killpg`의 사정거리 밖으로 나간다(`cargo`/`npm`/`pnpm`/`yarn`은 그러지 않으므로
+    허용목록 범위 안에서는 영향 없음) ② non-unix 빌드는 `process_group`/`killpg`가
+    없어 기존 `kill_on_drop` 경로(직계 자식만 종료) 그대로다.
 27. **명령 허용목록에서 프리픽스만 검사하면 플래그 인젝션으로 뚫린다** (Phase 5 통합 리뷰
     실측, m9a — `crates/crew-lead/src/cmd_exec.rs` `vet()`, t-cmd r2 `ff9636a`로 수정):
     초기 구현은 `["cargo","test"]` 같은 프리픽스만 리터럴 비교하고 그 뒤 토큰은 검사하지
@@ -433,3 +477,10 @@ execute_cmd_checks}`, `dod_exec::judge/3`·`DodVerdict::failed_cmds`,
     토큰에 `is_bare_trailing_token`(영숫자 시작 + `[A-Za-z0-9._-]`만 + `..` 금지)을 적용해
     플래그(`-`)·절대/상대경로(`/`·`.`)를 전부 거부. **새 프리픽스를 추가할 때마다 그 명령의
     플래그가 cwd/manifest/config를 바꿀 수 있는지 확인할 것.**
+28. **주입된 `DodCheck::Cmd`의 파싱 가능한 `expect`는 재귀 cargo 위험이 있다** (M10
+    실측, `docs/SPIKE-M10.md` §3.1): `crew-run` 테스트에서 파싱되는 `expect`를 가진
+    `DodCheck::Cmd`를 주입하면 실제 서브프로세스가 뜬다 — 실행 cwd가
+    `crates/crew-run` 아래에 중첩돼 cargo가 상위로 올라가 crew-run 자신의
+    `Cargo.toml`을 찾으므로 중첩 `cargo test`가 되고 바깥 런과 `target/` 락을 다툰다.
+    통합 테스트는 파싱 불가 sentinel `expect`를 써서 실행을 0으로 만든다
+    (`crates/crew-run/tests/m10_cmd_dod.rs` 모듈 doc).
