@@ -34,6 +34,16 @@ pub struct RunConfig {
     /// §H1g). Empty vector (default) = no emission = the M9-and-earlier
     /// behavior unchanged.
     pub dev_cmd_checks: Vec<CmdCheck>,
+    /// The real project tree the crew works in and the Lead's `cmd` DoD checks
+    /// execute in. `None` (the shipped default) = the M10-and-earlier behavior
+    /// exactly: every role's CLI cwd and the Cmd DoD exec cwd are the per-role
+    /// scratch `<data_dir>/cli-cwd/<role>`. `Some(root)` = **both** are `root`.
+    ///
+    /// Caller-designated only — never derived from cwd, git, or a guess
+    /// (HANDOFF §5 trap 29 / contracts-m11.md §I6). With `Some`, the Lead
+    /// executes agent-authored code by design; the containment is this
+    /// human-designated tree, not the argv allowlist.
+    pub project_root: Option<PathBuf>,
 }
 
 /// Default Rust-domain dev cmd checks that satisfy `CmdPolicy`'s positional
@@ -127,6 +137,12 @@ pub enum RunError {
     /// `human.response` publish.
     #[error("gate unavailable: {0}")]
     GateUnavailable(String),
+    /// `RunConfig.project_root` failed startup validation (contracts-m11.md
+    /// §I2): not absolute, or not an existing directory. The message carries
+    /// the received value verbatim. No fallback to the scratch cwd — a silent
+    /// fallback reproduces M10's exit-101 confusion (docs/SPIKE-M10.md §3).
+    #[error("project_root invalid: {0}")]
+    ProjectRootInvalid(String),
 }
 
 #[cfg(test)]
