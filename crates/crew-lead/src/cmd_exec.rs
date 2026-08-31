@@ -171,6 +171,12 @@ pub async fn execute_cmd_checks(
         cmd.current_dir(cwd);
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
+        // Making the child the leader of its own new process group (trap
+        // 26) is what lets a timeout kill its descendants too, via
+        // `killpg`, rather than only the direct child.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        #[cfg(not(unix))]
         cmd.kill_on_drop(true);
 
         let mut child = match cmd.spawn() {
@@ -183,30 +189,112 @@ pub async fn execute_cmd_checks(
             }
             Ok(child) => child,
         };
+        #[cfg(unix)]
+        let mut group_guard = child.id().and_then(ProcessGroupGuard::new);
 
         match timeout(policy.timeout, child.wait()).await {
-            Ok(Ok(status)) => match status.code() {
-                Some(code) => outcomes.push(CmdOutcome::Ran {
+            Ok(Ok(status)) => {
+                #[cfg(unix)]
+                if let Some(guard) = group_guard.as_mut() {
+                    guard.disarm();
+                }
+                match status.code() {
+                    Some(code) => outcomes.push(CmdOutcome::Ran {
+                        run: run.clone(),
+                        exit_code: code,
+                    }),
+                    None => outcomes.push(CmdOutcome::SpawnFailed {
+                        run: run.clone(),
+                        error: "terminated by signal".to_string(),
+                    }),
+                }
+            }
+            Ok(Err(e)) => {
+                #[cfg(unix)]
+                if let Some(guard) = group_guard.as_mut() {
+                    guard.disarm();
+                }
+                outcomes.push(CmdOutcome::SpawnFailed {
                     run: run.clone(),
-                    exit_code: code,
-                }),
-                None => outcomes.push(CmdOutcome::SpawnFailed {
-                    run: run.clone(),
-                    error: "terminated by signal".to_string(),
-                }),
-            },
-            Ok(Err(e)) => outcomes.push(CmdOutcome::SpawnFailed {
-                run: run.clone(),
-                error: e.to_string(),
-            }),
+                    error: e.to_string(),
+                });
+            }
             Err(_) => {
-                let _ = child.kill().await;
+                #[cfg(unix)]
+                {
+                    match group_guard.as_mut() {
+                        Some(guard) => {
+                            guard.kill_group();
+                            guard.disarm();
+                            let _ = child.wait().await;
+                        }
+                        None => {
+                            let _ = child.kill().await;
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.kill().await;
+                }
                 outcomes.push(CmdOutcome::TimedOut { run: run.clone() });
             }
         }
     }
 
     outcomes
+}
+
+/// Owns the group-kill responsibility for a spawned child's entire process
+/// group while `armed`. `Drop` runs a synchronous `killpg(pgid, SIGKILL)` —
+/// no `await` needed — so panic, early-return, and task-cancellation paths
+/// all still clean up the child's descendants (trap 26), not just the
+/// explicit timeout branch.
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    pgid: i32,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    /// `process_group(0)` at spawn time makes the child its own group
+    /// leader, so its pgid equals its pid. A live child's id is never 0,
+    /// but a guard must never be built for 0 anyway: `killpg(0, _)` targets
+    /// the *caller's own* process group, not the child's — that would kill
+    /// this coordinator/app process instead of the runaway command.
+    fn new(child_id: u32) -> Option<Self> {
+        if child_id == 0 {
+            return None;
+        }
+        Some(ProcessGroupGuard {
+            pgid: child_id as i32,
+            armed: true,
+        })
+    }
+
+    fn kill_group(&self) {
+        // SAFETY: killpg is called with a valid signal constant and no
+        // borrowed/untrusted memory. The return value is ignored: ESRCH
+        // ("no such process group") just means the whole group already
+        // exited on its own, which is the success case, not an error.
+        unsafe {
+            libc::killpg(self.pgid, libc::SIGKILL);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.kill_group();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -470,6 +558,168 @@ mod tests {
             outcomes,
             vec![CmdOutcome::Ran {
                 run: "/bin/echo hello".to_string(),
+                exit_code: 0,
+            }]
+        );
+    }
+
+    // --- execute_cmd_checks: process-group cleanup on timeout (trap 26) ---
+    //
+    // A timed-out command whose child forks its own background grandchild
+    // must not leak that grandchild. `slow_command_times_out` above only
+    // proves the direct child dies; it says nothing about descendants. This
+    // test spawns a shell script that backgrounds a `sleep 300`, records the
+    // real pid, and then observes with `libc::kill(pid, 0)` whether that
+    // grandchild is still alive after the parent times out.
+
+    /// Kills any grandchild the test recorded and removes its scratch dir,
+    /// even if an assertion above panics — the test must never leak a
+    /// process, RED run or not.
+    struct TestCleanup {
+        dir: PathBuf,
+        grandchild_pid: Option<i32>,
+    }
+
+    impl Drop for TestCleanup {
+        fn drop(&mut self) {
+            if let Some(pid) = self.grandchild_pid {
+                // Best-effort: if the fix under test worked, this is
+                // already dead and returns ESRCH, which we ignore.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Polls `path` until it holds non-whitespace content or `budget`
+    /// elapses. The spawner script `sync`s before its own long sleep, but
+    /// under load the write can still lag a few scheduler ticks behind the
+    /// parent returning from `execute_cmd_checks`.
+    async fn wait_for_nonempty_file(path: &Path, budget: Duration) -> Option<String> {
+        let step = Duration::from_millis(20);
+        let mut waited = Duration::ZERO;
+        loop {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if !contents.trim().is_empty() {
+                    return Some(contents);
+                }
+            }
+            if waited >= budget {
+                return None;
+            }
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_command_kills_grandchild_process() {
+        let dir = cwd()
+            .join("target")
+            .join(format!("m10-pgroup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test scratch dir");
+        let mut cleanup = TestCleanup {
+            dir: dir.clone(),
+            grandchild_pid: None,
+        };
+
+        let script_path = dir.join("spawner.sh");
+        let pid_file = dir.join("grandchild.pid");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nsleep 300 &\nGCPID=$!\necho \"$GCPID\" > \"{}\"\nsync\nsleep 300\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write spawner script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat spawner script")
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&script_path, perms).expect("chmod spawner script");
+        }
+        let script_abs = script_path
+            .to_str()
+            .expect("scratch path is utf8")
+            .to_string();
+
+        let policy = CmdPolicy::default_allowlist()
+            .allow(&[script_abs.as_str()])
+            .with_timeout(Duration::from_millis(500));
+        let t = task(vec![cmd_check(&script_abs, "exit 0")]);
+
+        let outcomes = execute_cmd_checks(&t, &cwd(), &policy).await;
+
+        assert_eq!(
+            outcomes,
+            vec![CmdOutcome::TimedOut {
+                run: script_abs.clone(),
+            }]
+        );
+
+        let pid_contents = wait_for_nonempty_file(&pid_file, Duration::from_secs(2))
+            .await
+            .expect("grandchild pid file was never written by the spawner script");
+        let grandchild_pid: i32 = pid_contents
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("grandchild pid file {pid_contents:?} did not parse: {e}"));
+        assert!(
+            grandchild_pid > 1,
+            "grandchild pid must be a real pid, got {grandchild_pid}"
+        );
+        cleanup.grandchild_pid = Some(grandchild_pid);
+
+        let alive = unsafe { libc::kill(grandchild_pid, 0) };
+        let probe_err = std::io::Error::last_os_error();
+        assert_eq!(
+            alive, -1,
+            "expected grandchild pid {grandchild_pid} to be dead after the timeout, \
+             but kill(pid, 0) returned {alive} (still alive)"
+        );
+        assert_eq!(
+            probe_err.raw_os_error(),
+            Some(libc::ESRCH),
+            "expected ESRCH (no such process) for grandchild {grandchild_pid}, got {probe_err}"
+        );
+    }
+
+    // --- ProcessGroupGuard: boundary ---
+
+    #[cfg(unix)]
+    #[test]
+    fn process_group_guard_refuses_pgid_zero() {
+        // killpg(0, SIG) targets the *caller's* process group, not a
+        // child's — building a guard for child_id 0 must be impossible.
+        assert!(ProcessGroupGuard::new(0).is_none());
+    }
+
+    // --- execute_cmd_checks: normal completion still runs in a new group ---
+
+    #[tokio::test]
+    async fn allowed_command_in_new_process_group_still_completes_normally() {
+        // Regression companion to allowed_command_completes_successfully:
+        // proves `process_group(0)` doesn't change the happy path, and that
+        // the disarmed guard on the completion branch doesn't kill anything
+        // — if it did, this test process (in the same original group up
+        // until the child's own group is formed) would be unaffected either
+        // way, so the real evidence is that `Ran` is still reported with
+        // the right exit code, i.e. nothing raced the completion.
+        let policy = CmdPolicy::default_allowlist().allow(&["/usr/bin/true"]);
+        let t = task(vec![cmd_check("/usr/bin/true", "exit 0")]);
+
+        let outcomes = execute_cmd_checks(&t, &cwd(), &policy).await;
+
+        assert_eq!(
+            outcomes,
+            vec![CmdOutcome::Ran {
+                run: "/usr/bin/true".to_string(),
                 exit_code: 0,
             }]
         );
