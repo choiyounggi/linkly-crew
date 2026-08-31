@@ -17,7 +17,7 @@ use crew_bus::{BusConfig, BusEvent as BusLifecycleEvent, BusHandle, BusServer};
 use crew_harness::{AgentCfg as HarnessAgentCfg, HandoffSnapshot, Harness, HarnessPool, HarnessRegistry};
 use crew_lead::compress::summarize_sprint;
 use crew_lead::dispatch::{LeadBehavior, TaskState};
-use crew_lead::plan::{LeadPlanner, PlanError, SprintSlicer};
+use crew_lead::plan::{LeadPlanner, PlanError, PlanOptions, SprintSlicer};
 use crew_lead::plan_llm::LlmLeadPlanner;
 use crew_ledger::{EventLedger, StoredMessage};
 use crew_proto::{handoff_body, Envelope, HandoffPack, MessageKind, Role, Roster, RosterAgent, SpecDoc, TaskDag};
@@ -490,7 +490,13 @@ impl RunController {
         };
         // present = crew_agents' roles (contracts-m7.md §E4) — the LLM path
         // varies only the SpecDoc, DAG shaping is the same function either way.
-        let dag = LeadPlanner::plan_dag_for(&spec, &present_roles)?;
+        let dag = LeadPlanner::plan_dag_with(
+            &spec,
+            &present_roles,
+            &PlanOptions {
+                dev_cmd_checks: cfg.dev_cmd_checks.clone(),
+            },
+        )?;
         let effective_max = if cfg.max_per_sprint == 0 {
             dag.tasks.len().max(1)
         } else {
@@ -1351,6 +1357,7 @@ mod live_controls_wiring_tests {
             max_per_sprint: 0,
             escalation_timeout_ms: 0,
             roster: None,
+            dev_cmd_checks: Vec::new(),
         }
     }
 
@@ -1359,6 +1366,14 @@ mod live_controls_wiring_tests {
             .unwrap()
             .join(".crew-test")
             .join(format!("{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Default (D5, contracts-m10.md §H1h.3): the existing helper's
+    /// `RunConfig` carries no cmd DoD checks unless a test opts in.
+    #[test]
+    fn scripted_config_default_carries_no_dev_cmd_checks() {
+        let cfg = scripted_config(test_data_dir("scripted-config-default"));
+        assert!(cfg.dev_cmd_checks.is_empty());
     }
 
     /// (a) Wiring: every non-lead role is registered the instant the first

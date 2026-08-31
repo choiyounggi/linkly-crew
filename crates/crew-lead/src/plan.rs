@@ -31,6 +31,24 @@ pub enum PlanError {
     DuplicateRole(Role),
 }
 
+/// A single `cmd` DoD check the planner may attach to a Developer task
+/// (contracts-m10.md §H1b). Not `DodCheck` itself — this narrower type keeps
+/// the injection knob from ever admitting a check other than `Cmd`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmdCheck {
+    pub run: String,
+    pub expect: String,
+}
+
+/// Optional behavior for [`LeadPlanner::plan_dag_with`]. `Default` is
+/// entirely empty, which reproduces `plan_dag_for`'s historical output
+/// (contracts-m10.md §H1b/H1c).
+#[derive(Debug, Clone, Default)]
+pub struct PlanOptions {
+    /// Cmd checks to append after `ReqCover` in the Developer task's `dod`.
+    pub dev_cmd_checks: Vec<CmdCheck>,
+}
+
 /// Turns a one-line request into a [`SpecDoc`] and a 5-role [`TaskDag`].
 pub struct LeadPlanner;
 
@@ -73,13 +91,28 @@ impl LeadPlanner {
         Self::plan_dag_for(spec, &ROLE_ORDER)
     }
 
+    /// `plan_dag_for` with `opts` entirely empty (contracts-m7.md §E1) —
+    /// delegates to [`Self::plan_dag_with`]. Signature and behavior
+    /// unchanged from before `plan_dag_with` existed.
+    pub fn plan_dag_for(spec: &SpecDoc, roles: &[Role]) -> Result<TaskDag, PlanError> {
+        Self::plan_dag_with(spec, roles, &PlanOptions::default())
+    }
+
     /// Builds a task DAG covering exactly `roles` (a non-empty, duplicate-free
     /// subset of the canonical order `[Pm, Designer, Publisher, Developer,
     /// Qa]`), chained in that canonical order regardless of `roles`' input
     /// order: each task depends on the nearest preceding role that is present
     /// (contracts-m7.md §E1). Per-role id/title/brief/dod/artifacts_expected
-    /// are verbatim the same as `plan_dag`'s historical output for that role.
-    pub fn plan_dag_for(spec: &SpecDoc, roles: &[Role]) -> Result<TaskDag, PlanError> {
+    /// are verbatim the same as `plan_dag`'s historical output for that role,
+    /// except the Developer task's `dod`, which additionally gets
+    /// `opts.dev_cmd_checks` appended after `ReqCover` (contracts-m10.md §H1d).
+    /// `opts.dev_cmd_checks` is silently ignored when `roles` has no
+    /// `Role::Developer` — not an error (contracts-m10.md §H1d).
+    pub fn plan_dag_with(
+        spec: &SpecDoc,
+        roles: &[Role],
+        opts: &PlanOptions,
+    ) -> Result<TaskDag, PlanError> {
         if roles.is_empty() {
             return Err(PlanError::EmptyRoles);
         }
@@ -90,7 +123,7 @@ impl LeadPlanner {
         }
 
         let req_ids: Vec<ReqId> = spec.requirements.iter().map(|r| r.id.clone()).collect();
-        let dod = vec![DodCheck::ReqCover {
+        let base_dod = vec![DodCheck::ReqCover {
             ids: req_ids.clone(),
         }];
 
@@ -99,6 +132,16 @@ impl LeadPlanner {
         for role in ROLE_ORDER.iter().copied().filter(|r| roles.contains(r)) {
             let (id, duty, artifact_name, artifact_kind) = role_meta(role);
             let deps = prev_id.clone().into_iter().collect();
+            let dod = if role == Role::Developer {
+                let mut dod = base_dod.clone();
+                dod.extend(opts.dev_cmd_checks.iter().map(|c| DodCheck::Cmd {
+                    run: c.run.clone(),
+                    expect: c.expect.clone(),
+                }));
+                dod
+            } else {
+                base_dod.clone()
+            };
             tasks.push(role_task(
                 id,
                 role,
@@ -353,6 +396,134 @@ mod tests {
         let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
         assert_eq!(
             LeadPlanner::plan_dag_for(&spec, &[Role::Pm, Role::Qa, Role::Pm]),
+            Err(PlanError::DuplicateRole(Role::Pm))
+        );
+    }
+
+    #[test]
+    fn plan_dag_with_default_options_equals_plan_dag_for() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let via_with = LeadPlanner::plan_dag_with(&spec, &ROLE_ORDER, &PlanOptions::default())
+            .unwrap();
+        let via_for = LeadPlanner::plan_dag_for(&spec, &ROLE_ORDER).unwrap();
+        assert_eq!(via_with, via_for);
+    }
+
+    #[test]
+    fn plan_dag_with_appends_dev_cmd_checks_to_developer_dod_in_order() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let opts = PlanOptions {
+            dev_cmd_checks: vec![
+                CmdCheck {
+                    run: "cargo test".to_string(),
+                    expect: "exit 0".to_string(),
+                },
+                CmdCheck {
+                    run: "npm run build".to_string(),
+                    expect: "exit 0".to_string(),
+                },
+            ],
+        };
+        let dag = LeadPlanner::plan_dag_with(&spec, &ROLE_ORDER, &opts).unwrap();
+        let all_req_ids: Vec<ReqId> = spec.requirements.iter().map(|r| r.id.clone()).collect();
+
+        let dev_task = dag.tasks.iter().find(|t| t.role == Role::Developer).unwrap();
+        assert_eq!(
+            dev_task.dod,
+            vec![
+                DodCheck::ReqCover { ids: all_req_ids },
+                DodCheck::Cmd {
+                    run: "cargo test".to_string(),
+                    expect: "exit 0".to_string(),
+                },
+                DodCheck::Cmd {
+                    run: "npm run build".to_string(),
+                    expect: "exit 0".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_dag_with_leaves_non_developer_dod_untouched_by_injected_checks() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let opts = PlanOptions {
+            dev_cmd_checks: vec![CmdCheck {
+                run: "cargo test".to_string(),
+                expect: "exit 0".to_string(),
+            }],
+        };
+        let dag = LeadPlanner::plan_dag_with(&spec, &ROLE_ORDER, &opts).unwrap();
+        let all_req_ids: Vec<ReqId> = spec.requirements.iter().map(|r| r.id.clone()).collect();
+
+        for task in dag.tasks.iter().filter(|t| t.role != Role::Developer) {
+            assert_eq!(
+                task.dod,
+                vec![DodCheck::ReqCover {
+                    ids: all_req_ids.clone()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn plan_dag_with_empty_dev_cmd_checks_matches_default_boundary() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let opts = PlanOptions {
+            dev_cmd_checks: vec![],
+        };
+        let via_empty = LeadPlanner::plan_dag_with(&spec, &ROLE_ORDER, &opts).unwrap();
+        let via_default =
+            LeadPlanner::plan_dag_with(&spec, &ROLE_ORDER, &PlanOptions::default()).unwrap();
+        assert_eq!(via_empty, via_default);
+    }
+
+    #[test]
+    fn plan_dag_with_no_developer_role_silently_drops_dev_cmd_checks_without_error() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let opts = PlanOptions {
+            dev_cmd_checks: vec![CmdCheck {
+                run: "cargo test".to_string(),
+                expect: "exit 0".to_string(),
+            }],
+        };
+        let dag = LeadPlanner::plan_dag_with(&spec, &[Role::Pm, Role::Qa], &opts).unwrap();
+
+        assert_eq!(dag.tasks.len(), 2);
+        for task in &dag.tasks {
+            assert!(
+                !task.dod.iter().any(|c| matches!(c, DodCheck::Cmd { .. })),
+                "no task should carry a Cmd check when Developer is absent from roles"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_dag_with_rejects_empty_roles() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let opts = PlanOptions {
+            dev_cmd_checks: vec![CmdCheck {
+                run: "cargo test".to_string(),
+                expect: "exit 0".to_string(),
+            }],
+        };
+        assert_eq!(
+            LeadPlanner::plan_dag_with(&spec, &[], &opts),
+            Err(PlanError::EmptyRoles)
+        );
+    }
+
+    #[test]
+    fn plan_dag_with_rejects_duplicate_roles() {
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let opts = PlanOptions {
+            dev_cmd_checks: vec![CmdCheck {
+                run: "cargo test".to_string(),
+                expect: "exit 0".to_string(),
+            }],
+        };
+        assert_eq!(
+            LeadPlanner::plan_dag_with(&spec, &[Role::Pm, Role::Pm], &opts),
             Err(PlanError::DuplicateRole(Role::Pm))
         );
     }

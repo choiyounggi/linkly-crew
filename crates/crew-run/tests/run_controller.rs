@@ -41,6 +41,7 @@ fn scripted_config(data_dir: PathBuf, planted_violations: Vec<(Role, Vec<String>
         max_per_sprint: 0,
         escalation_timeout_ms: 0,
         roster: None,
+        dev_cmd_checks: Vec::new(),
     }
 }
 

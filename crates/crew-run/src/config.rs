@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crew_agent::BusError;
 use crew_ledger::LedgerError;
-use crew_lead::plan::PlanError;
+use crew_lead::plan::{CmdCheck, PlanError};
 
 /// One run's configuration (contract §C3, extended by contracts-m5.md
 /// §C5a).
@@ -30,6 +30,39 @@ pub struct RunConfig {
     /// Agent roster (contracts-m5.md §C5a). `None` = the default 6-slot
     /// roster (lead + 5 roles, all `claude-code`/`"default"`).
     pub roster: Option<crew_proto::Roster>,
+    /// `cmd` DoD checks to attach to the Developer task (contracts-m10.md
+    /// §H1g). Empty vector (default) = no emission = the M9-and-earlier
+    /// behavior unchanged.
+    pub dev_cmd_checks: Vec<CmdCheck>,
+}
+
+/// Default Rust-domain dev cmd checks that satisfy `CmdPolicy`'s positional
+/// allowlist (contracts-m9.md §G2c / contracts-m10.md §H1g): the prefix
+/// tokens equal an allowed prefix literally, and every trailing token is a
+/// bare identifier. `cargo test --workspace` is not used here — its trailing
+/// `--workspace` flag fails the bare-identifier rule and would be `Refused`.
+/// Not a default — `RunConfig::dev_cmd_checks`'s shipped default stays empty.
+pub fn default_dev_cmd_checks_rust() -> Vec<CmdCheck> {
+    vec![CmdCheck {
+        run: "cargo test".to_string(),
+        expect: "exit 0".to_string(),
+    }]
+}
+
+/// Default Node-domain dev cmd checks — see [`default_dev_cmd_checks_rust`]
+/// for the allowlist rule they satisfy. Not a default — `RunConfig`'s
+/// shipped default stays empty.
+pub fn default_dev_cmd_checks_node() -> Vec<CmdCheck> {
+    vec![
+        CmdCheck {
+            run: "npm test".to_string(),
+            expect: "exit 0".to_string(),
+        },
+        CmdCheck {
+            run: "npm run build".to_string(),
+            expect: "exit 0".to_string(),
+        },
+    ]
 }
 
 /// How the run's five crew-member workers behave (contract §C3). `Clone`
@@ -94,4 +127,93 @@ pub enum RunError {
     /// `human.response` publish.
     #[error("gate unavailable: {0}")]
     GateUnavailable(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `CmdPolicy::default_allowlist()`'s nine prefixes (contracts-m9.md
+    /// §G2c, `crates/crew-lead/src/cmd_exec.rs`), copied here rather than
+    /// imported — importing `CmdPolicy` would reach into t-pgroup's owned
+    /// file, and D10 keeps the guard's assertion target the *string* rather
+    /// than production code this task must not touch.
+    const ALLOWED_PREFIXES: &[&[&str]] = &[
+        &["cargo", "test"],
+        &["cargo", "build"],
+        &["cargo", "clippy"],
+        &["npm", "test"],
+        &["npm", "run"],
+        &["pnpm", "test"],
+        &["pnpm", "run"],
+        &["yarn", "test"],
+        &["yarn", "run"],
+    ];
+
+    /// `vet`'s trailing-position rule verbatim (contracts-m9.md §G2c r2 F3,
+    /// `crates/crew-lead/src/cmd_exec.rs::is_bare_trailing_token`):
+    /// `^[A-Za-z0-9][A-Za-z0-9._-]*$` and no `..` substring.
+    fn is_bare_trailing_token(tok: &str) -> bool {
+        if tok.contains("..") {
+            return false;
+        }
+        let mut chars = tok.chars();
+        match chars.next() {
+            Some(first) if first.is_ascii_alphanumeric() => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    }
+
+    /// Asserts `run` matches an allowed prefix literally and every trailing
+    /// token is a bare identifier — the same "shape and consequence" the
+    /// production `vet()` decides (guard-shape-vs-consequence), reproduced
+    /// as a local assertion per D10 rather than calling `vet()` itself.
+    fn assert_satisfies_positional_allowlist(run: &str) {
+        let tokens: Vec<&str> = run.split_ascii_whitespace().collect();
+        let matched = ALLOWED_PREFIXES
+            .iter()
+            .find(|p| tokens.len() >= p.len() && tokens[..p.len()] == p[..]);
+        let prefix = matched.unwrap_or_else(|| {
+            panic!("{run:?} does not start with any CmdPolicy::default_allowlist() prefix")
+        });
+        for tok in &tokens[prefix.len()..] {
+            assert!(
+                is_bare_trailing_token(tok),
+                "{run:?}: trailing token {tok:?} is not a bare identifier \
+                 (^[A-Za-z0-9][A-Za-z0-9._-]*$, no \"..\")"
+            );
+        }
+    }
+
+    #[test]
+    fn default_dev_cmd_checks_rust_satisfies_the_positional_allowlist() {
+        let checks = default_dev_cmd_checks_rust();
+        assert!(!checks.is_empty());
+        for c in &checks {
+            assert_satisfies_positional_allowlist(&c.run);
+            assert_eq!(c.expect, "exit 0");
+        }
+    }
+
+    #[test]
+    fn default_dev_cmd_checks_node_satisfies_the_positional_allowlist() {
+        let checks = default_dev_cmd_checks_node();
+        assert!(!checks.is_empty());
+        for c in &checks {
+            assert_satisfies_positional_allowlist(&c.run);
+            assert_eq!(c.expect, "exit 0");
+        }
+    }
+
+    #[test]
+    fn positional_allowlist_helper_rejects_a_trailing_flag_as_a_negative_control() {
+        // Negative control (testing-quality-tests-that-cannot-fail): proves
+        // assert_satisfies_positional_allowlist can actually fail, guarding
+        // against a helper that accepts everything.
+        let result = std::panic::catch_unwind(|| {
+            assert_satisfies_positional_allowlist("cargo test --workspace")
+        });
+        assert!(result.is_err(), "a trailing flag must be refused");
+    }
 }
