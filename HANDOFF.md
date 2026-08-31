@@ -296,10 +296,8 @@ opencode 실 어댑터는 PiHarness로 대체됨(스텁 존치, DESIGN §2.3) �
 
 **재사용 계약**: M3(archive-20260827-m3a/contracts-m3.md) + M4(archive-20260828-m4a/
 contracts-m4.md) + M5(archive-20260829-m5a/contracts-m5.md) + M6(archive-20260829-m6a/
-contracts-m6.md 예정, 현재 .orchestration/contracts-m6.md) + M7(archive-20260830-m7a/
-contracts-m7.md 예정, 현재 .orchestration/contracts-m7.md) + M8(archive-20260831-m8a/
-contracts-m8.md 예정, 현재 .orchestration/contracts-m8.md) + **M9(archive-20260901-m9a/
-contracts-m9.md 예정, 현재 .orchestration/contracts-m9.md)** — RunEvent 3종, TaskStateDto
+contracts-m6.md) + M7(archive-20260830-m7a/contracts-m7.md) + M8(archive-20260831-m8a/
+contracts-m8.md) + **M9(archive-20260831-m9a/contracts-m9.md)** — RunEvent 3종, TaskStateDto
 "blocked", HandoffPack/Roster, HarnessRegistry/HarnessPool, LlmLeadPlanner,
 `RunHandle::swap_harness`(즉시 실효 + 경계 폴백), `AgentControl`/`on_control`,
 `features/dag`/`features/timeline`, Tauri 커맨드 5종, 로스터 패널/동적 배지/이니셜 맵,
