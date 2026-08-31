@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use crew_harness::claude::ClaudeCodeHarness;
-use crew_harness::{AgentCfg, Harness, TurnOutcome, UserTurn};
+use crew_harness::{AgentCfg, Harness, HarnessEvent, TurnOutcome, UserTurn};
 
 fn agent_cfg() -> AgentCfg {
     AgentCfg {
@@ -87,4 +87,41 @@ async fn three_consecutive_turns_then_resume() {
     assert_eq!(outcome, TurnOutcome::Success, "resumed turn should succeed");
 
     harness.shutdown(resumed).await.expect("shutdown");
+}
+
+/// Trap 8 real-CLI smoke — coordinator-manual only, workers must not run it
+/// (trap 19):
+///   cargo test -p crew-harness --test real_claude -- --ignored --nocapture \
+///     spawned_session_fires_no_user_global_hooks
+/// Precondition: `claude` >= 2.1.236, and the user-global
+/// `~/.claude/settings.json` has at least one hook configured.
+/// Assertion: the spawned session's stream-json carries zero
+/// `hook_started` events (D9) — the default `--setting-sources
+/// project,local` (ClaudeCodeHarness::new) keeps the user-global source,
+/// and therefore its hooks, out of the child.
+#[tokio::test]
+#[ignore]
+async fn spawned_session_fires_no_user_global_hooks() {
+    let harness = ClaudeCodeHarness::new();
+    let cfg = agent_cfg();
+
+    let mut session = harness.spawn(&cfg).await.expect("spawn claude should succeed");
+    let mut events = harness.take_events(&mut session);
+
+    // Hooks fire at SessionStart, before any turn is sent, so draining here
+    // (before `send`) already observes everything they would produce.
+    let mut hook_started_count = 0usize;
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(3), events.recv()).await {
+        if let HarnessEvent::Raw(value) = &event {
+            if value.get("subtype").and_then(|s| s.as_str()) == Some("hook_started") {
+                hook_started_count += 1;
+            }
+        }
+    }
+    assert_eq!(
+        hook_started_count, 0,
+        "spawned session must fire no user-global hooks"
+    );
+
+    harness.shutdown(session).await.expect("shutdown");
 }
