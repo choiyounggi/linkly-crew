@@ -277,3 +277,53 @@ async fn real_cli_three_person_team_completes_one_sprint() {
     handle.shutdown().await;
     cleanup(&data_dir);
 }
+
+/// t-wire plan D10: spot-checks that `spawn_sprint`'s now-unconditional
+/// `LeadBehavior::with_cmd_exec(...)` chain (contracts-m9.md §G3, wired at
+/// `controller.rs:325`) does not regress or hang a real-CLI run — the
+/// `role_cli_cwd` closure must resolve and create each role's cwd without
+/// error even though `LeadPlanner`'s DAG never emits a `DodCheck::Cmd`
+/// (`plan.rs` only emits `ReqCover`), so this run exercises the wiring path
+/// with an always-empty `execute_cmd_checks` result, same shape as
+/// `real_cli_three_person_team_completes_one_sprint`.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn real_cli_three_person_team_completes_one_sprint_with_cmd_exec_wired() {
+    let data_dir = test_data_dir("roster-3person-real-cli-cmd-wired");
+    let cfg = RunConfig {
+        goal: GOAL.to_string(),
+        mode: RunMode::RealCli,
+        data_dir: data_dir.clone(),
+        max_rework: AcceptanceLoop::default_budget(),
+        max_per_sprint: 0,
+        escalation_timeout_ms: 0,
+        roster: Some(three_person_roster()),
+    };
+
+    let real_start_timeout = Duration::from_secs(300);
+    let real_join_timeout = Duration::from_secs(1800);
+
+    let mut handle = tokio::time::timeout(real_start_timeout, RunController::start(cfg))
+        .await
+        .expect("real-CLI start must finish within the budget")
+        .expect("real-CLI start must succeed with Cmd-exec wiring in place");
+
+    tokio::time::timeout(real_join_timeout, handle.join())
+        .await
+        .expect("real-CLI run must finish within the budget")
+        .expect("the run must complete its single sprint with Cmd-exec wiring in place");
+
+    let snap = handle.snapshot();
+    assert_eq!(snap.sprint.len(), 2, "the 3-person roster's DAG must have exactly the dev/qa tasks");
+    assert!(
+        data_dir.join("cli-cwd").join("developer").is_dir(),
+        "role_cli_cwd must have created the developer's cwd"
+    );
+    assert!(
+        data_dir.join("cli-cwd").join("qa").is_dir(),
+        "role_cli_cwd must have created the qa's cwd"
+    );
+
+    handle.shutdown().await;
+    cleanup(&data_dir);
+}
