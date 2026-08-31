@@ -19,6 +19,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use crew_proto::{DodCheck, TaskSpec};
+#[cfg(unix)]
+use tokio::process::Child;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -210,10 +212,13 @@ pub async fn execute_cmd_checks(
                 }
             }
             Ok(Err(e)) => {
+                // `child.wait()` itself errored: exit status is unknown, so
+                // this is not a completion — treat it like a runaway and
+                // clean up rather than disarm (r1 F1: disarming here left
+                // unix with no cleanup path at all, since this diff also
+                // moved `kill_on_drop(true)` under `cfg(not(unix))`).
                 #[cfg(unix)]
-                if let Some(guard) = group_guard.as_mut() {
-                    guard.disarm();
-                }
+                cleanup_unknown_state(group_guard.as_mut(), &mut child).await;
                 outcomes.push(CmdOutcome::SpawnFailed {
                     run: run.clone(),
                     error: e.to_string(),
@@ -293,6 +298,24 @@ impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         if self.armed {
             self.kill_group();
+        }
+    }
+}
+
+/// Cleans up after `child.wait()` itself returns an I/O error — the exit
+/// status is unknown, so this is not a completion. Kill the group if there
+/// is one, or fall back to killing just the direct child. Pulled out of
+/// `execute_cmd_checks` (r1 F1) so the policy can be pinned by a test: the
+/// test suite has no reliable way to force `Child::wait` itself to error.
+#[cfg(unix)]
+async fn cleanup_unknown_state(guard: Option<&mut ProcessGroupGuard>, child: &mut Child) {
+    match guard {
+        Some(guard) => {
+            guard.kill_group();
+            guard.disarm();
+        }
+        None => {
+            let _ = child.kill().await;
         }
     }
 }
@@ -614,6 +637,27 @@ mod tests {
         }
     }
 
+    /// Polls `libc::kill(pid, 0)` until it reports `ESRCH` or `budget`
+    /// elapses. A signal delivery is not synchronous with the `kill(2)`
+    /// syscall returning — checking aliveness in the same instant a
+    /// `killpg` was issued, with no intervening await, races the kernel.
+    #[cfg(unix)]
+    async fn wait_until_dead(pid: i32, budget: Duration) -> bool {
+        let step = Duration::from_millis(10);
+        let mut waited = Duration::ZERO;
+        loop {
+            let alive = unsafe { libc::kill(pid, 0) };
+            if alive == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            if waited >= budget {
+                return false;
+            }
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn timed_out_command_kills_grandchild_process() {
@@ -649,9 +693,13 @@ mod tests {
             .expect("scratch path is utf8")
             .to_string();
 
+        // A generous window: under concurrent test-thread load, forking the
+        // shell and backgrounding+recording its own grandchild can take
+        // longer than a tight timeout would allow, and the group-kill must
+        // not fire before the script finishes writing its pid file.
         let policy = CmdPolicy::default_allowlist()
             .allow(&[script_abs.as_str()])
-            .with_timeout(Duration::from_millis(500));
+            .with_timeout(Duration::from_millis(1500));
         let t = task(vec![cmd_check(&script_abs, "exit 0")]);
 
         let outcomes = execute_cmd_checks(&t, &cwd(), &policy).await;
@@ -687,6 +735,101 @@ mod tests {
             probe_err.raw_os_error(),
             Some(libc::ESRCH),
             "expected ESRCH (no such process) for grandchild {grandchild_pid}, got {probe_err}"
+        );
+    }
+
+    // --- cleanup_unknown_state: the wait()-errored branch (r1 F1) ---
+    //
+    // `child.wait()` returning `Err` is not something the test suite can
+    // provoke reliably (it would require corrupting the process table out
+    // from under tokio). Instead these pin the extracted cleanup policy
+    // directly: with a guard, the whole group dies; without one, the
+    // fallback still kills the direct child.
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_unknown_state_kills_the_whole_group_when_a_guard_exists() {
+        let dir = cwd()
+            .join("target")
+            .join(format!("m10-cleanup-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test scratch dir");
+        let mut cleanup = TestCleanup {
+            dir: dir.clone(),
+            grandchild_pid: None,
+        };
+
+        let script_path = dir.join("spawner.sh");
+        let pid_file = dir.join("grandchild.pid");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nsleep 300 &\nGCPID=$!\necho \"$GCPID\" > \"{}\"\nsync\nsleep 300\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write spawner script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat spawner script")
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&script_path, perms).expect("chmod spawner script");
+        }
+
+        let mut cmd = Command::new(&script_path);
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn spawner script");
+        let mut guard = child
+            .id()
+            .and_then(ProcessGroupGuard::new)
+            .expect("live child has a non-zero id, so a guard must build");
+
+        let pid_contents = wait_for_nonempty_file(&pid_file, Duration::from_secs(2))
+            .await
+            .expect("grandchild pid file was never written by the spawner script");
+        let grandchild_pid: i32 = pid_contents
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("grandchild pid file {pid_contents:?} did not parse: {e}"));
+        cleanup.grandchild_pid = Some(grandchild_pid);
+
+        cleanup_unknown_state(Some(&mut guard), &mut child).await;
+
+        assert!(
+            wait_until_dead(grandchild_pid, Duration::from_secs(2)).await,
+            "expected grandchild pid {grandchild_pid} to be dead after cleanup_unknown_state, \
+             but it was still alive after waiting"
+        );
+
+        let _ = child.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_unknown_state_falls_back_to_killing_the_child_without_a_guard() {
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("300");
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        let mut child = cmd.spawn().expect("spawn /bin/sleep");
+        let pid = child.id().expect("live child has a pid") as i32;
+
+        cleanup_unknown_state(None, &mut child).await;
+
+        let alive = unsafe { libc::kill(pid, 0) };
+        let probe_err = std::io::Error::last_os_error();
+        assert_eq!(
+            alive, -1,
+            "expected child pid {pid} to be dead after the no-guard fallback, \
+             but kill(pid, 0) returned {alive} (still alive)"
+        );
+        assert_eq!(
+            probe_err.raw_os_error(),
+            Some(libc::ESRCH),
+            "expected ESRCH (no such process) for pid {pid}, got {probe_err}"
         );
     }
 
