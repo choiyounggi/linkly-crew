@@ -57,6 +57,7 @@ fn config(data_dir: PathBuf, roster: Option<Roster>, dev_cmd_checks: Vec<CmdChec
         escalation_timeout_ms: 0,
         roster,
         dev_cmd_checks,
+        project_root: None,
     }
 }
 
