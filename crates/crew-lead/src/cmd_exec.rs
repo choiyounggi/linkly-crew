@@ -6,9 +6,13 @@
 //! — `Lead::handle_task_result` (`dispatch.rs:295`) — is a synchronous pure
 //! state machine that must not become async.
 //!
-//! Safety boundary (contracts-m9.md §G2c): no shell, argv exec only, and the
-//! command text is vetted against a positive character allowlist plus a command
-//! prefix allowlist — never a metacharacter blocklist.
+//! Safety boundary (contracts-m9.md §G2c, hardened by review r2 F3): no
+//! shell, argv exec only, and the command text is vetted positionally — the
+//! prefix tokens must equal a configured command literally, and every token
+//! after the prefix must be a bare identifier (no flags, no paths) — never a
+//! metacharacter blocklist. A prefix-only check (no trailing-token rule) lets
+//! a flag like `--manifest-path=<outside the repo>` escape the cwd sandbox
+//! while still exiting 0, which is exactly the RCE r2 F3 reproduced.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -90,21 +94,47 @@ fn vet(run: &str, policy: &CmdPolicy) -> Result<Vec<String>, String> {
     if tokens.is_empty() {
         return Err("empty command".to_string());
     }
-    for tok in &tokens {
-        if !tok
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._/@:=+-".contains(c))
-        {
-            return Err(format!("token {tok:?} outside the allowed character set"));
+
+    // Positional allowlist (contracts-m9.md §G2c + coordinator decision, r2
+    // F3): the prefix position is a literal-equality match against a known
+    // command, so it needs no separate character check. Everything after the
+    // prefix is a bare identifier only — no flags, no paths — closing the
+    // flag-injection sandbox escape a prefix-only check left open
+    // (`--manifest-path=...`, `--prefix=...`, etc).
+    let matched_prefix = policy
+        .allowed_prefixes
+        .iter()
+        .find(|prefix| tokens.len() >= prefix.len() && tokens[..prefix.len()] == prefix[..]);
+
+    let Some(prefix) = matched_prefix else {
+        return Err(format!("{tokens:?} matches no allowed prefix"));
+    };
+
+    for tok in &tokens[prefix.len()..] {
+        if !is_bare_trailing_token(tok) {
+            return Err(format!(
+                "trailing argument {tok:?} is not a bare identifier"
+            ));
         }
     }
-    let matches_prefix = policy.allowed_prefixes.iter().any(|prefix| {
-        tokens.len() >= prefix.len() && tokens[..prefix.len()] == prefix[..]
-    });
-    if !matches_prefix {
-        return Err(format!("{tokens:?} matches no allowed prefix"));
-    }
+
     Ok(tokens)
+}
+
+/// Trailing-position rule (r2 F3): `^[A-Za-z0-9][A-Za-z0-9._-]*$` and no `..`
+/// substring. Positive rule, not a blocklist — it happens to exclude every
+/// flag (`-`-leading), absolute path (`/`-leading), relative path
+/// (`.`-leading), and `=`/`:`/`@`/`+`-bearing token, which is the point.
+fn is_bare_trailing_token(tok: &str) -> bool {
+    if tok.contains("..") {
+        return false;
+    }
+    let mut chars = tok.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
 /// Runs every `DodCheck::Cmd` in `task.dod` that the policy permits and whose
@@ -346,5 +376,102 @@ mod tests {
         let outcomes = execute_cmd_checks(&t, &cwd(), &policy).await;
 
         assert!(outcomes.is_empty());
+    }
+
+    // --- vet(): trailing-token positional allowlist (review r2 F3) ---
+    //
+    // These call `vet` directly rather than going through
+    // `execute_cmd_checks`: the whole point is to prove the *rejection*
+    // happens before any process would spawn, and running a real `cargo`/
+    // `npm` invocation from inside this crate's own test suite would be
+    // both slow and, for the accepted case, actually execute the flag the
+    // rule exists to keep out.
+
+    #[test]
+    fn vet_refuses_flag_injection_via_equals_syntax() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = vet("cargo test --manifest-path=../../evil/Cargo.toml", &policy);
+
+        match result {
+            Err(reason) => assert!(
+                reason.contains("trailing argument"),
+                "reason should mention the trailing argument, got: {reason}"
+            ),
+            Ok(argv) => panic!("expected Refused, got Ok({argv:?})"),
+        }
+    }
+
+    #[test]
+    fn vet_refuses_prefix_flag_injection() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = vet("npm run build --prefix=/tmp/evil", &policy);
+
+        assert!(result.is_err(), "expected Refused, got {result:?}");
+    }
+
+    #[test]
+    fn vet_refuses_bare_flag_with_no_value() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = vet("cargo test --workspace", &policy);
+
+        assert!(result.is_err(), "expected Refused, got {result:?}");
+    }
+
+    #[test]
+    fn vet_refuses_trailing_relative_path() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = vet("cargo test ../../evil", &policy);
+
+        assert!(result.is_err(), "expected Refused, got {result:?}");
+    }
+
+    #[test]
+    fn vet_refuses_trailing_absolute_path() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = vet("cargo test /abs/path", &policy);
+
+        assert!(result.is_err(), "expected Refused, got {result:?}");
+    }
+
+    #[test]
+    fn vet_accepts_bare_trailing_identifier() {
+        // Non-regression guard (r2's required last row): the trailing-token
+        // rule must not over-reject an ordinary bare-word argument.
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = vet("npm run build", &policy);
+
+        assert_eq!(
+            result,
+            Ok(vec![
+                "npm".to_string(),
+                "run".to_string(),
+                "build".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_prefix_with_bare_trailing_argument_still_executes() {
+        // End-to-end companion to vet_accepts_bare_trailing_identifier:
+        // proves the positional split doesn't just parse correctly but
+        // still lets a legitimate trailing argument reach the child.
+        let policy = CmdPolicy::default_allowlist().allow(&["/bin/echo"]);
+        let t = task(vec![cmd_check("/bin/echo hello", "exit 0")]);
+
+        let outcomes = execute_cmd_checks(&t, &cwd(), &policy).await;
+
+        assert_eq!(
+            outcomes,
+            vec![CmdOutcome::Ran {
+                run: "/bin/echo hello".to_string(),
+                exit_code: 0,
+            }]
+        );
     }
 }
