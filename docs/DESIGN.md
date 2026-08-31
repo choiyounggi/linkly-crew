@@ -239,9 +239,17 @@ Lead는 `task.result`를 받으면 위 예시의 `kind:"cmd"` 체크를 셸을 �
 - **허용목록**: `cargo test`/`cargo build`/`cargo clippy`/`npm test`/`npm run`/`pnpm test`/
   `pnpm run`/`yarn test`/`yarn run` 9개 프리픽스만 허용(`CmdPolicy::default_allowlist`).
   프리픽스에 없으면 `Refused`.
-- **문자 허용목록**: 토큰마다 영숫자 + `._/@:=+-`만 허용 — 메타문자 블록리스트가 아니라
-  화이트리스트라 `&&`/`;`/`|` 등은 프리픽스 매칭 이전에 이미 거부된다. `tokio::process::
-  Command`로 argv를 그대로 넘기며 셸을 전혀 거치지 않는다.
+- **위치별 허용목록** (`vet()`, r2 F3로 경화): 프리픽스 위치 토큰은 설정된 명령과의
+  **리터럴 동등 비교**(별도 문자집합 검사 없음), 프리픽스 **뒤**의 모든 토큰은
+  `is_bare_trailing_token` — 첫 글자가 영숫자이고 나머지는 `[A-Za-z0-9._-]`만, `..`
+  부분문자열 금지. 메타문자 블록리스트가 아니라 양성 규칙이라는 점은 유지되지만, 위치마다
+  다른 규칙이다. 귀결: 플래그(`-`로 시작)·절대경로(`/`로 시작)·상대경로(`.`로 시작)·
+  `=`/`:`/`@`/`+`를 포함한 토큰은 트레일링 위치에서 **전부 거부**된다 — `npm run build`의
+  `build`처럼 맨 식별자만 트레일링으로 허용된다. `tokio::process::Command`로 argv를 그대로
+  넘기며 셸을 전혀 거치지 않는다.
+- `cargo test --workspace`처럼 정당해 보이는 명령도 **거부된다**(`--workspace`가 트레일링
+  플래그라서) — 이 거부는 조용한 통과가 아니라 `failed_cmds`에 남는 **보이는 실패**다. DoD를
+  쓸 때 이 제약을 감안해야 한다.
 - **`expect`는 `"exit <N>"` 형식만 인식**한다(`parse_expect`). 그 외 문자열(예: 위 예시의
   `browser` 체크처럼 자연어)은 체크가 아예 실행되지 않고 `skipped`로만 기록된다.
 - **타임아웃 기본 120초**(`CmdPolicy::default_allowlist().timeout`), 초과 시 자식

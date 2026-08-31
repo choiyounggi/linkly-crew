@@ -225,11 +225,17 @@
   (구독 OAuth 유지) A/B 동일, 부수 효과로 프리앰블 24,667→9,998 토큰(-14,669, 함정 2 완화).
   프로덕션 형상(`--session-id` + stream-json stdin) 조합에서도 훅 0건 확인.
 - t-cmd: `crates/crew-lead/src/cmd_exec.rs` 신규 — `CmdPolicy::default_allowlist()`(프리픽스
-  9종, 타임아웃 120s), 문자 화이트리스트(셸 미경유, `tokio::process::Command` argv 직접
-  실행), `parse_expect`(`"exit <N>"`만 인식). `dod_exec::judge`가 `judge/3`으로 확장되어
-  `DodVerdict.failed_cmds` 추가. `accept.rs`도 함께 수정됨(계약 밖 추가) —
+  9종, 타임아웃 120s), 위치별 허용목록(셸 미경유, `tokio::process::Command` argv 직접
+  실행 — 프리픽스 토큰은 리터럴 동등 비교, 프리픽스 뒤 모든 토큰은 `is_bare_trailing_token`
+  으로 영숫자 시작 + `[A-Za-z0-9._-]`만 + `..` 금지, 그 결과 플래그·절대/상대경로는 트레일링
+  위치에서 전부 거부), `parse_expect`(`"exit <N>"`만 인식). `dod_exec::judge`가 `judge/3`으로
+  확장되어 `DodVerdict.failed_cmds` 추가. `accept.rs`도 함께 수정됨(계약 밖 추가) —
   `AcceptanceLoop::decide`가 `failed_cmds`를 `Rework.violations`에 체이닝(리뷰 t-cmd-r1 F1
   회귀 방지 — Cmd 체크 단독 실패도 진단 없이 빈 violations로 돌아가지 않는다).
+- **r2 보안 수정** (`ff9636a`, Phase 5 통합 리뷰 발견): 초기 구현은 프리픽스만 검사했다 —
+  `cargo test --manifest-path=<레포 밖>`이 `vet()`을 통과해 cwd 샌드박스를 벗어나 임의
+  `build.rs`를 실행하면서도 exit 0으로 DoD를 통과시켰다. 위 위치별 허용목록(트레일링 토큰의
+  `is_bare_trailing_token` 규칙)이 이 플래그 인젝션 경로를 닫은 것 — §5 함정 27 참고.
 - t-wire: `LeadBehavior::with_cmd_exec`/`with_cmd_policy`가 `crew-run`
   `controller.rs`의 `spawn_sprint`에서 무조건 배선됨(`role_cli_cwd(data_dir, role)` 클로저로
   실행 cwd 주입). `resolve_task_result`를 `handle_task_result`에서 분리(동기 유지) —
@@ -241,8 +247,9 @@
   `RunConfig`에도 DAG 직접 주입 필드가 없다 — scripted/LLM 두 경로 모두
   `controller.rs:493`에서 같은 `plan_dag_for`를 호출한다. 즉 **현재 어떤 코드 경로도
   `DodCheck::Cmd`를 만들지 않는다** — §4 잔여 1번 참고.
-- 결정론: `cargo test --workspace` rc=0, **350 passed, 0 failed, 9 ignored**(직접 실행,
-  `--ignored` 미실행 — 함정 19).
+- 결정론: `cargo test --workspace` rc=0, **357 passed, 0 failed, 9 ignored**(직접 실행,
+  `--ignored` 미실행 — 함정 19; r2 보안 수정으로 `cmd_exec.rs` 테스트가 7개 늘어
+  350→357).
 
 **미검증**:
 - GUI에서 scripted=false 클릭 실행(네이티브 창 — 사람 1클릭 필요; 실 CLI 경로 자체는 위
@@ -410,3 +417,11 @@ execute_cmd_checks}`, `dod_exec::judge/3`·`DodVerdict::failed_cmds`,
     타임아웃되면 손자 프로세스가 남을 수 있고, 이들이 `target/` 락을 쥐면 같은 런의 다음
     `cargo build` 체크도 연쇄 타임아웃될 수 있다. M9 의도적 스코프 아웃(리뷰 t-cmd-r1
     N1에서 "stands"로 수용) — 프로세스 그룹(setsid + 그룹 kill) 도입은 후속 과제.
+27. **명령 허용목록에서 프리픽스만 검사하면 플래그 인젝션으로 뚫린다** (Phase 5 통합 리뷰
+    실측, m9a — `crates/crew-lead/src/cmd_exec.rs` `vet()`, t-cmd r2 `ff9636a`로 수정):
+    초기 구현은 `["cargo","test"]` 같은 프리픽스만 리터럴 비교하고 그 뒤 토큰은 검사하지
+    않았다 — `cargo test --manifest-path=<레포 밖>`이 그대로 통과해 cwd 샌드박스를 벗어난
+    임의 `build.rs`를 실행하면서도 exit 0으로 DoD를 통과시켰다. 수정: 프리픽스 뒤 모든
+    토큰에 `is_bare_trailing_token`(영숫자 시작 + `[A-Za-z0-9._-]`만 + `..` 금지)을 적용해
+    플래그(`-`)·절대/상대경로(`/`·`.`)를 전부 거부. **새 프리픽스를 추가할 때마다 그 명령의
+    플래그가 cwd/manifest/config를 바꿀 수 있는지 확인할 것.**
