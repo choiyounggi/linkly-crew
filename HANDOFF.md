@@ -300,7 +300,7 @@ Cmd DoD 플래너 방출 + 타임아웃 프로세스 그룹 kill) — 다음은 
 - **M11 결정 — 해소 아님**: 함정 29(`npm|yarn|pnpm run` 간접 실행이 허용목록을 무력화)는
   이 마일스톤으로 닫히지 않았다. `--ignore-scripts`가 이 경로를 막는지 실측했으나
   막지 못했다(`docs/SPIKE-M11.md` §1, 4/4 rc=0). §5 함정 29 참고.
-- M11 계약 정본: `.orchestration/contracts-m11.md` §I5·§I6·§I7·§I8.
+- M11 계약 정본: `archive-20260831-m11a/contracts-m11.md` §I5·§I6·§I7·§I8.
 
 **미검증**:
 - GUI에서 scripted=false 클릭 실행(네이티브 창 — 사람 1클릭 필요; 실 CLI 경로 자체는 위
@@ -388,7 +388,7 @@ execute_cmd_checks}`, `dod_exec::judge/3`·`DodVerdict::failed_cmds`,
 PlanOptions}`, `LeadPlanner::plan_dag_with`, `RunConfig.dev_cmd_checks`,
 `crew_run::{default_dev_cmd_checks_rust, default_dev_cmd_checks_node}`, `cmd_exec`의
 프로세스 그룹 종료(`process_group(0)`/`ProcessGroupGuard`/`killpg`, 타임아웃·드롭
-양쪽) + **M11(`.orchestration/contracts-m11.md` §I5·§I6·§I7·§I8)** — 신규 공개 API 2건:
+양쪽) + **M11(`archive-20260831-m11a/contracts-m11.md` §I5·§I6·§I7·§I8)** — 신규 공개 API 2건:
 `RunConfig.project_root`(`Option<PathBuf>`, 기본 `None`, `RunError::ProjectRootInvalid`로
 선행 검증), `crew_lead::cmd_exec::CmdPolicy::vet_run(&str) -> Result<(), String>`.
 재발명 금지.
