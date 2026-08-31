@@ -63,6 +63,13 @@ impl CmdPolicy {
             .push(prefix.iter().map(|s| s.to_string()).collect());
         self
     }
+
+    /// The single production judge for whether a `DodCheck::Cmd` `run` string
+    /// is permitted, exposed so callers/tests assert against the real policy
+    /// instead of a copy (HANDOFF §4 잔여 5).
+    pub fn vet_run(&self, run: &str) -> Result<(), String> {
+        vet(run, self).map(|_| ())
+    }
 }
 
 /// Outcome of one attempted `DodCheck::Cmd`.
@@ -565,6 +572,102 @@ mod tests {
                 "build".to_string(),
             ])
         );
+    }
+
+    // --- vet_run(): public façade over vet() (contracts-m11.md §I4) ---
+    //
+    // `vet_run` is the seam other crates/tests call instead of duplicating
+    // the allowlist rules (HANDOFF §4 잔여 5). These assert the same
+    // judgments as the `vet()` tests above, through the public entry point,
+    // plus one explicit equivalence check that the façade does not change
+    // the underlying verdict.
+
+    #[test]
+    fn vet_run_accepts_allowed_prefix() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = policy.vet_run("cargo test");
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn vet_run_accepts_bare_trailing_identifier() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = policy.vet_run("npm run build");
+
+        assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn vet_run_refuses_trailing_flag() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = policy.vet_run("cargo test --workspace");
+
+        match result {
+            Err(reason) => assert!(
+                reason.contains("--workspace"),
+                "reason should mention the rejected token, got: {reason}"
+            ),
+            Ok(()) => panic!("expected Refused for a trailing flag"),
+        }
+    }
+
+    #[test]
+    fn vet_run_refuses_unmatched_prefix() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = policy.vet_run("rm -rf /");
+
+        match result {
+            Err(reason) => assert!(
+                reason.contains("no allowed prefix"),
+                "reason should convey the prefix mismatch, got: {reason}"
+            ),
+            Ok(()) => panic!("expected Refused for an unmatched prefix"),
+        }
+    }
+
+    #[test]
+    fn vet_run_refuses_empty_string() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = policy.vet_run("");
+
+        assert_eq!(result, Err("empty command".to_string()));
+    }
+
+    #[test]
+    fn vet_run_refuses_whitespace_only() {
+        let policy = CmdPolicy::default_allowlist();
+
+        let result = policy.vet_run("   ");
+
+        assert_eq!(result, Err("empty command".to_string()));
+    }
+
+    #[test]
+    fn vet_run_agrees_with_vet_judgment() {
+        let policy = CmdPolicy::default_allowlist();
+        let inputs = [
+            "cargo test",
+            "npm run build",
+            "cargo test --workspace",
+            "rm -rf /",
+            "",
+            "   ",
+        ];
+
+        for input in inputs {
+            let vet_run_ok = policy.vet_run(input).is_ok();
+            let vet_ok = vet(input, &policy).is_ok();
+            assert_eq!(
+                vet_run_ok, vet_ok,
+                "vet_run and vet disagreed on {input:?}: vet_run.is_ok()={vet_run_ok}, vet.is_ok()={vet_ok}"
+            );
+        }
     }
 
     #[tokio::test]
