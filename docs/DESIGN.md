@@ -262,8 +262,10 @@ Lead는 `task.result`를 받으면 위 예시의 `kind:"cmd"` 체크를 셸을 �
   범위 안에서는 영향 없음). 근거: `docs/SPIKE-M10.md` §2 A/B 표(FIX ON: exit `0`·잔존
   프로세스 **0개** / FIX OFF: exit `101`·잔존 **1개**, 기록된 손자는 타임아웃 후에도
   `kill(pid,0)`이 생존을 반환).
-- **실행 cwd**는 해당 태스크 역할의 CLI 세션과 같은 디렉토리(`crew-run`의
-  `role_cli_cwd(data_dir, role)`) — Lead 자신의 cwd가 아니다.
+- **실행 cwd** (M11 갱신, `crew-run`의 `role_cli_cwd(project_root, data_dir, role)`):
+  `project_root: Some(root)`이면 해당 태스크 역할의 CLI 세션 cwd와 Cmd DoD 실행 cwd가
+  **둘 다 `root`** — Lead 자신의 cwd가 아니다. `project_root: None`(기본)이면 M10까지의
+  동작 그대로 스크래치 `<data_dir>/cli-cwd/<role>`.
 - `kind:"browser"`는 **M10에서도 아직 미실행**이다 — 항상 `skipped`로만 기록된다(스코프
   아웃).
 - 실행 결과 중 하나라도 `Refused`/`TimedOut`/`SpawnFailed`이거나 exit code가 `expect`와
@@ -275,17 +277,36 @@ Lead는 `task.result`를 받으면 위 예시의 `kind:"cmd"` 체크를 셸을 �
   `plan_dag_for`/`plan_dag`는 `PlanOptions::default()`로 위임하는 래퍼라 **기존 출력
   무변경**이다. 호출부 경로는 `RunConfig.dev_cmd_checks` → `crew-run/src/controller.rs`의
   `plan_dag_with` 호출(HANDOFF §3 M10). **기본값은 빈 벡터 = 방출 없음** — 이유는 아래.
-- **기본값이 OFF인 이유**: 실행 cwd(`crew-run`의 `role_cli_cwd(data_dir, role)`)의 어떤
-  상위에도 프로젝트 매니페스트(`Cargo.toml`)가 없다(`docs/SPIKE-M10.md` §3). 그 모양의
-  디렉토리에서 `cargo test`를 돌리면 `` could not find `Cargo.toml` in `.../cli-cwd/developer`
-  or any parent directory ``로 exit `101`이 나고, `expect "exit 0"`과 불일치해
-  `DodVerdict.failed_cmds`에 쌓여 리워크 루프로 간다. 노브가 쓸모 있어지려면 먼저
-  "에이전트 작업 cwd = 실제 프로젝트 루트"가 성립해야 한다 — 후속 마일스톤 과제
-  (HANDOFF §4 잔여 4번).
+- **기본값이 OFF인 이유** (M11 갱신 — A/B 실측으로 대체, `docs/SPIKE-M11.md` §2):
+  `project_root: None`일 때의 실행 cwd 모양 `<data_dir>/cli-cwd/<role>`의 어떤 상위에도
+  프로젝트 매니페스트(`Cargo.toml`)가 없다. 그 모양의 디렉토리에서 `cargo test`를 돌리면
+  `` could not find `Cargo.toml` in `.../cli-cwd/developer` or any parent directory ``로
+  exit `101`이 나고(A), `expect "exit 0"`과 불일치해 `DodVerdict.failed_cmds`에 쌓여
+  리워크 루프로 간다. `project_root: Some(<레포 루트>)`로 실행 cwd를 레포 루트로 바꾸면(B)
+  같은 `cargo test`가 exit `0`으로 끝난다(실측: `test result:` 합산 394 passed / 0 failed /
+  9 ignored, `docs/SPIKE-M11.md` §2). **`dev_cmd_checks` 노브를 켜려면 `project_root` 지정이
+  선행 조건이다** — M10까지는 이 조건이 성립하지 않아 기본 OFF였고, M11이 `project_root`를
+  도입해 조건을 채웠다. 단, 이것이 함정 29를 닫지는 않는다(아래 신뢰 경계 문단, HANDOFF §5
+  함정 29).
 - **기본 상수**: `crew_run::default_dev_cmd_checks_rust()`/`_node()`가 위치별 허용목록
   (§5 함정 27)을 통과하는 문자열(`cargo test` / `npm test`·`npm run build`)을 제공한다.
   이는 **기본값이 아니라 호출부가 골라 쓰는 상수**다 — `RunConfig.dev_cmd_checks`의 실제
   기본값은 여전히 빈 벡터.
+
+**신뢰 경계 (M11 신설, contracts-m11.md §I6)**: `cmd` DoD는 설계상 **에이전트 산출물의 코드
+실행**이다 — Developer 에이전트가 실행 트리에 쓴 파일(빌드 스크립트, `package.json` 등)을
+Lead가 그대로 실행해 판정한다. 이 실행을 봉쇄하는 것은 argv 위치별 허용목록(§5 함정 27이
+막는 층)이 **아니라**, 사람이 지정한 `project_root` 트리다. `project_root`에는 **봉쇄
+목록이 없다** — 검증은 "절대경로인가, 존재하는 디렉토리인가"(`RunError::ProjectRootInvalid`,
+`RunController::start` 선행 검증)뿐이고, 어떤 경로가 지정 가능한지에 대한 상한이 없다.
+즉 `$HOME`도 `/`도 `project_root`로 지정할 수 있고, 지정하면 **그 트리 전체**에서 에이전트가
+쓴 코드가 Lead에 의해 실행된다. 위치별 허용목록(argv 경계)의 역할은 "허용된 명령 프리픽스
+뒤에 플래그·경로를 못 끼워 넣게 한다"는 것으로 한정되며, 어떤 트리에서 그 명령이 도는지는
+전혀 판단하지 않는다 — 그 판단은 전적으로 `project_root`를 지정하는 사람의 몫이다. 이
+노브를 실제 활성화하려면(`RunConfig.project_root`를 `Some`으로) 반드시 함정 29(`HANDOFF.md`
+§5 함정 29) —
+`npm|yarn|pnpm run`류 간접 실행이 위치별 허용목록을 무력화한다는 사실 — 를 감안해야
+한다. **함정 29는 이 마일스톤으로 닫히지 않는다.**
 
 ### 4.3 Lead 에이전트의 실제 구현
 - Lead도 LLM 세션이지만, **출력은 반드시 구조화 JSON** (툴 스키마 강제).
@@ -335,6 +356,9 @@ L3 개인 세션 (에이전트 내부)         : 해당 CLI 세션의 자체 히
 ---
 
 ## 6. 파일 충돌 — 병렬 에이전트의 진짜 지뢰
+
+**이 절은 설계 목표이며 미구현이다** — M11의 `project_root: Some`은 아래 통제 없이 로스터
+전원이 같은 cwd를 공유하는 트리를 만든다(HANDOFF §5 함정 30 참고).
 
 - 에이전트마다 **git worktree + 전용 브랜치**(`crew/sprint-3/dev`). 같은 파일 동시 수정 원천 차단.
 - Lead가 스프린트 종료 시 순차 머지, 충돌 시 해당 에이전트에게 `change_request`.

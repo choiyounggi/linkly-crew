@@ -82,6 +82,10 @@ where
         // contracts-m10.md §H1g / D8: cmd DoD emission is off by default.
         // To turn it on, pass crew_run::default_dev_cmd_checks_rust() etc.
         dev_cmd_checks: Vec::new(),
+        // contracts-m11.md §I1/D12: no GUI project_root picker yet (out of
+        // scope) — every role's CLI cwd and the Cmd DoD exec cwd stay the
+        // per-role scratch dir, unchanged from pre-M11 behavior.
+        project_root: None,
     };
 
     let handle = RunController::start(cfg).await.map_err(|e| e.to_string())?;

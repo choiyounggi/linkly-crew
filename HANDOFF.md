@@ -1,7 +1,7 @@
 # 세션 인계 — linkly-crew
 
 **한 줄**: 구독 중인 AI CLI들을 역할별 팀원으로 묶어, 요청 한 줄을 팀장 에이전트가
-스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M10 완료·실측 검증**
+스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M11 완료·실측 검증**
 (멀티 스프린트 + 압축 + 핸드오프/스왑 + 하네스 레지스트리/세마포어 + 로스터 UI + LLM 스펙화 +
 Cmd DoD 플래너 방출 + 타임아웃 프로세스 그룹 kill) — 다음은 §4 잔여·3단계 후보.
 
@@ -275,6 +275,33 @@ Cmd DoD 플래너 방출 + 타임아웃 프로세스 그룹 kill) — 다음은 
   **360 passed / 0 failed**(베이스라인 357 + 신규 3). t-cmdplan 워크트리 rc=0,
   **371 passed / 0 failed**(베이스라인 357 + 신규 14).
 
+**검증됨 — M11** (2026-08-31, 실측: `crew-m11-integration` 베이스 `49509dc`, t-vet
+`de68636` + t-cwd `35e6736` 머지; 상세: `docs/SPIKE-M11.md`):
+- t-vet: `crates/crew-lead/src/cmd_exec.rs`에 `CmdPolicy::vet_run(&str) -> Result<(), String>`
+  공개 파사드 신설(변경 파일 1개, cmd_exec.rs 단독) + 인라인 테스트 7개 추가.
+- t-cwd: `crates/crew-run/src/config.rs`에 `RunConfig.project_root: Option<PathBuf>` 신설
+  (기본 `None` = M10까지 동작 그대로) + `RunController::start` 선행 검증(절대경로·존재
+  디렉토리, 아니면 `RunError::ProjectRootInvalid`) + `crates/crew-run/src/controller.rs`의
+  `role_cli_cwd(project_root, data_dir, role)`가 에이전트 CLI 세션 cwd와 Cmd DoD 실행 cwd
+  양쪽에 배선됨 — `project_root: Some(root)`이면 둘 다 `root`를 그대로 반환(스크래치
+  `cli-cwd/` 서브디렉토리 미생성), `None`이면 M10까지의 `<data_dir>/cli-cwd/<role>` 그대로.
+  `m11_project_root.rs` 신규 9테스트, src-tauri `core.rs` 호출부 + `RunConfig` 생성부
+  6곳 갱신.
+- 실측(코디네이터, `docs/SPIKE-M11.md` §2 A/B): `project_root: None`(A) — 실행 cwd에
+  매니페스트 없어 `cargo test` exit `101`. `project_root: Some(<레포 루트>)`(B) — exit `0`,
+  `test result:` 합산 394 passed / 0 failed / 9 ignored. 이 A/B가 §4 잔여 4번이 실제로
+  걷힌 벽임을 증명한다.
+- t-docs(본 문서 태스크): `crates/crew-run/src/config.rs` 테스트의 허용목록 이중 정의
+  제거(`CmdPolicy::vet_run` 직접 호출로 교체) + `crates/crew-lead/src/plan.rs`의 항진
+  테스트 `plan_dag_with_default_options_equals_plan_dag_for` 삭제. `cargo test --workspace`
+  rc=0, **393 passed / 0 failed / 9 ignored**(394에서 항진 테스트 1개 삭제로 감소 —
+  `docs/SPIKE-M11.md` §3), `cargo check --all-targets --manifest-path
+  apps/crew-app/src-tauri/Cargo.toml` rc=0.
+- **M11 결정 — 해소 아님**: 함정 29(`npm|yarn|pnpm run` 간접 실행이 허용목록을 무력화)는
+  이 마일스톤으로 닫히지 않았다. `--ignore-scripts`가 이 경로를 막는지 실측했으나
+  막지 못했다(`docs/SPIKE-M11.md` §1, 4/4 rc=0). §5 함정 29 참고.
+- M11 계약 정본: `.orchestration/contracts-m11.md` §I5·§I6·§I7·§I8.
+
 **미검증**:
 - GUI에서 scripted=false 클릭 실행(네이티브 창 — 사람 1클릭 필요; 실 CLI 경로 자체는 위
   E2E 2건으로 증명됨) — Gate 2에서 확인 예정.
@@ -300,7 +327,7 @@ task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ## 4. 다음 스텝 — M10 완료 후 잔여
 
-M1~M10 완료·실측 검증됨(§3). 다음 후보:
+M1~M11 완료·실측 검증됨(§3). 다음 후보:
 
 **M10 완료 후 잔여 (작은 것부터)**:
 1. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가;
@@ -313,13 +340,26 @@ M1~M10 완료·실측 검증됨(§3). 다음 후보:
    (`docs/SPIKE-M10.md` §3). 이 변경은 함정 29(`npm|yarn|pnpm run` 간접 실행이 허용목록을
    무력화)를 무장시키므로, cwd 변경과 함께 `npm|yarn|pnpm run` 허용 여부를 반드시
    재결정해야 한다.
+   **완료 — 단, 함정 29는 닫히지 않음(§5)** (M11, t-cwd `35e6736`): `RunConfig.project_root`
+   신설 + `role_cli_cwd(project_root, data_dir, role)`가 CLI 세션 cwd/Cmd DoD 실행 cwd
+   양쪽에 배선. `project_root` 지정 시 exit `101`(A) → exit `0`(B) 실측(`docs/SPIKE-M11.md`
+   §2). "`npm|yarn|pnpm run` 허용 여부를 반드시 재결정해야 한다"는 이 문장의 요구는
+   **재결정하지 않고 그대로 남겨뒀다** — 재결정은 M11 스코프 밖(DESIGN §4.2 신뢰 경계
+   문단 참고).
 5. **허용목록 규칙의 이중 정의 제거** — `crates/crew-run/src/config.rs`의 테스트 모듈이
    `ALLOWED_PREFIXES`와 `is_bare_trailing_token`을 `cmd_exec.rs`에서 복제하고 있다.
    두 태스크가 머지된 지금은 `CmdPolicy`에 `vet_run(&str) -> Result<(), String>`를
    공개해 프로덕션 판정기를 직접 호출하도록 바꿀 수 있다.
+   **완료** (M11, t-docs): `crates/crew-run/src/config.rs` 테스트 모듈이 `CmdPolicy::
+   default_allowlist().vet_run(&c.run)`을 직접 호출하도록 교체, `ALLOWED_PREFIXES`·
+   `is_bare_trailing_token`·`assert_satisfies_positional_allowlist` 3개 전부 삭제
+   (grep 0건).
 6. **`plan_dag_with_default_options_equals_plan_dag_for`는 항진 명제** —
    `plan_dag_for`가 `plan_dag_with`에 위임하므로 자기 자신과 비교한다. 진짜 회귀
    가드는 `plan.rs`의 기존 5역할 DAG 테스트(`dod == [ReqCover]` 단언)다. 정리 대상.
+   **완료** (M11, t-docs): 항진 테스트 삭제(grep 0건), 회귀 가드
+   `plan_dag_builds_a_validated_linear_five_role_chain`의 `dod == [ReqCover]` 단언은
+   그대로 통과(`cargo test --workspace` rc=0).
 
 opencode 실 어댑터는 PiHarness로 대체됨(스텁 존치, DESIGN §2.3) — M8 F0로 스코프
 아웃 항목에서 제거. 적응형 세마포어는 M8 F1로 완료.
@@ -348,7 +388,10 @@ execute_cmd_checks}`, `dod_exec::judge/3`·`DodVerdict::failed_cmds`,
 PlanOptions}`, `LeadPlanner::plan_dag_with`, `RunConfig.dev_cmd_checks`,
 `crew_run::{default_dev_cmd_checks_rust, default_dev_cmd_checks_node}`, `cmd_exec`의
 프로세스 그룹 종료(`process_group(0)`/`ProcessGroupGuard`/`killpg`, 타임아웃·드롭
-양쪽). 재발명 금지.
+양쪽) + **M11(`.orchestration/contracts-m11.md` §I5·§I6·§I7·§I8)** — 신규 공개 API 2건:
+`RunConfig.project_root`(`Option<PathBuf>`, 기본 `None`, `RunError::ProjectRootInvalid`로
+선행 검증), `crew_lead::cmd_exec::CmdPolicy::vet_run(&str) -> Result<(), String>`.
+재발명 금지.
 
 ---
 
@@ -511,3 +554,49 @@ PlanOptions}`, `LeadPlanner::plan_dag_with`, `RunConfig.dev_cmd_checks`,
     루트로")이 바로 이것을 무장시키는 변경이다. **완화 방향(선택지, 미확정)**: 실행
     cwd를 에이전트 쓰기 영역과 분리하거나, `npm/yarn/pnpm run`을 허용목록에서 빼거나,
     스크립트 본문까지 검증하는 것 중 하나가 §4 잔여 4번과 함께 결정돼야 한다.
+
+    **M11 결정 — 해소 아님.** §4 잔여 4번은 M11에서 완료됐다(`project_root` 도입, 위
+    "완료 — 단, 함정 29는 닫히지 않음" 참고) — 즉 위 문단이 예고한 무장은 실제로
+    일어났다. 그러나 이 함정 자체는 **닫히지 않았다.** 위에서 미확정으로 남긴 세 완화
+    방향은 각각 다음 근거로 죽었다(실측: `docs/SPIKE-M11.md` §1):
+    - **(a) `npm run` 제거**: 허용목록에서 `npm run`/`pnpm run`/`yarn run`을 빼도
+      `npm test`가 동일한 간접층이다 — `package.json`의 `scripts.test`도 에이전트가
+      쓰고 `npm test`가 그대로 실행한다. 프리픽스 하나를 빼는 것으로는 막히지 않는다.
+    - **(b) 스크립트명 화이트리스트**: 스크립트 **이름**(`build`/`test` 등)을
+      화이트리스트해도 그 이름이 가리키는 **본문**은 에이전트가 쓴 `package.json`이
+      정의한다 — 이름이 무해해 보여도 본문은 임의 셸 명령일 수 있다. 이름 검증은
+      본문을 전혀 보지 못한다.
+    - **(c) 스크립트 본문 검증**: 채택하지 않았다. 셸 명령 문자열을 안전하게
+      정적 검증하는 것은 위치별 허용목록(함정 27)이 이미 겪은 문제(플래그·경로
+      인젝션)를 셸 문법 전체로 확장하는 것이라 이 마일스톤 스코프 밖.
+    - `--ignore-scripts`도 막지 못한다(§1 참고) — `npm run <script>`/`npm test`로
+      **명시 호출된** 스크립트는 이 플래그가 막는 라이프사이클 훅과 다른 경로다.
+      실측: `npm run build --ignore-scripts` rc=0 (`pwned-build.txt` 생성),
+      `npm test --ignore-scripts` rc=0 (`pwned-test.txt` 생성) — 4/4 rc=0.
+
+    남은 상태: `project_root`를 지정하고 `dev_cmd_checks`에 `npm run`/`npm test`류를
+    포함시키면, 함정 29가 조용히 통과한다. 봉쇄는 argv 허용목록이 아니라 `project_root`를
+    지정하는 사람의 판단뿐이다(DESIGN §4.2 신뢰 경계 문단).
+30. **`project_root: Some`이면 로스터 전원의 CLI 세션 cwd가 동일하다 — 락·역할별 브랜치·
+    충돌 감지가 전부 없다** (Phase 5 통합 리뷰 발, 코디네이터 재현, 2026-08-31):
+    1. `role_cli_cwd`의 `Some(root)` 분기(`controller.rs:98-101`)는 역할과 무관하게
+       `root.to_path_buf()`를 그대로 반환한다 — 역할별 하위 디렉토리를 만들지 않는다.
+    2. `spawn_sprint`(`controller.rs:277`)는 `crew_agents(roster)`로 얻은 로스터 전원을
+       매 스프린트 동시에 `tokio::spawn`한다 — 이번 스프린트에 태스크가 있는 역할만이
+       아니다. `RealCli` 모드에서는 5개 CLI 세션이 동시에 산다. `SprintSlicer::slice`
+       (`plan.rs:232`)는 위상 순서를 `max_per_sprint` 단위로 `chunks()`할 뿐이라, 한
+       스프린트에 서로 다른 역할의 태스크가 함께 들어간다.
+    3. 귀결: 락·역할별 브랜치·충돌 감지가 **전부 없으므로** 마지막 writer가 조용히
+       이긴다. 더해서 Lead의 `Cmd DoD`(`cmd_exec::execute_cmd_checks`)도 같은 cwd에서
+       도므로, 아직 쓰는 중인 형제 세션의 파일을 읽어 **코드 정확성과 무관한 DoD
+       판정**이 나올 수 있다.
+    4. **DESIGN §6의 "에이전트마다 git worktree + 전용 브랜치"는 미구현이다**
+       (`grep -rn "worktree" crates/ apps/crew-app/src-tauri/src/`의 히트는 전부
+       dev-loop 워크트리를 가리키는 테스트 주석 — 제품 코드의 역할별 git
+       worktree/브랜치는 어디에도 구현돼 있지 않다). M10까지는 역할별 scratch
+       디렉토리(`<data_dir>/cli-cwd/<role>`)가 우연히 그 역할을 대신하고 있었고,
+       M11이 `project_root: Some`으로 그것을 없앴다.
+    5. **오늘은 발화하지 않는다** — `project_root` 기본값이 `None`이고 GUI에 피커가
+       없다. §4-1(GUI 1클릭)이나 `project_root` 피커를 붙이는 것이 이것을 무장시킨다.
+    6. 검증은 런 시작 1회뿐이며, 실행 중 그 트리가 사라지거나 교체되는 것은 재검증하지
+       않는다(에이전트 세션 자신이 그 트리에 쓰기 권한을 갖는다는 점과 함께 읽을 것).

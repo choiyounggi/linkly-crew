@@ -34,6 +34,16 @@ pub struct RunConfig {
     /// §H1g). Empty vector (default) = no emission = the M9-and-earlier
     /// behavior unchanged.
     pub dev_cmd_checks: Vec<CmdCheck>,
+    /// The real project tree the crew works in and the Lead's `cmd` DoD checks
+    /// execute in. `None` (the shipped default) = the M10-and-earlier behavior
+    /// exactly: every role's CLI cwd and the Cmd DoD exec cwd are the per-role
+    /// scratch `<data_dir>/cli-cwd/<role>`. `Some(root)` = **both** are `root`.
+    ///
+    /// Caller-designated only — never derived from cwd, git, or a guess
+    /// (HANDOFF §5 trap 29 / contracts-m11.md §I6). With `Some`, the Lead
+    /// executes agent-authored code by design; the containment is this
+    /// human-designated tree, not the argv allowlist.
+    pub project_root: Option<PathBuf>,
 }
 
 /// Default Rust-domain dev cmd checks that satisfy `CmdPolicy`'s positional
@@ -127,93 +137,56 @@ pub enum RunError {
     /// `human.response` publish.
     #[error("gate unavailable: {0}")]
     GateUnavailable(String),
+    /// `RunConfig.project_root` failed startup validation (contracts-m11.md
+    /// §I2): not absolute, or not an existing directory. The message carries
+    /// the received value verbatim. No fallback to the scratch cwd — a silent
+    /// fallback reproduces M10's exit-101 confusion (docs/SPIKE-M10.md §3).
+    #[error("project_root invalid: {0}")]
+    ProjectRootInvalid(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `CmdPolicy::default_allowlist()`'s nine prefixes (contracts-m9.md
-    /// §G2c, `crates/crew-lead/src/cmd_exec.rs`), copied here rather than
-    /// imported — importing `CmdPolicy` would reach into t-pgroup's owned
-    /// file, and D10 keeps the guard's assertion target the *string* rather
-    /// than production code this task must not touch.
-    const ALLOWED_PREFIXES: &[&[&str]] = &[
-        &["cargo", "test"],
-        &["cargo", "build"],
-        &["cargo", "clippy"],
-        &["npm", "test"],
-        &["npm", "run"],
-        &["pnpm", "test"],
-        &["pnpm", "run"],
-        &["yarn", "test"],
-        &["yarn", "run"],
-    ];
-
-    /// `vet`'s trailing-position rule verbatim (contracts-m9.md §G2c r2 F3,
-    /// `crates/crew-lead/src/cmd_exec.rs::is_bare_trailing_token`):
-    /// `^[A-Za-z0-9][A-Za-z0-9._-]*$` and no `..` substring.
-    fn is_bare_trailing_token(tok: &str) -> bool {
-        if tok.contains("..") {
-            return false;
-        }
-        let mut chars = tok.chars();
-        match chars.next() {
-            Some(first) if first.is_ascii_alphanumeric() => {}
-            _ => return false,
-        }
-        chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-    }
-
-    /// Asserts `run` matches an allowed prefix literally and every trailing
-    /// token is a bare identifier — the same "shape and consequence" the
-    /// production `vet()` decides (guard-shape-vs-consequence), reproduced
-    /// as a local assertion per D10 rather than calling `vet()` itself.
-    fn assert_satisfies_positional_allowlist(run: &str) {
-        let tokens: Vec<&str> = run.split_ascii_whitespace().collect();
-        let matched = ALLOWED_PREFIXES
-            .iter()
-            .find(|p| tokens.len() >= p.len() && tokens[..p.len()] == p[..]);
-        let prefix = matched.unwrap_or_else(|| {
-            panic!("{run:?} does not start with any CmdPolicy::default_allowlist() prefix")
-        });
-        for tok in &tokens[prefix.len()..] {
-            assert!(
-                is_bare_trailing_token(tok),
-                "{run:?}: trailing token {tok:?} is not a bare identifier \
-                 (^[A-Za-z0-9][A-Za-z0-9._-]*$, no \"..\")"
-            );
-        }
-    }
+    use crew_lead::cmd_exec::CmdPolicy;
 
     #[test]
     fn default_dev_cmd_checks_rust_satisfies_the_positional_allowlist() {
+        // Asserts each `run` against the production judge
+        // (`CmdPolicy::default_allowlist().vet_run`, contracts-m9.md §G2c r2
+        // F3) rather than a locally-reproduced copy of its rule (M11 D1/D3 —
+        // the guard's assertion target moves from the string's *shape* to
+        // the production judge's *consequence*, guard-shape-vs-consequence).
+        let policy = CmdPolicy::default_allowlist();
         let checks = default_dev_cmd_checks_rust();
         assert!(!checks.is_empty());
         for c in &checks {
-            assert_satisfies_positional_allowlist(&c.run);
+            assert_eq!(policy.vet_run(&c.run), Ok(()));
             assert_eq!(c.expect, "exit 0");
         }
     }
 
     #[test]
     fn default_dev_cmd_checks_node_satisfies_the_positional_allowlist() {
+        let policy = CmdPolicy::default_allowlist();
         let checks = default_dev_cmd_checks_node();
         assert!(!checks.is_empty());
         for c in &checks {
-            assert_satisfies_positional_allowlist(&c.run);
+            assert_eq!(policy.vet_run(&c.run), Ok(()));
             assert_eq!(c.expect, "exit 0");
         }
     }
 
     #[test]
-    fn positional_allowlist_helper_rejects_a_trailing_flag_as_a_negative_control() {
+    fn cmd_policy_refuses_a_trailing_flag_as_a_negative_control() {
         // Negative control (testing-quality-tests-that-cannot-fail): proves
-        // assert_satisfies_positional_allowlist can actually fail, guarding
-        // against a helper that accepts everything.
-        let result = std::panic::catch_unwind(|| {
-            assert_satisfies_positional_allowlist("cargo test --workspace")
-        });
-        assert!(result.is_err(), "a trailing flag must be refused");
+        // the production judge can actually refuse, guarding against a
+        // helper/policy that accepts everything (M11 D2 — the negative
+        // control itself is kept, only its assertion mechanism changes).
+        let policy = CmdPolicy::default_allowlist();
+        assert!(
+            policy.vet_run("cargo test --workspace").is_err(),
+            "a trailing flag must be refused"
+        );
     }
 }

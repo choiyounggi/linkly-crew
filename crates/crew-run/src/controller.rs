@@ -79,15 +79,26 @@ fn role_dir_name(role: Role) -> &'static str {
     }
 }
 
-/// `RealCli` worker cwd (t-swap follow-up fix, coordinator-run real-CLI
-/// spot check): `data_dir/cli-cwd/<role>`, created best-effort — mirroring
-/// `RunController::start`'s own `create_dir_all(&cfg.data_dir)` — because
-/// `Command::current_dir` on a missing directory fails the CLI spawn with
-/// ENOENT ("failed to spawn claude process: No such file or directory"),
-/// which every worker then reports as blocked, and with the default
-/// `escalation_timeout_ms=0` the run hangs forever waiting on a human gate
-/// that never fires.
-fn role_cli_cwd(data_dir: &Path, role: Role) -> std::path::PathBuf {
+/// The agent CLI cwd and the Cmd DoD exec cwd — the same seam feeds both
+/// call sites in `spawn_sprint` (contracts-m11.md §I1/§I3).
+///
+/// `Some(project_root)` — the human-designated real project tree (M11):
+/// returned verbatim, `create_dir_all` is **not** called since
+/// `RunController::start`'s leading validation (§I2) already guarantees the
+/// directory exists.
+///
+/// `None` — pre-M11 behavior, unchanged (t-swap follow-up fix,
+/// coordinator-run real-CLI spot check): `data_dir/cli-cwd/<role>`, created
+/// best-effort — mirroring `RunController::start`'s own
+/// `create_dir_all(&cfg.data_dir)` — because `Command::current_dir` on a
+/// missing directory fails the CLI spawn with ENOENT ("failed to spawn
+/// claude process: No such file or directory"), which every worker then
+/// reports as blocked, and with the default `escalation_timeout_ms=0` the
+/// run hangs forever waiting on a human gate that never fires.
+fn role_cli_cwd(project_root: Option<&Path>, data_dir: &Path, role: Role) -> std::path::PathBuf {
+    if let Some(root) = project_root {
+        return root.to_path_buf();
+    }
     let cwd = data_dir.join("cli-cwd").join(role_dir_name(role));
     let _ = std::fs::create_dir_all(&cwd);
     cwd
@@ -245,6 +256,7 @@ async fn spawn_sprint(
     mode: &RunMode,
     goal: &str,
     data_dir: &Path,
+    project_root: Option<&Path>,
     roster: &Roster,
     pool: &Arc<HarnessPool>,
     dag: &TaskDag,
@@ -295,7 +307,7 @@ async fn spawn_sprint(
                     continue;
                 };
                 let harness_cfg = HarnessAgentCfg {
-                    cwd: role_cli_cwd(data_dir, role),
+                    cwd: role_cli_cwd(project_root, data_dir, role),
                     model: None,
                 };
                 let system_hint = format!("You are the {role:?} of a crew building: {goal}");
@@ -323,6 +335,7 @@ async fn spawn_sprint(
     let routing: Vec<(Role, String)> = crew.iter().map(|(id, role)| (*role, id.clone())).collect();
     let prior_states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
     let cmd_cwd_base = data_dir.to_path_buf();
+    let cmd_project_root = project_root.map(Path::to_path_buf);
     let lead_behavior = LeadBehavior::new(
         "agent:lead",
         dag.clone(),
@@ -332,7 +345,9 @@ async fn spawn_sprint(
     )
     .with_prior_states(prior_states)
     .escalation_timeout_ms(escalation_timeout_ms)
-    .with_cmd_exec(Arc::new(move |role| role_cli_cwd(&cmd_cwd_base, role)));
+    .with_cmd_exec(Arc::new(move |role| {
+        role_cli_cwd(cmd_project_root.as_deref(), &cmd_cwd_base, role)
+    }));
     let observing = ObservingLead::new(lead_behavior, sprint_tasks.to_vec(), ts_tx, cumulative);
     // Lead never gets a control channel (contracts-m6.md §D2a, plan D2/plan
     // D6, pitfall 14) — lead swaps stay M5 boundary-only via `AgentRunner::run`.
@@ -465,6 +480,32 @@ pub struct RunController;
 
 impl RunController {
     pub async fn start(cfg: RunConfig) -> Result<RunHandle, RunError> {
+        // Validated before anything else, including the roster check right
+        // below (contracts-m11.md §I2) — same rationale: a rejected config
+        // leaves zero partial run state. No fallback to the scratch cwd on
+        // failure — that would reproduce M10's exit-101 confusion
+        // (docs/SPIKE-M10.md §3).
+        let project_root: Option<std::path::PathBuf> = match &cfg.project_root {
+            None => None,
+            Some(p) => {
+                if !p.is_absolute() {
+                    return Err(RunError::ProjectRootInvalid(format!(
+                        "must be an absolute path, got: {p:?}"
+                    )));
+                }
+                if !p.is_dir() {
+                    return Err(RunError::ProjectRootInvalid(format!(
+                        "must be an existing directory, got: {p:?}"
+                    )));
+                }
+                // D5: resolve once so both call sites (agent CLI cwd, Cmd DoD
+                // exec cwd) agree on one path.
+                Some(std::fs::canonicalize(p).map_err(|e| {
+                    RunError::ProjectRootInvalid(format!("could not resolve {p:?}: {e}"))
+                })?)
+            }
+        };
+
         // Validated before any spec/dag/ledger/spawn work (contracts-m7.md
         // §E4 plan D5) — a rejected roster leaves zero partial run state.
         let roster = cfg.roster.clone().unwrap_or_else(default_roster);
@@ -617,6 +658,7 @@ impl RunController {
             &cfg.mode,
             &cfg.goal,
             &cfg.data_dir,
+            project_root.as_deref(),
             &roster_snapshot0,
             &pool,
             &dag,
@@ -642,6 +684,7 @@ impl RunController {
         let mode = cfg.mode.clone();
         let goal = cfg.goal.clone();
         let data_dir = cfg.data_dir.clone();
+        let project_root = project_root.clone();
         let max_rework = cfg.max_rework;
         let escalation_timeout_ms = cfg.escalation_timeout_ms;
         let finisher_live = live.clone();
@@ -669,6 +712,7 @@ impl RunController {
                         &mode,
                         &goal,
                         &data_dir,
+                        project_root.as_deref(),
                         &roster_snapshot,
                         &pool,
                         &dag,
@@ -1358,6 +1402,7 @@ mod live_controls_wiring_tests {
             escalation_timeout_ms: 0,
             roster: None,
             dev_cmd_checks: Vec::new(),
+            project_root: None,
         }
     }
 
@@ -1467,7 +1512,7 @@ mod role_cli_cwd_tests {
         let data_dir = test_data_dir("cli-cwd-fresh");
         assert!(!data_dir.exists(), "test setup: data_dir must not pre-exist");
 
-        let cwd = role_cli_cwd(&data_dir, Role::Designer);
+        let cwd = role_cli_cwd(None, &data_dir, Role::Designer);
 
         assert_eq!(cwd, data_dir.join("cli-cwd").join("designer"));
         assert!(cwd.is_dir(), "the role cwd must exist as a directory after role_cli_cwd: {cwd:?}");
@@ -1482,10 +1527,10 @@ mod role_cli_cwd_tests {
     #[test]
     fn is_idempotent_and_preserves_existing_contents() {
         let data_dir = test_data_dir("cli-cwd-idempotent");
-        let cwd = role_cli_cwd(&data_dir, Role::Qa);
+        let cwd = role_cli_cwd(None, &data_dir, Role::Qa);
         std::fs::write(cwd.join("marker.txt"), b"sprint-0").expect("must be able to write into the created cwd");
 
-        let cwd_again = role_cli_cwd(&data_dir, Role::Qa);
+        let cwd_again = role_cli_cwd(None, &data_dir, Role::Qa);
 
         assert_eq!(cwd, cwd_again);
         assert!(cwd_again.is_dir(), "the directory must still exist: {cwd_again:?}");
@@ -1508,11 +1553,68 @@ mod role_cli_cwd_tests {
         std::fs::create_dir_all(&data_dir).expect("test setup");
         std::fs::write(data_dir.join("cli-cwd"), b"not a directory").expect("test setup: block the cli-cwd path segment");
 
-        let cwd = role_cli_cwd(&data_dir, Role::Publisher);
+        let cwd = role_cli_cwd(None, &data_dir, Role::Publisher);
 
         assert_eq!(cwd, data_dir.join("cli-cwd").join("publisher"));
         assert!(!cwd.is_dir(), "creation must have failed silently (best-effort), not been magically satisfied: {cwd:?}");
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// Normal (M11 §I3): `Some(root)` is returned verbatim and untouched —
+    /// no `cli-cwd/<role>` scratch subdirectory is created under it, since
+    /// `RunController::start`'s leading validation (§I2) already guarantees
+    /// `root` exists.
+    #[test]
+    fn some_project_root_is_returned_verbatim_and_creates_nothing_under_it() {
+        let root = test_data_dir("cli-cwd-project-root");
+        std::fs::create_dir_all(&root).expect("test setup: project_root must exist");
+        let data_dir = test_data_dir("cli-cwd-project-root-data-dir");
+
+        let cwd = role_cli_cwd(Some(&root), &data_dir, Role::Developer);
+
+        assert_eq!(cwd, root, "Some(root) must be returned verbatim, not joined with a per-role subdirectory");
+        assert!(
+            !root.join("cli-cwd").exists(),
+            "no scratch cli-cwd/ subdirectory may be created under project_root: {root:?}"
+        );
+        assert!(!data_dir.exists(), "data_dir must be untouched when project_root is Some");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// M11 §I1 core contract, plan step 1 priority (a): when `project_root`
+    /// is `Some`, the agent CLI cwd (`spawn_sprint`'s `HarnessAgentCfg.cwd`
+    /// call site) and the Cmd DoD exec cwd (`spawn_sprint`'s `with_cmd_exec`
+    /// closure call site) must resolve to the **same** path for every role.
+    /// Both call sites invoke this exact function with the exact same
+    /// `project_root` value, so this is asserted here directly against two
+    /// independent (and deliberately different) `data_dir` bases — proving
+    /// the equality holds because of `project_root`, not because the two
+    /// call sites happen to share a `data_dir`.
+    #[test]
+    fn some_project_root_makes_both_call_sites_agree_for_every_role() {
+        let root = test_data_dir("cli-cwd-combined-root");
+        std::fs::create_dir_all(&root).expect("test setup: project_root must exist");
+        let agent_cli_data_dir = test_data_dir("cli-cwd-combined-agent-base");
+        let cmd_dod_data_dir = test_data_dir("cli-cwd-combined-dod-base");
+        assert_ne!(
+            agent_cli_data_dir, cmd_dod_data_dir,
+            "test setup: the two data_dir bases must differ so equality below proves project_root, not a shared base"
+        );
+
+        for role in [Role::Pm, Role::Designer, Role::Publisher, Role::Developer, Role::Qa] {
+            let agent_cli_cwd = role_cli_cwd(Some(&root), &agent_cli_data_dir, role);
+            let cmd_dod_cwd = role_cli_cwd(Some(&root), &cmd_dod_data_dir, role);
+
+            assert_eq!(
+                agent_cli_cwd, cmd_dod_cwd,
+                "agent CLI cwd and Cmd DoD exec cwd must be the same path for role {role:?}"
+            );
+            assert_eq!(agent_cli_cwd, root, "both call sites must resolve to project_root itself for role {role:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
