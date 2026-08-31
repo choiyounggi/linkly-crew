@@ -21,6 +21,36 @@ fn agent_cfg() -> AgentCfg {
     }
 }
 
+/// Path for a test's recorded argv (D6). Lives under `CARGO_MANIFEST_DIR`,
+/// never `/tmp` (trap 6). Each test uses its own file name so parallel runs
+/// don't race each other.
+fn argv_log_path(test_name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".crew-test");
+    std::fs::create_dir_all(&dir).expect("create argv log dir");
+    dir.join(format!("{test_name}.argv.log"))
+}
+
+/// Reads back the argv `fake-claude.sh` recorded via `FAKE_ARGV_LOG`, then
+/// removes the log file so it doesn't linger in the worktree.
+fn read_and_clear_argv(path: &std::path::Path) -> Vec<String> {
+    let argv = std::fs::read_to_string(path)
+        .expect("read argv log")
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    let _ = std::fs::remove_file(path);
+    argv
+}
+
+/// Position of `--setting-sources` in `argv`, plus the value that follows
+/// it (structural, not a stub-string match — trap 18).
+fn setting_sources_value(argv: &[String]) -> Option<&str> {
+    argv.iter()
+        .position(|a| a == "--setting-sources")
+        .and_then(|i| argv.get(i + 1))
+        .map(String::as_str)
+}
+
 #[tokio::test]
 async fn normal_turn_is_finished_ok_and_streams_events() {
     let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
@@ -224,6 +254,99 @@ async fn snapshot_prefers_the_cli_reported_session_id_over_spawn_uuid() {
 
     let snapshot = harness.snapshot(&session).await.expect("snapshot should succeed");
     assert_eq!(snapshot.session_id, reported);
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// Trap 8 — the default `--setting-sources` scopes a spawned session away
+/// from user-global hooks (D2). Asserts the flag and its value are present
+/// in `spawn`'s argv.
+#[tokio::test]
+async fn spawn_passes_default_setting_sources() {
+    let log_path = argv_log_path("spawn_passes_default_setting_sources");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ARGV_LOG", log_path.to_str().unwrap());
+    let cfg = agent_cfg();
+
+    let mut session = harness.spawn(&cfg).await.expect("spawn should succeed");
+    // Wait for the init line: fake-claude.sh writes FAKE_ARGV_LOG before
+    // printing it, so by the time Started arrives the log is on disk.
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let argv = read_and_clear_argv(&log_path);
+    assert_eq!(setting_sources_value(&argv), Some("project,local"));
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D4 — the resume path must carry the same default, or hooks come back to
+/// life whenever a session resumes.
+#[tokio::test]
+async fn spawn_resumed_passes_default_setting_sources() {
+    let log_path = argv_log_path("spawn_resumed_passes_default_setting_sources");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ARGV_LOG", log_path.to_str().unwrap());
+    let cfg = agent_cfg();
+
+    let mut session = harness
+        .spawn_resumed(&cfg, uuid::Uuid::new_v4())
+        .await
+        .expect("spawn_resumed should succeed");
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let argv = read_and_clear_argv(&log_path);
+    assert!(argv.iter().any(|a| a == "-r"), "expected resume flag -r");
+    assert_eq!(setting_sources_value(&argv), Some("project,local"));
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D3 boundary — `None` must omit both the flag and any placeholder value,
+/// not pass an empty string.
+#[tokio::test]
+async fn setting_sources_none_omits_the_flag_entirely() {
+    let log_path = argv_log_path("setting_sources_none_omits_the_flag_entirely");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ARGV_LOG", log_path.to_str().unwrap())
+        .with_setting_sources(None::<String>);
+    let cfg = agent_cfg();
+
+    let mut session = harness.spawn(&cfg).await.expect("spawn should succeed");
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let argv = read_and_clear_argv(&log_path);
+    assert!(
+        !argv.iter().any(|a| a == "--setting-sources"),
+        "flag must be omitted entirely, got: {argv:?}"
+    );
+    assert!(
+        !argv.iter().any(|a| a.is_empty()),
+        "no empty-string argv element, got: {argv:?}"
+    );
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D7 — the override test uses a value different from the default
+/// ("project" vs "project,local") so a mutant that silently falls back to
+/// the default cannot pass this test.
+#[tokio::test]
+async fn custom_setting_sources_overrides_the_default() {
+    let log_path = argv_log_path("custom_setting_sources_overrides_the_default");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ARGV_LOG", log_path.to_str().unwrap())
+        .with_setting_sources(Some("project"));
+    let cfg = agent_cfg();
+
+    let mut session = harness.spawn(&cfg).await.expect("spawn should succeed");
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let argv = read_and_clear_argv(&log_path);
+    assert_eq!(setting_sources_value(&argv), Some("project"));
+    assert!(
+        !argv.iter().any(|a| a == "project,local"),
+        "default value must not leak through, got: {argv:?}"
+    );
 
     harness.shutdown(session).await.expect("shutdown");
 }
