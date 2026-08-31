@@ -233,6 +233,32 @@ Lead는 `task.result`를 받으면 **DoD를 직접 실행**해서 수락 여부�
 **핵심 장치**: 모든 산출물이 `REQ-id`를 참조합니다. PM이 "기획대로 안 됐다"를 말할 때
 감이 아니라 **커버되지 않은 REQ-id**를 근거로 `change_request`를 보냅니다.
 
+**M9 갱신 — `cmd` DoD 실행 규칙** (`crates/crew-lead/src/cmd_exec.rs`, `dod_exec::judge/3`):
+Lead는 `task.result`를 받으면 위 예시의 `kind:"cmd"` 체크를 셸을 거치지 않는 argv 직접
+실행으로 검증한다.
+- **허용목록**: `cargo test`/`cargo build`/`cargo clippy`/`npm test`/`npm run`/`pnpm test`/
+  `pnpm run`/`yarn test`/`yarn run` 9개 프리픽스만 허용(`CmdPolicy::default_allowlist`).
+  프리픽스에 없으면 `Refused`.
+- **문자 허용목록**: 토큰마다 영숫자 + `._/@:=+-`만 허용 — 메타문자 블록리스트가 아니라
+  화이트리스트라 `&&`/`;`/`|` 등은 프리픽스 매칭 이전에 이미 거부된다. `tokio::process::
+  Command`로 argv를 그대로 넘기며 셸을 전혀 거치지 않는다.
+- **`expect`는 `"exit <N>"` 형식만 인식**한다(`parse_expect`). 그 외 문자열(예: 위 예시의
+  `browser` 체크처럼 자연어)은 체크가 아예 실행되지 않고 `skipped`로만 기록된다.
+- **타임아웃 기본 120초**(`CmdPolicy::default_allowlist().timeout`), 초과 시 자식
+  프로세스를 죽이고 `TimedOut`으로 기록한다(§5 함정 26 — 직계 자식만 죽는다).
+- **실행 cwd**는 해당 태스크 역할의 CLI 세션과 같은 디렉토리(`crew-run`의
+  `role_cli_cwd(data_dir, role)`) — Lead 자신의 cwd가 아니다.
+- `kind:"browser"`는 **M9에서도 아직 미실행**이다 — 항상 `skipped`로만 기록된다(스코프
+  아웃).
+- 실행 결과 중 하나라도 `Refused`/`TimedOut`/`SpawnFailed`이거나 exit code가 `expect`와
+  다르면 `DodVerdict.failed_cmds`에 쌓이고 `passed=false`가 되며, `AcceptanceLoop::decide`가
+  이를 그대로 `Rework.violations`에 포함한다.
+- **다만 실 런에서는 이 경로에 아직 도달하지 않는다** — `LeadPlanner::plan_dag_for`가
+  `DodCheck::ReqCover`만 방출하고 `DodCheck::Cmd`를 만드는 코드 경로가 현재 없다
+  (HANDOFF §3 M9, §4 잔여 1번). 실행기·판정·배선은 완성되어 있고 단위/통합 테스트로
+  커버되지만, 위 규칙이 실제 태스크에서 발동하려면 플래너가 먼저 `DodCheck::Cmd`를
+  넣어줘야 한다.
+
 ### 4.3 Lead 에이전트의 실제 구현
 - Lead도 LLM 세션이지만, **출력은 반드시 구조화 JSON** (툴 스키마 강제).
   자유 텍스트로 계획을 뱉게 하면 파싱이 무너집니다.
