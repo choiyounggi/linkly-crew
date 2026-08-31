@@ -388,6 +388,16 @@ execute_cmd_checks}`, `dod_exec::judge/3`·`DodVerdict::failed_cmds`,
     8/8 clean, 실패 메시지도 미포착 — 원인 미상(병렬 부하/콜드 스타트 타이밍 의심).
     재현 불가·근본원인 미확정이므로 결론 내리지 말 것 — 콜드 빌드 직후 실패를 보면
     바로 결함으로 단정하지 말고 한 번 더 돌려 재현 여부부터 확인할 것.
+    3차(m9a Phase 5 통합 테스트, 2026-08-31, 코디네이터 실측): `crew-bus`의
+    `tests/integration.rs:171` `test_redelivery_after_no_receipt_succeeds`가 콜드 빌드 직후
+    `cargo test --workspace` 첫 실행에서만 실패. **이번에 처음으로 실패 메시지가 포착됐다** —
+    `assertion left == right failed / left: Error { code: "delivery_failed", message:
+    "msg_01M1B169TRTQQ8FT89AC13NB97" } / right: Receipt { id: "msg_..." }`. 즉 무수신 후
+    재배달이 `Receipt` 대신 `delivery_failed`를 돌려줬다 — 재배달 타이밍이 병렬 부하에서
+    밀리는 쪽을 시사한다(확정 아님). 직후 재현 시도: 격리 실행 3/3 clean, `-p crew-bus`
+    스위트 3/3 clean, `cargo test --workspace` 2연속 clean(357 passed). M9는 `crates/crew-bus`를
+    **한 줄도 건드리지 않았다**(`git diff 8e331e7..crew-m9-integration -- crates/crew-bus`가 빈
+    출력) — M9 회귀가 아니다.
 21. **워커가 `impl_done` 보고 후 커밋 전에 죽으면 구현이 워크트리 dirty로만 존재한다**
     (M7 오케스트레이션 운영 실측, m7a 재진입): 4개 태스크(t-artifacts/t-inbox/
     t-rosterrun/t-search)가 이 상태로 발견됐고, 코디네이터가 스냅샷 커밋으로 회수했다
