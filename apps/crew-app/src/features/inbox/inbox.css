@@ -1,6 +1,6 @@
 .inbox-empty {
-  color: var(--text-dim);
-  font-size: 0.85rem;
+  color: var(--ink-dim);
+  font-size: var(--font-size-md);
 }
 
 .inbox-list {
@@ -9,54 +9,54 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
+  gap: var(--space-3);
 }
 
 .inbox-item {
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.6rem 0.75rem;
+  background: var(--surface-panel);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-3);
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: var(--space-2);
 }
 
 .inbox-item__meta {
   display: flex;
   justify-content: space-between;
-  font-size: 0.75rem;
-  color: var(--text-dim);
+  font-size: var(--font-size-xs);
+  color: var(--ink-dim);
 }
 
 .inbox-item__reason {
   margin: 0;
-  color: var(--text);
-  font-size: 0.85rem;
+  color: var(--ink-text);
+  font-size: var(--font-size-md);
 }
 
 .inbox-item__reason-input {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  padding: 0.35rem 0.5rem;
-  font-size: 0.8rem;
+  background: var(--surface-paper);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  color: var(--ink-text);
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-size-sm);
 }
 
 .inbox-item__actions {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--space-2);
   align-items: center;
 }
 
 .inbox-item__unsupported {
-  color: var(--text-dim);
-  font-size: 0.75rem;
+  color: var(--ink-dim);
+  font-size: var(--font-size-xs);
 }
 
 .inbox-item__error {
   margin: 0;
-  color: var(--danger);
-  font-size: 0.75rem;
+  color: var(--status-danger);
+  font-size: var(--font-size-xs);
 }

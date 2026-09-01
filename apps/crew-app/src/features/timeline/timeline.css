@@ -1,16 +1,30 @@
+.panel--timeline {
+  overflow-y: auto;
+  background: var(--surface-panel);
+}
+
+.panel--timeline p {
+  margin: 0;
+  color: var(--ink-dim);
+  font-size: var(--font-size-md);
+}
+
 .timeline-lanes {
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 0.6rem;
-  padding-top: 1rem;
+  gap: var(--space-3);
+  padding-top: var(--space-4);
 }
 
 .timeline-lanes__markers {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: 4.5rem;
+  /* label column (4rem) + lane gap (--space-2) — exceeds the 4pt spacing scale
+     (max var(--space-10) = 2.5rem), so left as a derived layout offset rather
+     than snapped, which would collapse it onto the label's own width. */
+  left: calc(4rem + var(--space-2));
   right: 0;
   pointer-events: none;
 }
@@ -19,61 +33,66 @@
   position: absolute;
   top: 0;
   bottom: 0;
-  border-left: 1px dashed var(--border);
+  border-left: 1px dashed var(--border-hairline);
 }
 
 .timeline-marker__label {
   position: absolute;
-  top: -1rem;
-  left: 2px;
-  font-size: 0.65rem;
-  color: var(--text-dim);
+  top: calc(-1 * var(--space-4));
+  left: var(--space-1);
+  font-family: var(--font-mono);
+  font-variant-numeric: var(--font-numeric);
+  font-size: var(--font-size-2xs);
+  color: var(--ink-dim);
   white-space: nowrap;
 }
 
 .timeline-lane {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
 }
 
 .timeline-lane__label {
   width: 4rem;
   flex-shrink: 0;
-  font-size: 0.78rem;
-  color: var(--text-dim);
+  font-size: var(--font-size-xs);
+  color: var(--ink-dim);
   text-transform: uppercase;
 }
 
 .timeline-lane__track {
   position: relative;
   flex: 1;
-  height: 1.4rem;
-  border-bottom: 1px solid var(--border);
+  height: var(--space-6);
+  border-bottom: 1px solid var(--border-hairline);
 }
 
 .timeline-chip {
   position: absolute;
   top: 50%;
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
+  box-sizing: border-box;
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-circle);
   transform: translate(-50%, -50%);
-  background: var(--accent);
+  background: var(--color-accent);
 }
 
 .timeline-chip--change-request {
-  background: #f5a623;
+  background: color-mix(in oklab, var(--status-warning) 14%, transparent);
+  border: 1px solid color-mix(in oklab, var(--status-warning) 30%, transparent);
 }
 
 .timeline-chip--gate {
-  background: var(--danger);
+  background: var(--status-danger);
 }
 
 .timeline-chip--result {
-  background: #51cf66;
+  background: color-mix(in oklab, var(--status-success) 14%, transparent);
+  border: 1px solid color-mix(in oklab, var(--status-success) 30%, transparent);
 }
 
 .timeline-chip--ack {
-  background: var(--text-dim);
+  background: var(--ink-dim);
 }

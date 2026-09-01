@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { Button, Field } from "../../components/primitives";
 import { defaultSource, useRunStore } from "../../lib/store";
 import { derivePendingGates, type PendingGate } from "./derive";
 import "./inbox.css";
@@ -33,32 +34,33 @@ function GateItem({ gate }: { gate: PendingGate }) {
         <span className="inbox-item__ts">{gate.ts}</span>
       </div>
       <p className="inbox-item__reason">{gate.reason}</p>
-      <input
-        className="inbox-item__reason-input"
-        type="text"
-        placeholder="사유 입력"
-        value={reason}
-        onChange={(e) => setReason(e.target.value)}
-        disabled={pending !== null}
-        aria-label="승인/반려 사유"
-      />
+      <Field label="승인/반려 사유">
+        <input
+          className="inbox-item__reason-input"
+          type="text"
+          placeholder="사유 입력"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          disabled={pending !== null}
+        />
+      </Field>
       <div className="inbox-item__actions">
         {resolveGate ? (
           <>
-            <button
-              type="button"
+            <Button
+              variant="primary"
               disabled={pending !== null || gate.taskId === ""}
               onClick={() => handleDecision("approve")}
             >
               승인
-            </button>
-            <button
-              type="button"
+            </Button>
+            <Button
+              variant="danger"
               disabled={pending !== null || gate.taskId === ""}
               onClick={() => handleDecision("reject")}
             >
               반려
-            </button>
+            </Button>
           </>
         ) : (
           <span className="inbox-item__unsupported">이 소스에서 지원 안 함</span>

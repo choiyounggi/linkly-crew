@@ -116,7 +116,7 @@ export default function Thread() {
       ref={sectionRef}
       onScroll={handleScroll}
     >
-      <h2>라이브 스레드</h2>
+      <h2 className="panel__title">라이브 스레드</h2>
       {items.length === 0 ? (
         <p>아직 메시지가 없습니다</p>
       ) : (

@@ -22,7 +22,7 @@ export default function TimelineView() {
 
   return (
     <section className="panel panel--timeline timeline-view" aria-label="타임라인">
-      <h2>타임라인</h2>
+      <h2 className="panel__title">타임라인</h2>
       {lanes.length === 0 ? (
         <p>아직 활동이 없습니다</p>
       ) : (
