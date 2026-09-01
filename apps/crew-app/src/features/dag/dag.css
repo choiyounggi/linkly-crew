@@ -65,7 +65,7 @@
 }
 
 .dag-node__initials {
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
 }
 
 .dag-node__id {

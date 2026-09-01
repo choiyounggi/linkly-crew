@@ -65,7 +65,7 @@
 .board-card__badge {
   color: var(--status-danger);
   font-size: var(--font-size-xs);
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
   flex-shrink: 0;
 }
 
@@ -86,7 +86,7 @@
   height: var(--space-6);
   border-radius: var(--radius-circle);
   font-size: var(--font-size-2xs);
-  font-weight: 700;
+  font-weight: var(--font-weight-bold);
   color: var(--ink-text);
   background: var(--border-hairline);
 }

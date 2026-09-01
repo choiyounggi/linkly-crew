@@ -267,10 +267,10 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
           <Button
             variant="primary"
             loading={saveState === "loading"}
-            disabled={!draft || saveState === "loading"}
+            disabled={!draft}
             onClick={() => void handleSave()}
           >
-            저장
+            {saveState === "loading" ? "저장 중…" : "저장"}
           </Button>
           {saveState === "success" && <span className="roster__save-status">저장됨</span>}
           {saveState === "error" && (

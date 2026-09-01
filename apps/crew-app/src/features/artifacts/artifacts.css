@@ -122,7 +122,7 @@
 
 .artifact-detail__name {
   color: var(--ink-text);
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
   font-size: var(--font-size-md);
 }
 
