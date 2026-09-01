@@ -49,7 +49,7 @@ export default function DagView() {
       id: `${e.from}-${e.to}`,
       source: e.from,
       target: e.to,
-      style: e.onCriticalPath ? { stroke: "var(--accent)", strokeWidth: 3 } : undefined,
+      style: e.onCriticalPath ? { stroke: "var(--color-accent)", strokeWidth: 3 } : undefined,
     }));
     return { nodes: flowNodes, edges: flowEdges };
   }, [dag, taskStates]);
