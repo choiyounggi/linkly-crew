@@ -132,11 +132,15 @@
   border-color: var(--status-success);
 }
 
+/* .panel 은 rail/board/roster/timeline/thread 6개 모듈이 className="panel panel--x"
+ * 로 쓰는 단일 정본 기반 클래스다(integration r1 R1) — 지우지 말 것.
+ * border-radius 는 없다: .layout 그리드에서 rail/thread/timeline 은 full-bleed
+ * 컬럼이라 둥근 모서리가 rail 의 직선 border-right 와 어긋나 보인다.
+ */
 .panel {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
-  border-radius: var(--radius-md);
   padding: var(--space-4);
 }
 
