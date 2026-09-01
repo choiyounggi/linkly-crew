@@ -1,16 +1,87 @@
 /* 라틴은 latin subset 만, 한글은 korean subset 만 (F3 리뷰 — 죽은 웨이트 서브셋 제거).
  * ibm-plex-sans-kr 의 latin subset 은 ibm-plex-sans 와 중복이라 쓰지 않는다.
- */
-@import "@fontsource/ibm-plex-mono/latin-300.css";
-@import "@fontsource/ibm-plex-mono/latin-400.css";
-@import "@fontsource/ibm-plex-mono/latin-700.css";
-@import "@fontsource/ibm-plex-sans/latin-300.css";
-@import "@fontsource/ibm-plex-sans/latin-400.css";
-@import "@fontsource/ibm-plex-sans/latin-700.css";
-@import "@fontsource/ibm-plex-sans-kr/korean-300.css";
-@import "@fontsource/ibm-plex-sans-kr/korean-400.css";
-@import "@fontsource/ibm-plex-sans-kr/korean-700.css";
+ *
+ * @fontsource/* 의 CSS(@import)는 한 src 선언 안에 woff2 와 woff 를 함께
+ * 참조해서 Vite 가 둘 다 dist/assets 에 번들한다(.woff 는 런타임에 요청되지
+ * 않음 — .orchestration/notes/t2-baseline.md). 인라인 PostCSS 플러그인으로
+ * @font-face 의 src 에서 format('woff') 만 제거하는 방법을 먼저 시도했으나,
+ * Vite 의 CSS 애셋-URL 리라이트가 그 플러그인보다 먼저 실행돼 .woff 파일이
+ * 이미 애셋으로 등록된 뒤라 dist/assets 의 .woff 개수가 줄지 않았다
+ * (.orchestration/notes/t2-woff-removal.md 참고). 그래서 @import 대신 아래처럼
+ * @font-face 를 손으로 써서 woff2 만 참조한다. */
 @import "./styles/tokens.css";
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300;
+  src: url("@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-300-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url("@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-400-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url("@fontsource/ibm-plex-mono/files/ibm-plex-mono-latin-700-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300;
+  src: url("@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-300-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url("@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-400-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url("@fontsource/ibm-plex-sans/files/ibm-plex-sans-latin-700-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans KR";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 300;
+  src: url("@fontsource/ibm-plex-sans-kr/files/ibm-plex-sans-kr-korean-300-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans KR";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 400;
+  src: url("@fontsource/ibm-plex-sans-kr/files/ibm-plex-sans-kr-korean-400-normal.woff2")
+    format("woff2");
+}
+@font-face {
+  font-family: "IBM Plex Sans KR";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 700;
+  src: url("@fontsource/ibm-plex-sans-kr/files/ibm-plex-sans-kr-korean-700-normal.woff2")
+    format("woff2");
+}
 
 * {
   box-sizing: border-box;
