@@ -1,32 +1,40 @@
+.panel--rail {
+  overflow-y: auto;
+  border-right: 1px solid var(--border-hairline);
+  background: var(--surface-panel);
+}
+
 .rail-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: var(--space-2);
 }
 
 .rail-card {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.5rem 0.6rem;
-  font-size: 0.8rem;
-  color: var(--text);
+  gap: var(--space-1);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-sm);
+  color: var(--ink-text);
 }
 
 .rail-card__header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.4rem;
+  gap: var(--space-2);
 }
 
 .rail-card__name {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
   font-weight: 600;
 }
 
@@ -35,51 +43,66 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.5rem;
-  height: 1.5rem;
-  border-radius: 50%;
-  font-size: 0.65rem;
+  width: var(--space-6);
+  height: var(--space-6);
+  border-radius: var(--radius-circle);
+  font-size: var(--font-size-2xs);
   font-weight: 700;
-  color: var(--text);
-  background: var(--border);
+  color: var(--ink-text);
+  background: var(--border-hairline);
 }
 
 .rail-card__task {
-  color: var(--text-dim);
-  font-size: 0.75rem;
+  color: var(--ink-dim);
+  font-size: var(--font-size-xs);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .rail-card__harness {
-  color: var(--text-dim);
-  font-size: 0.7rem;
+  color: var(--ink-dim);
+  font-size: var(--font-size-2xs);
   text-transform: uppercase;
   letter-spacing: 0.03em;
 }
 
 .rail-badge {
   flex-shrink: 0;
-  font-size: 0.7rem;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--font-size-2xs);
   font-weight: 600;
-  padding: 0.1rem 0.4rem;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-circle);
+  border: 1px solid var(--border-hairline);
+  color: var(--ink-dim);
 }
 
+.rail-badge::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-circle);
+  background: currentColor;
+}
+
+/* T8: rail/index.tsx 의 실제 상태 문자열(작업/응답대기/대기)은 와이어프레임의 4상태
+ * (실행 중/대기/오류/완료)와 다르다. "대기"만 정확히 일치해 --status-warning 을 쓰고,
+ * 나머지(작업/응답대기)는 추측하지 않고 --ink-faint 로 떨어뜨린다 — 완료 보고 (a) 참조. */
 .rail-badge--working {
-  color: var(--accent);
-  border-color: var(--accent);
+  color: var(--ink-faint);
+  border-color: var(--ink-faint);
 }
 
 .rail-badge--awaiting {
-  color: var(--danger);
-  border-color: var(--danger);
+  color: var(--ink-faint);
+  border-color: var(--ink-faint);
 }
 
 .rail-badge--idle {
-  color: var(--text-dim);
-  border-color: var(--border);
+  color: var(--status-warning);
+  border-color: var(--status-warning);
 }

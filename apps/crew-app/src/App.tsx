@@ -9,6 +9,7 @@ import RosterPanel from "./features/roster";
 import SearchBox from "./features/search";
 import Thread from "./features/thread";
 import TimelineView from "./features/timeline";
+import { Button } from "./components/primitives";
 import { defaultSource, useRunStore } from "./lib/store";
 import "./App.css";
 
@@ -38,8 +39,7 @@ export default function App() {
     return defaultSource.onEvent(applyEvent);
   }, [applyEvent]);
 
-  const handleSubmit = (e: FormEvent) => {
-    e.preventDefault();
+  const submitGoal = () => {
     const goal = goalInput.trim();
     if (!goal) {
       setError("요청을 입력하세요");
@@ -47,6 +47,11 @@ export default function App() {
     }
     setError(null);
     void startRun(goal);
+  };
+
+  const handleSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    submitGoal();
   };
 
   return (
@@ -61,9 +66,9 @@ export default function App() {
               placeholder="요청을 입력하세요 (예: 간단한 랜딩 페이지)"
               aria-label="요청"
             />
-            <button type="submit" disabled={isRunning}>
+            <Button variant="primary" loading={isRunning} onClick={submitGoal}>
               {isRunning ? "실행 중…" : "시작"}
-            </button>
+            </Button>
           </form>
           {error && <p className="command-bar__error">{error}</p>}
         </div>

@@ -44,7 +44,7 @@ export default function Rail() {
 
   return (
     <section className="panel panel--rail" aria-label="에이전트 레일">
-      <h2>에이전트 레일</h2>
+      <h2 className="panel__title">에이전트 레일</h2>
       <ul className="rail-list">
         {cards.map((card) => (
           <Card key={card.id} card={card} />
