@@ -1,0 +1,20 @@
+/* contract: t1-foundation owns the implementation.
+ *
+ * 이 파일은 계약 스텁이다. t1-foundation 이 아래 축을 실제 값으로 채운다.
+ * 소비자(t2-chrome / t3-messaging / t4-worksurfaces)는 이 토큰 이름에 대고
+ * 계획하되, t1 이 머지되기 전에는 값이 비어 있다.
+ *
+ * 축:
+ *   --surface-*   표면 계단 (명도로 층을 만든다, 그림자 아님)
+ *   --ink-*       본문/보조/흐린 텍스트
+ *   --accent      액센트 1개
+ *   --status-*    danger / warning / success
+ *   --space-*     4pt 원시 스케일 + 시맨틱 토큰
+ *   --font-*      패밀리 / 크기 / weight / line-height / numeric
+ *   --radius-*    base 하나에서 배수로 유도 + 원형
+ *   --elev-*      표면 레벨별 명도
+ *   --motion-*    duration + named easing
+ *
+ * 호환 레이어: 기존 8개 이름(--bg --bg-panel --border --text --text-dim
+ * --accent --danger)은 삭제되지 않고 위 토큰의 별칭으로 재정의된다.
+ */
