@@ -24,8 +24,8 @@ body,
 }
 
 body {
-  background: var(--bg);
-  color: var(--text);
+  background: var(--surface-paper);
+  color: var(--ink-text);
   font-family: var(--font-sans);
   font-weight: var(--font-weight-body);
   font-size: var(--font-size-md);
