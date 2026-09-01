@@ -325,11 +325,25 @@ task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ---
 
-## 4. 다음 스텝 — M10 완료 후 잔여
+## 4. 다음 스텝 — M11 완료 후 잔여
 
-M1~M11 완료·실측 검증됨(§3). 다음 후보:
+M1~M11 완료·실측 검증됨(§3).
 
-**M10 완료 후 잔여 (작은 것부터)**:
+> **작업 항목은 이제 GitHub 이슈가 정본이다** (2026-09-01). 아래 목록은 이력으로 남긴다 —
+> 새 작업을 고를 때는 이슈를 볼 것. 이슈는 자기완결적이라 이 문서를 읽지 않아도 착수할 수 있다.
+>
+> | 이슈 | 내용 |
+> |---|---|
+> | [#2](https://github.com/choiyounggi/linkly-crew/issues/2) | GUI `scripted=false` 실 런 1클릭 확인 (사람 1분) |
+> | [#3](https://github.com/choiyounggi/linkly-crew/issues/3) | Browser DoD 실제 실행 (지금은 항상 `skipped`) |
+> | [#4](https://github.com/choiyounggi/linkly-crew/issues/4) | auto-memory 스폰 세션 주입 차단 (함정 8 잔여 ①) |
+> | [#5](https://github.com/choiyounggi/linkly-crew/issues/5) | **함정 29** — 패키지 스크립트 간접 실행 (미해소·해소 불가) |
+> | [#6](https://github.com/choiyounggi/linkly-crew/issues/6) | **함정 30** — `project_root: Some`의 cwd 공유 (미해소) |
+>
+> `project_root`를 켜는 작업(GUI 피커 등)은 #5와 #6을 **동시에** 무장시킨다. 착수 전 둘 다 읽을 것.
+
+**M11 완료 후 잔여 (작은 것부터)**:
+
 1. GUI에서 scripted=false 실 런 1클릭 확인 (사람 1분 — 네이티브 창이라 자동화 불가;
    현재 코디네이터 수동 진행 중).
 2. Browser DoD 실제 실행 (M3부터 skip 기록만, M9 G0로 스코프 아웃 — 착수 전).
