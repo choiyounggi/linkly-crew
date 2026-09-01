@@ -1,33 +1,41 @@
+.panel--rail {
+  overflow-y: auto;
+  border-right: 1px solid var(--border-hairline);
+  background: var(--surface-panel);
+}
+
 .rail-list {
   list-style: none;
   margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: var(--space-2);
 }
 
 .rail-card {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
-  background: var(--bg-panel);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.5rem 0.6rem;
-  font-size: 0.8rem;
-  color: var(--text);
+  gap: var(--space-1);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-sm);
+  color: var(--ink-text);
 }
 
 .rail-card__header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.4rem;
+  gap: var(--space-2);
 }
 
 .rail-card__name {
-  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
 }
 
 .rail-card__avatar {
@@ -35,51 +43,71 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.5rem;
-  height: 1.5rem;
-  border-radius: 50%;
-  font-size: 0.65rem;
-  font-weight: 700;
-  color: var(--text);
-  background: var(--border);
+  width: var(--space-6);
+  height: var(--space-6);
+  border-radius: var(--radius-circle);
+  font-size: var(--font-size-2xs);
+  font-weight: var(--font-weight-bold);
+  color: var(--ink-text);
+  background: var(--border-hairline);
 }
 
 .rail-card__task {
-  color: var(--text-dim);
-  font-size: 0.75rem;
+  color: var(--ink-dim);
+  font-size: var(--font-size-xs);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .rail-card__harness {
-  color: var(--text-dim);
-  font-size: 0.7rem;
+  color: var(--ink-dim);
+  font-size: var(--font-size-2xs);
   text-transform: uppercase;
   letter-spacing: 0.03em;
 }
 
 .rail-badge {
   flex-shrink: 0;
-  font-size: 0.7rem;
-  font-weight: 600;
-  padding: 0.1rem 0.4rem;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--font-size-2xs);
+  font-weight: var(--font-weight-semibold);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-circle);
+  border: 1px solid var(--border-hairline);
+  color: var(--ink-dim);
 }
 
+.rail-badge::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-circle);
+  background: currentColor;
+}
+
+/* r1 F1: 상태 색은 와이어프레임 한국어 라벨이 아니라 derive.ts 의 RailStatus 의미로
+ * 매핑한다 — union 이 {working, awaiting, idle} 세 값으로 닫혀 있어 T8 의 "모르는 상태"
+ * 폴백 전제가 애초에 성립하지 않는다(derive.ts:95 assign 중 응답 대기 -> awaiting,
+ * derive.ts:105 런 없음/종료 -> idle). working=성공(진행 중), awaiting=경고(응답 대기로
+ * 막힘), idle=옅게(할 일 없음). 텍스트 배지는 형제 모듈(.thread-badge--warning)과 같은
+ * color-mix 틴트 공식을 쓴다 — r1 F2. */
 .rail-badge--working {
-  color: var(--accent);
-  border-color: var(--accent);
+  color: var(--status-success);
+  border-color: color-mix(in oklab, var(--status-success) 30%, transparent);
+  background: color-mix(in oklab, var(--status-success) 14%, transparent);
 }
 
 .rail-badge--awaiting {
-  color: var(--danger);
-  border-color: var(--danger);
+  color: var(--status-warning);
+  border-color: color-mix(in oklab, var(--status-warning) 30%, transparent);
+  background: color-mix(in oklab, var(--status-warning) 14%, transparent);
 }
 
 .rail-badge--idle {
-  color: var(--text-dim);
-  border-color: var(--border);
+  color: var(--ink-faint);
+  border-color: var(--ink-faint);
 }
