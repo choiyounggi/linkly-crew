@@ -87,7 +87,7 @@
 }
 
 .search-box__result-kind {
-  font-weight: 600;
+  font-weight: var(--font-weight-semibold);
   margin-right: var(--space-2);
 }
 
