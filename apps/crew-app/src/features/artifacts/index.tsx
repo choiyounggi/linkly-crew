@@ -66,7 +66,7 @@ export default function Artifacts() {
 
   return (
     <section className="artifacts-view" aria-label="아티팩트">
-      <h2>아티팩트</h2>
+      <h2 className="panel__title">아티팩트</h2>
       <div className="artifacts-view__matrix">
         <ReqMatrix matrix={matrix} />
       </div>
