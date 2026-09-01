@@ -71,7 +71,6 @@
 .timeline-chip {
   position: absolute;
   top: 50%;
-  box-sizing: border-box;
   width: var(--space-2);
   height: var(--space-2);
   border-radius: var(--radius-circle);
@@ -80,8 +79,7 @@
 }
 
 .timeline-chip--change-request {
-  background: color-mix(in oklab, var(--status-warning) 14%, transparent);
-  border: 1px solid color-mix(in oklab, var(--status-warning) 30%, transparent);
+  background: var(--status-warning);
 }
 
 .timeline-chip--gate {
@@ -89,8 +87,7 @@
 }
 
 .timeline-chip--result {
-  background: color-mix(in oklab, var(--status-success) 14%, transparent);
-  border: 1px solid color-mix(in oklab, var(--status-success) 30%, transparent);
+  background: var(--status-success);
 }
 
 .timeline-chip--ack {
