@@ -6,6 +6,7 @@
 
 import { useRef, useState, type FormEvent } from "react";
 
+import { Button } from "../../components/primitives";
 import { defaultSource, useRunStore } from "../../lib/store";
 import type { RunEventSource } from "../../lib/source";
 import type { Envelope } from "../../lib/types";
@@ -31,8 +32,7 @@ export default function SearchBox({ source = defaultSource }: SearchBoxProps) {
 
   const close = () => setOpen(false);
 
-  const handleSubmit = (e: FormEvent) => {
-    e.preventDefault();
+  const runSearch = () => {
     const trimmed = query.trim();
     if (!trimmed) return;
 
@@ -56,6 +56,11 @@ export default function SearchBox({ source = defaultSource }: SearchBoxProps) {
     void run();
   };
 
+  const handleSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    runSearch();
+  };
+
   return (
     <div className="search-box">
       <form onSubmit={handleSubmit}>
@@ -66,7 +71,9 @@ export default function SearchBox({ source = defaultSource }: SearchBoxProps) {
           placeholder="검색"
           aria-label="전역 검색"
         />
-        <button type="submit">검색</button>
+        <Button variant="ghost" onClick={runSearch}>
+          검색
+        </Button>
       </form>
       {open && (
         <div className="search-box__panel" role="listbox" aria-label="검색 결과">

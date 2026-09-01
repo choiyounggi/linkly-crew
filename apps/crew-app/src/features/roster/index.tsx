@@ -8,6 +8,7 @@ import { useEffect, useState } from "react";
 import { defaultSource, useRunStore } from "../../lib/store";
 import type { RunEventSource } from "../../lib/source";
 import type { HarnessInfo, Roster, RosterAgent, RosterPreset } from "../../lib/types";
+import { Button, Field } from "../../components/primitives";
 import "./roster.css";
 
 interface RosterPanelProps {
@@ -80,7 +81,7 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
   if (!supported) {
     return (
       <section className="panel panel--roster" aria-label="로스터">
-        <h2>로스터</h2>
+        <h2 className="panel__title">로스터</h2>
         <p className="roster__status">이 소스에서 지원 안 함</p>
       </section>
     );
@@ -151,7 +152,7 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
 
   return (
     <section className="panel panel--roster" aria-label="로스터">
-      <h2>로스터</h2>
+      <h2 className="panel__title">로스터</h2>
 
       {loadState === "loading" && <p className="roster__status">불러오는 중…</p>}
       {loadState === "error" && (
@@ -160,19 +161,16 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
 
       {supportsPresets && (
         <div className="roster__presets">
-          <label htmlFor="roster-preset-select">프리셋</label>
-          <select
-            id="roster-preset-select"
-            value={selectedPresetName}
-            onChange={(e) => handlePresetChange(e.target.value)}
-          >
-            <option value="">선택…</option>
-            {presets.map((p) => (
-              <option key={p.name} value={p.name}>
-                {p.name}
-              </option>
-            ))}
-          </select>
+          <Field label="프리셋">
+            <select value={selectedPresetName} onChange={(e) => handlePresetChange(e.target.value)}>
+              <option value="">선택…</option>
+              {presets.map((p) => (
+                <option key={p.name} value={p.name}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </Field>
         </div>
       )}
 
@@ -209,6 +207,7 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
                   {supportsSwap && (
                     <button
                       type="button"
+                      className="btn btn--ghost btn--sm"
                       aria-label={`${agent.role} 교체`}
                       disabled={!canSwap || swapping}
                       onClick={() => handleSwap(agent.id, agent.harness)}
@@ -218,6 +217,7 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
                   )}
                   <button
                     type="button"
+                    className="btn btn--danger btn--sm"
                     aria-label={`슬롯 삭제 ${agent.id}`}
                     disabled={agent.role === "lead"}
                     onClick={() => handleDeleteSlot(agent.id)}
@@ -256,17 +256,22 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
               ))
             )}
           </select>
-          <button type="button" onClick={handleAddSlot} disabled={missingRoles.length === 0}>
+          <Button variant="primary" onClick={handleAddSlot} disabled={missingRoles.length === 0}>
             추가
-          </button>
+          </Button>
         </div>
       )}
 
       {supportsSetRoster && (
         <div className="roster__save">
-          <button type="button" onClick={() => void handleSave()} disabled={!draft || saveState === "loading"}>
+          <Button
+            variant="primary"
+            loading={saveState === "loading"}
+            disabled={!draft}
+            onClick={() => void handleSave()}
+          >
             {saveState === "loading" ? "저장 중…" : "저장"}
-          </button>
+          </Button>
           {saveState === "success" && <span className="roster__save-status">저장됨</span>}
           {saveState === "error" && (
             <span className="roster__save-status roster__save-status--error">저장 실패: {saveError}</span>

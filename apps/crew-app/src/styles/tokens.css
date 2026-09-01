@@ -1,0 +1,127 @@
+/* Direction 1 "터미널 밀도" — anchor hue ~215° (cool blue-cyan), dark-only (D19).
+ * 표면·잉크는 앵커 hue 로 tint, 액센트 1개(D6), 상태색은 별도 hue.
+ * 한글 라벨(보드/DAG/타임라인/승인함/아티팩트)이 시스템 폰트로 폴백되지 않도록
+ * 라틴 페이스마다 한글 동반 페이스를 명시적으로 짝짓는다(D7 확장, 사용자 결정).
+ */
+:root {
+  color-scheme: dark;
+
+  /* ---- 색: 표면 계단 (elevation = lightness, D4·D5) ---- */
+  --elev-0: 13%;
+  --elev-1: 16%;
+  --elev-2: 19%;
+  --elev-3: 22%;
+  --surface-chroma: 0.012;
+  --surface-hue: 215;
+
+  --surface-paper: oklch(var(--elev-0) var(--surface-chroma) var(--surface-hue));
+  --surface-panel: oklch(var(--elev-1) var(--surface-chroma) var(--surface-hue));
+  --surface-raised: oklch(var(--elev-2) var(--surface-chroma) var(--surface-hue));
+  --surface-overlay: oklch(var(--elev-3) var(--surface-chroma) var(--surface-hue));
+
+  --border-hairline: oklch(27% 0.014 var(--surface-hue));
+
+  /* ---- 색: 잉크 (같은 hue 로 tint, D5) ---- */
+  --ink-text: oklch(92% 0.01 var(--surface-hue));
+  --ink-dim: oklch(68% 0.014 var(--surface-hue));
+  --ink-faint: oklch(50% 0.014 var(--surface-hue));
+
+  /* ---- 색: 액센트 1개 (D6) ---- */
+  --color-accent: oklch(68% 0.16 var(--surface-hue));
+  --color-accent-ink: oklch(14% 0.02 var(--surface-hue));
+
+  /* ---- 색: 상태 (D3 전부 oklch) ---- */
+  --status-danger: oklch(66% 0.19 25);
+  --status-warning: oklch(76% 0.15 80);
+  --status-success: oklch(72% 0.15 150);
+
+  /* ---- spacing: 4pt 원시 스케일 (D8) ---- */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.25rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-10: 2.5rem;
+
+  /* ---- spacing: 시맨틱 ---- */
+  --space-xs: var(--space-1);
+  --space-sm: var(--space-2);
+  --space-md: var(--space-3);
+  --space-lg: var(--space-4);
+  --space-xl: var(--space-6);
+  --space-2xl: var(--space-8);
+
+  /* ---- 타이포: 패밀리 (한글 동반 페이스 짝짓기) ---- */
+  --font-sans: "IBM Plex Sans", "IBM Plex Sans KR", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "IBM Plex Sans KR", ui-monospace, monospace;
+
+  /* ---- 타이포: 크기 스케일 (D10 r2 정정 — 크기 축 3배 점프는 이 방향에 적용하지
+   * 않는다. weight 축 극단으로 위계를 세운다. 사용처 없는 크기 토큰은 두지 않는다
+   * — 필요해지면 그때 근거와 함께 추가한다, r2 F5) ---- */
+  --font-size-2xs: 0.6875rem;
+  --font-size-xs: 0.75rem;
+  /* sm: 컨트롤(버튼/인풋) 텍스트, md: 기본 본문 — 의도적으로 한 단계 차이(r1 F2) */
+  --font-size-sm: 0.8125rem;
+  --font-size-md: 0.875rem;
+  /* lg: 화면/패널 제목 — task 03 와이어프레임의 화면 제목 처리와 동일(r2 F4) */
+  --font-size-lg: 1.25rem;
+
+  /* ---- 타이포: weight (양끝에서, D10 — 300 대 700, 400 대 600 아님) ---- */
+  --font-weight-light: 300;
+  --font-weight-regular: 400;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+  --font-weight-heading: var(--font-weight-bold);
+  /* 라이트 온 다크 광학 굵어짐 보정: regular 보다 한 단계 가볍게(D4) */
+  --font-weight-body: var(--font-weight-light);
+
+  --line-height-tight: 1.25;
+  --line-height-normal: 1.45;
+  --line-height-relaxed: 1.6;
+
+  /* ---- 타이포: 숫자 정렬 (D11) ---- */
+  --font-numeric: tabular-nums;
+
+  /* ---- radius: base 하나에서 배수 파생 (D9, Orca 구조 참고) ---- */
+  --radius: 0.5rem;
+  --radius-xs: calc(var(--radius) * 0.25);
+  --radius-sm: calc(var(--radius) * 0.5);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) * 1.5);
+  --radius-xl: calc(var(--radius) * 2);
+  --radius-circle: 9999px;
+
+  /* ---- elevation: 레벨별 표면 명도 (그림자 아님, D4) ---- */
+  --elev-level-0: var(--surface-paper);
+  --elev-level-1: var(--surface-panel);
+  --elev-level-2: var(--surface-raised);
+  --elev-level-3: var(--surface-overlay);
+
+  /* ---- 모션: duration + named easing (transform/opacity 전용, D12) ---- */
+  --motion-duration-fast: 100ms;
+  --motion-duration-base: 150ms;
+  --motion-duration-slow: 250ms;
+  --motion-ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --motion-ease-decelerate: cubic-bezier(0, 0, 0, 1);
+  --motion-ease-accelerate: cubic-bezier(0.3, 0, 1, 1);
+
+  /* ---- 호환 레이어: 기존 8개 이름을 별칭으로 유지 (D17) ---- */
+  --bg: var(--surface-paper);
+  --bg-panel: var(--surface-panel);
+  --border: var(--border-hairline);
+  --text: var(--ink-text);
+  --text-dim: var(--ink-dim);
+  --accent: var(--color-accent);
+  --danger: var(--status-danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-duration-fast: 0s;
+    --motion-duration-base: 0s;
+    --motion-duration-slow: 0s;
+  }
+}

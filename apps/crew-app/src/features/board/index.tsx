@@ -50,7 +50,7 @@ export default function Board() {
 
   return (
     <section className="panel panel--board" aria-label="스프린트 보드">
-      <h2>스프린트 보드</h2>
+      <h2 className="panel__title">스프린트 보드</h2>
       <div className="board-columns">
         {COLUMNS.map(({ key, label }) => (
           <section key={key} className="board-column" aria-label={label}>
