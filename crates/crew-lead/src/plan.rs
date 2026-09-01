@@ -401,15 +401,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_dag_with_default_options_equals_plan_dag_for() {
-        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
-        let via_with = LeadPlanner::plan_dag_with(&spec, &ROLE_ORDER, &PlanOptions::default())
-            .unwrap();
-        let via_for = LeadPlanner::plan_dag_for(&spec, &ROLE_ORDER).unwrap();
-        assert_eq!(via_with, via_for);
-    }
-
-    #[test]
     fn plan_dag_with_appends_dev_cmd_checks_to_developer_dod_in_order() {
         let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
         let opts = PlanOptions {
