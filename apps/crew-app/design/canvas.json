@@ -1,0 +1,11 @@
+{
+  "artboards": [
+    { "file": "Main.dc.html", "x": 0, "y": 0, "w": 1440, "h": 900, "title": "① 셸" },
+    { "file": "Board.dc.html", "x": 1500, "y": 0, "w": 1440, "h": 900, "title": "② 보드" },
+    { "file": "Dag.dc.html", "x": 3000, "y": 0, "w": 1440, "h": 900, "title": "③ DAG" },
+    { "file": "Thread.dc.html", "x": 0, "y": 960, "w": 1440, "h": 900, "title": "④ 스레드" },
+    { "file": "Inbox.dc.html", "x": 1500, "y": 960, "w": 1440, "h": 900, "title": "⑤ 승인함" },
+    { "file": "Artifacts.dc.html", "x": 3000, "y": 960, "w": 1440, "h": 900, "title": "⑥ 아티팩트" }
+  ],
+  "launch": { "view": "canvas" }
+}

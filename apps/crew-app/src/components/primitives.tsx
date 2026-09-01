@@ -1,12 +1,11 @@
 // contract: t1-foundation owns the implementation.
 //
-// 이 파일은 계약 스텁이다 — 시그니처만 확정하고 구현은 t1-foundation 이 채운다.
-// 소비자(t2-chrome / t3-messaging / t4-worksurfaces)는 이 시그니처에 대고
-// 계획한다. t1 이 머지되기 전에 호출하면 의도적으로 throw 한다.
+// 소비자(t2-chrome / t3-messaging / t4-worksurfaces)는 이 시그니처에 대고 계획한다.
+// 시그니처를 바꿔야 한다면 plan gap 으로 보고한다 — 소비자 3개가 여기 묶여 있다.
 
-import type { ReactNode } from "react";
+import { cloneElement, isValidElement, useId, type ReactElement, type ReactNode } from "react";
 
-const NOT_IMPLEMENTED = "primitives: t1-foundation 미머지 — 계약 스텁";
+import "./primitives.css";
 
 export type ButtonProps = {
   variant: "primary" | "danger" | "ghost";
@@ -41,22 +40,67 @@ export type FieldProps = {
   children: ReactNode;
 };
 
-export function Button(_props: ButtonProps): never {
-  throw new Error(NOT_IMPLEMENTED);
+export function Button({ variant, size = "md", loading = false, disabled = false, onClick, children }: ButtonProps) {
+  return (
+    <button
+      type="button"
+      className={`btn btn--${variant} btn--${size}${loading ? " is-loading" : ""}`}
+      disabled={disabled || loading}
+      aria-busy={loading || undefined}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
 }
 
-export function IconButton(_props: IconButtonProps): never {
-  throw new Error(NOT_IMPLEMENTED);
+export function IconButton({ label, disabled = false, onClick, children }: IconButtonProps) {
+  return (
+    <button type="button" className="icon-btn" aria-label={label} disabled={disabled} onClick={onClick}>
+      {children}
+    </button>
+  );
 }
 
-export function Badge(_props: BadgeProps): never {
-  throw new Error(NOT_IMPLEMENTED);
+export function Badge({ variant, children }: BadgeProps) {
+  return (
+    <span className={`badge badge--${variant}`} data-testid="badge">
+      {children}
+    </span>
+  );
 }
 
-export function Panel(_props: PanelProps): never {
-  throw new Error(NOT_IMPLEMENTED);
+export function Panel({ title, level = 1, children }: PanelProps) {
+  return (
+    <section className={`panel panel--level-${level}`}>
+      {title !== undefined && <h2 className="panel__title">{title}</h2>}
+      <div className="panel__body">{children}</div>
+    </section>
+  );
 }
 
-export function Field(_props: FieldProps): never {
-  throw new Error(NOT_IMPLEMENTED);
+export function Field({ label, error, children }: FieldProps) {
+  const inputId = useId();
+  const errorId = useId();
+  const input = isValidElement(children)
+    ? cloneElement(children as ReactElement<{ id?: string; "aria-describedby"?: string; "aria-invalid"?: boolean }>, {
+        id: inputId,
+        "aria-describedby": error ? errorId : undefined,
+        "aria-invalid": error ? true : undefined,
+      })
+    : children;
+
+  return (
+    <div className={`field${error ? " field--error" : ""}`}>
+      <label className="field__label" htmlFor={inputId}>
+        {label}
+      </label>
+      {input}
+      {error && (
+        <p className="field__error" id={errorId} role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
 }

@@ -1,0 +1,89 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;700&family=IBM+Plex+Sans:wght@300;400;700&display=swap');
+    :root {
+      --elev-0: 13%; --elev-1: 16%; --elev-2: 19%;
+      --surface-chroma: 0.012; --surface-hue: 215;
+      --surface-paper: oklch(var(--elev-0) var(--surface-chroma) var(--surface-hue));
+      --surface-panel: oklch(var(--elev-1) var(--surface-chroma) var(--surface-hue));
+      --surface-raised: oklch(var(--elev-2) var(--surface-chroma) var(--surface-hue));
+      --border-hairline: oklch(27% 0.014 var(--surface-hue));
+      --ink-text: oklch(92% 0.01 var(--surface-hue));
+      --ink-dim: oklch(68% 0.014 var(--surface-hue));
+      --color-accent: oklch(68% 0.16 var(--surface-hue));
+      --status-danger: oklch(66% 0.19 25);
+      --status-success: oklch(72% 0.15 150);
+      --space-1: 0.25rem; --space-2: 0.5rem; --space-3: 0.75rem; --space-4: 1rem;
+      --font-sans: "IBM Plex Sans", "IBM Plex Sans KR", system-ui, sans-serif;
+      --font-mono: "IBM Plex Mono", "IBM Plex Sans KR", ui-monospace, monospace;
+      --font-size-2xs: 0.6875rem; --font-size-xs: 0.75rem; --font-size-sm: 0.8125rem; --font-size-lg: 1.25rem;
+      --font-weight-light: 300; --font-weight-regular: 400; --font-weight-bold: 700;
+      --radius-sm: 0.25rem; --radius-md: 0.5rem; --radius-circle: 9999px;
+    }
+    body { margin: 0; background: var(--surface-paper); color: var(--ink-text); font-family: var(--font-sans); font-weight: var(--font-weight-light); }
+    .mono { font-family: var(--font-mono); }
+  </style>
+</helmet>
+<div style="width:1440px; height:900px; background:var(--surface-paper); display:flex; flex-direction:column;">
+
+  <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--border-hairline); background:var(--surface-panel); padding:var(--space-2) var(--space-4);">
+    <div class="mono" style="font-size:var(--font-size-sm); color:var(--ink-text);">crew-app</div>
+    <div style="display:flex; gap:var(--space-4);">
+      <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-text); border-bottom:2px solid var(--color-accent); padding-bottom:2px;">보드</div>
+      <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-dim);">DAG</div>
+      <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-dim);">타임라인</div>
+      <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-dim);">승인함</div>
+      <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-dim);">아티팩트</div>
+    </div>
+  </div>
+
+  <div style="flex:1; min-height:0; display:flex;">
+    <div style="width:240px; flex-shrink:0; background:var(--surface-panel); border-right:1px solid var(--border-hairline);"></div>
+    <div style="flex:1; min-width:0; background:var(--surface-paper);"></div>
+
+    <!-- right panel: thread emphasized -->
+    <div style="width:360px; flex-shrink:0; background:var(--surface-panel); border-left:1px solid var(--border-hairline); padding:var(--space-4) var(--space-3); box-sizing:border-box; display:flex; flex-direction:column; gap:var(--space-3); min-height:0;">
+      <div style="font-size:var(--font-size-lg); font-weight:var(--font-weight-bold);">스레드 — 빌드-02</div>
+      <div style="flex:1; display:flex; flex-direction:column; gap:var(--space-2); overflow:hidden;">
+        <sc-for list="{{msgs}}" as="m" hint-placeholder-count="6">
+          <div style="border:1px solid {{m.border}}; border-radius:var(--radius-md); padding:var(--space-2) var(--space-3); background:{{m.bg}};">
+            <div style="display:flex; align-items:center; gap:var(--space-2); flex-wrap:wrap;">
+              <span class="mono" style="font-size:var(--font-size-2xs); color:var(--ink-text); font-weight:var(--font-weight-bold);">{{m.who}}</span>
+              <span class="mono" style="font-size:var(--font-size-2xs); color:var(--ink-dim); margin-left:auto;">{{m.ts}}</span>
+            </div>
+            <div style="font-size:var(--font-size-sm); color:var(--ink-text); margin-top:var(--space-1); line-height:1.4;">{{m.text}}</div>
+          </div>
+        </sc-for>
+      </div>
+      <div style="border-top:1px solid var(--border-hairline); padding-top:var(--space-3);">
+        <div style="background:var(--surface-raised); border:1px solid var(--border-hairline); border-radius:var(--radius-md); padding:var(--space-2) var(--space-3); color:var(--ink-dim); font-size:var(--font-size-sm);">메시지 입력…</div>
+      </div>
+    </div>
+  </div>
+</div>
+<script data-dc-script data-props='{}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      msgs: [
+        { who: "빌드-02", text: "타입 에러 3건 수정하고 재빌드 중이에요", ts: "10:12", border: "var(--border-hairline)", bg: "var(--surface-raised)" },
+        { who: "리뷰-01", text: "PR #182 리뷰 완료, 코멘트 2개 남겼습니다", ts: "10:14", border: "var(--border-hairline)", bg: "var(--surface-raised)" },
+        { who: "테스트-03", text: "빌드 실패 — 타입 체크 오류 발생", ts: "10:15", border: "var(--status-danger)", bg: "var(--surface-raised)" },
+        { who: "빌드-02", text: "테스트 통과, 배포 대기열에 등록했어요", ts: "10:20", border: "var(--border-hairline)", bg: "var(--surface-raised)" },
+        { who: "나", text: "승인함으로 옮겨줘", ts: "10:21", border: "var(--color-accent)", bg: "var(--surface-raised)" },
+      ],
+    };
+  }
+}
+</script>
+</x-dc>
+</body>
+</html>

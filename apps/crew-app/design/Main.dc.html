@@ -1,0 +1,153 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;700&family=IBM+Plex+Sans:wght@300;400;700&display=swap');
+    :root {
+      --elev-0: 13%; --elev-1: 16%; --elev-2: 19%; --elev-3: 22%;
+      --surface-chroma: 0.012; --surface-hue: 215;
+      --surface-paper: oklch(var(--elev-0) var(--surface-chroma) var(--surface-hue));
+      --surface-panel: oklch(var(--elev-1) var(--surface-chroma) var(--surface-hue));
+      --surface-raised: oklch(var(--elev-2) var(--surface-chroma) var(--surface-hue));
+      --surface-overlay: oklch(var(--elev-3) var(--surface-chroma) var(--surface-hue));
+      --border-hairline: oklch(27% 0.014 var(--surface-hue));
+      --ink-text: oklch(92% 0.01 var(--surface-hue));
+      --ink-dim: oklch(68% 0.014 var(--surface-hue));
+      --ink-faint: oklch(50% 0.014 var(--surface-hue));
+      --color-accent: oklch(68% 0.16 var(--surface-hue));
+      --color-accent-ink: oklch(14% 0.02 var(--surface-hue));
+      --status-danger: oklch(66% 0.19 25);
+      --status-warning: oklch(76% 0.15 80);
+      --status-success: oklch(72% 0.15 150);
+      --space-1: 0.25rem; --space-2: 0.5rem; --space-3: 0.75rem; --space-4: 1rem; --space-5: 1.25rem; --space-6: 1.5rem;
+      --font-sans: "IBM Plex Sans", "IBM Plex Sans KR", system-ui, sans-serif;
+      --font-mono: "IBM Plex Mono", "IBM Plex Sans KR", ui-monospace, monospace;
+      --font-size-2xs: 0.6875rem; --font-size-xs: 0.75rem; --font-size-sm: 0.8125rem; --font-size-md: 0.8125rem; --font-size-lg: 1.25rem; --font-size-xl: 1.75rem; --font-size-display: 2.75rem;
+      --font-weight-light: 300; --font-weight-regular: 400; --font-weight-bold: 700;
+      --radius: 0.5rem; --radius-xs: calc(var(--radius) * 0.25); --radius-sm: calc(var(--radius) * 0.5); --radius-md: var(--radius); --radius-lg: calc(var(--radius) * 1.5); --radius-circle: 9999px;
+    }
+    body { margin: 0; background: var(--surface-paper); color: var(--ink-text); font-family: var(--font-sans); font-weight: var(--font-weight-light); }
+    a { color: var(--color-accent); }
+    a:hover { color: oklch(76% 0.16 215); }
+    .mono { font-family: var(--font-mono); }
+    .callout { position: absolute; font-family: var(--font-mono); font-size: 10px; color: var(--color-accent); background: var(--surface-overlay); padding: 2px 6px; border-radius: var(--radius-xs); border: 1px solid var(--border-hairline); white-space: nowrap; }
+  </style>
+</helmet>
+<div style="width:1440px; height:900px; background:var(--surface-paper); display:flex; flex-direction:column; position:relative;">
+
+  <div class="callout" style="top:6px; right:6px;">① 셸 — command-bar + view-tabs + 3열 레이아웃</div>
+
+  <!-- command-bar -->
+  <div style="display:flex; align-items:center; justify-content:space-between; gap:var(--space-4); border-bottom:1px solid var(--border-hairline); background:var(--surface-panel); padding:var(--space-3) var(--space-4); position:relative;">
+    <div style="display:flex; gap:var(--space-2); flex:1; min-width:0;">
+      <div style="flex:1; background:var(--surface-paper); border:1px solid var(--border-hairline); border-radius:var(--radius-sm); padding:var(--space-2) var(--space-3); color:var(--ink-dim); font-size:var(--font-size-sm);">요청을 입력하세요 (예: 간단한 랜딩 페이지)</div>
+      <div style="background:var(--color-accent); color:var(--color-accent-ink); border-radius:var(--radius-sm); padding:var(--space-2) var(--space-4); font-size:var(--font-size-sm); font-weight:var(--font-weight-bold);">시작</div>
+    </div>
+    <div style="width:220px; background:var(--surface-paper); border:1px solid var(--border-hairline); border-radius:var(--radius-sm); padding:var(--space-2) var(--space-3); color:var(--ink-faint); font-size:var(--font-size-sm);">검색…</div>
+  </div>
+
+  <!-- view-tabs -->
+  <div style="display:flex; gap:var(--space-1); border-bottom:1px solid var(--border-hairline); background:var(--surface-panel); padding:var(--space-2) var(--space-4) 0;">
+    <sc-for list="{{tabs}}" as="t" hint-placeholder-count="5">
+      <div class="mono" style="padding:var(--space-2) var(--space-3); font-size:var(--font-size-xs); color:{{t.color}}; border-bottom:2px solid {{t.borderColor}};">{{t.label}}</div>
+    </sc-for>
+  </div>
+
+  <!-- 3-col layout -->
+  <div style="flex:1; min-height:0; display:flex; position:relative;">
+    <div class="callout" style="top:8px; left:8px;">rail 240px</div>
+    <div class="callout" style="top:8px; left:280px;">body — flex:1</div>
+    <div class="callout" style="top:8px; right:8px;">우측 360px</div>
+
+    <!-- rail -->
+    <div style="width:240px; flex-shrink:0; background:var(--surface-panel); border-right:1px solid var(--border-hairline); padding:var(--space-6) var(--space-2) var(--space-2); box-sizing:border-box; display:flex; flex-direction:column; gap:var(--space-2);">
+      <sc-for list="{{rail}}" as="r" hint-placeholder-count="6">
+        <div style="display:flex; flex-direction:column; gap:var(--space-1); background:var(--surface-raised); border:1px solid var(--border-hairline); border-radius:var(--radius-md); padding:var(--space-2) var(--space-3);">
+          <div style="display:flex; align-items:center; gap:var(--space-2);">
+            <div style="width:6px; height:6px; border-radius:var(--radius-circle); background:{{r.dot}};"></div>
+            <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-text);">{{r.name}}</div>
+          </div>
+          <div style="font-size:var(--font-size-2xs); color:var(--ink-dim); padding-left:14px;">{{r.state}}</div>
+        </div>
+      </sc-for>
+    </div>
+
+    <!-- body: board placeholder -->
+    <div style="flex:1; min-width:0; background:var(--surface-paper); padding:var(--space-6) var(--space-4) var(--space-4); box-sizing:border-box; display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:var(--space-3);">
+      <sc-for list="{{cols}}" as="c" hint-placeholder-count="5">
+        <div style="display:flex; flex-direction:column; gap:var(--space-2);">
+          <div class="mono" style="font-size:var(--font-size-2xs); text-transform:uppercase; letter-spacing:.04em; color:var(--ink-dim);">{{c.name}}</div>
+          <sc-for list="{{c.items}}" as="it" hint-placeholder-count="2">
+            <div style="background:var(--surface-panel); border:1px solid var(--border-hairline); border-radius:var(--radius-md); padding:var(--space-2) var(--space-3);">
+              <div style="font-size:var(--font-size-sm); font-weight:var(--font-weight-regular); color:var(--ink-text); line-height:1.3;">{{it.title}}</div>
+            </div>
+          </sc-for>
+        </div>
+      </sc-for>
+    </div>
+
+    <!-- right: thread + roster -->
+    <div style="width:360px; flex-shrink:0; background:var(--surface-panel); border-left:1px solid var(--border-hairline); padding:var(--space-6) var(--space-3) var(--space-3); box-sizing:border-box; display:flex; flex-direction:column; gap:var(--space-3); min-height:0;">
+      <div class="mono" style="font-size:var(--font-size-2xs); text-transform:uppercase; letter-spacing:.04em; color:var(--ink-dim);">스레드</div>
+      <div style="flex:1; display:flex; flex-direction:column; gap:var(--space-2); overflow:hidden;">
+        <sc-for list="{{msgs}}" as="m" hint-placeholder-count="3">
+          <div style="background:var(--surface-raised); border:1px solid var(--border-hairline); border-radius:var(--radius-md); padding:var(--space-2) var(--space-3);">
+            <div class="mono" style="font-size:var(--font-size-2xs); color:var(--ink-dim);">{{m.who}}</div>
+            <div style="font-size:var(--font-size-sm); color:var(--ink-text); margin-top:2px;">{{m.text}}</div>
+          </div>
+        </sc-for>
+      </div>
+      <div class="mono" style="font-size:var(--font-size-2xs); text-transform:uppercase; letter-spacing:.04em; color:var(--ink-dim); border-top:1px solid var(--border-hairline); padding-top:var(--space-3);">로스터</div>
+      <div style="display:flex; gap:var(--space-2); flex-wrap:wrap;">
+        <sc-for list="{{roster}}" as="p" hint-placeholder-count="4">
+          <div style="background:var(--surface-raised); border:1px solid var(--border-hairline); border-radius:var(--radius-circle); padding:var(--space-1) var(--space-3); font-size:var(--font-size-2xs); color:var(--ink-text);">{{p.name}}</div>
+        </sc-for>
+      </div>
+    </div>
+  </div>
+</div>
+<script data-dc-script data-props='{}'>
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      tabs: [
+        { label: "보드", color: "var(--ink-text)", borderColor: "var(--color-accent)" },
+        { label: "DAG", color: "var(--ink-dim)", borderColor: "transparent" },
+        { label: "타임라인", color: "var(--ink-dim)", borderColor: "transparent" },
+        { label: "승인함", color: "var(--ink-dim)", borderColor: "transparent" },
+        { label: "아티팩트", color: "var(--ink-dim)", borderColor: "transparent" },
+      ],
+      rail: [
+        { name: "리서치-01", state: "실행 중", dot: "var(--status-success)" },
+        { name: "빌드-02", state: "실행 중", dot: "var(--status-success)" },
+        { name: "리뷰-01", state: "대기", dot: "var(--status-warning)" },
+        { name: "테스트-03", state: "오류", dot: "var(--status-danger)" },
+        { name: "문서화-01", state: "완료", dot: "var(--ink-faint)" },
+        { name: "배포-01", state: "실행 중", dot: "var(--status-success)" },
+      ],
+      cols: [
+        { name: "대기 · 3", items: [{ title: "로그인 폼 접근성 점검" }, { title: "DAG 뷰 줌 성능" }] },
+        { name: "진행 · 4", items: [{ title: "토큰 스케일 정의" }, { title: "프리미티브 Button" }] },
+        { name: "검토 · 2", items: [{ title: "타임라인 스크롤 튐" }] },
+        { name: "승인 대기 · 2", items: [{ title: "프로덕션 배포 승인" }] },
+        { name: "완료 · 5", items: [{ title: "rail 카드 상태 dot" }] },
+      ],
+      msgs: [
+        { who: "빌드-02", text: "타입 에러 3건 수정, 재빌드 중" },
+        { who: "리뷰-01", text: "PR #182 리뷰 완료" },
+        { who: "나", text: "승인함으로 옮겨줘" },
+      ],
+      roster: [{ name: "영기" }, { name: "리서치-01" }, { name: "빌드-02" }, { name: "리뷰-01" }],
+    };
+  }
+}
+</script>
+</x-dc>
+</body>
+</html>

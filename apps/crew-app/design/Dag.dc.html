@@ -1,0 +1,90 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;700&family=IBM+Plex+Sans:wght@300;400;700&display=swap');
+    :root {
+      --elev-0: 13%; --elev-1: 16%; --elev-2: 19%;
+      --surface-chroma: 0.012; --surface-hue: 215;
+      --surface-paper: oklch(var(--elev-0) var(--surface-chroma) var(--surface-hue));
+      --surface-panel: oklch(var(--elev-1) var(--surface-chroma) var(--surface-hue));
+      --surface-raised: oklch(var(--elev-2) var(--surface-chroma) var(--surface-hue));
+      --border-hairline: oklch(27% 0.014 var(--surface-hue));
+      --ink-text: oklch(92% 0.01 var(--surface-hue));
+      --ink-dim: oklch(68% 0.014 var(--surface-hue));
+      --color-accent: oklch(68% 0.16 var(--surface-hue));
+      --color-accent-ink: oklch(14% 0.02 var(--surface-hue));
+      --status-warning: oklch(76% 0.15 80);
+      --status-success: oklch(72% 0.15 150);
+      --space-1: 0.25rem; --space-2: 0.5rem; --space-3: 0.75rem; --space-4: 1rem;
+      --font-sans: "IBM Plex Sans", "IBM Plex Sans KR", system-ui, sans-serif;
+      --font-mono: "IBM Plex Mono", "IBM Plex Sans KR", ui-monospace, monospace;
+      --font-size-2xs: 0.6875rem; --font-size-xs: 0.75rem; --font-size-sm: 0.8125rem; --font-size-lg: 1.25rem;
+      --font-weight-light: 300; --font-weight-regular: 400; --font-weight-bold: 700;
+      --radius-sm: 0.25rem; --radius-md: 0.5rem; --radius-circle: 9999px;
+    }
+    body { margin: 0; background: var(--surface-paper); color: var(--ink-text); font-family: var(--font-sans); font-weight: var(--font-weight-light); }
+    .mono { font-family: var(--font-mono); }
+    .dag-node { position:absolute; display:flex; flex-direction:column; align-items:center; gap:2px; min-width:132px; padding:var(--space-2) var(--space-3); border-radius:var(--radius-md); border:1px solid var(--border-hairline); font-size:var(--font-size-xs); }
+  </style>
+</helmet>
+<div style="width:1440px; height:900px; background:var(--surface-paper); display:flex; flex-direction:column;">
+
+  <div style="display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--border-hairline); background:var(--surface-panel); padding:var(--space-2) var(--space-4);">
+    <div class="mono" style="font-size:var(--font-size-sm); color:var(--ink-text);">crew-app</div>
+    <div style="display:flex; gap:var(--space-4);">
+      <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-dim);">보드</div>
+      <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-text); border-bottom:2px solid var(--color-accent); padding-bottom:2px;">DAG</div>
+      <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-dim);">타임라인</div>
+      <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-dim);">승인함</div>
+      <div class="mono" style="font-size:var(--font-size-xs); color:var(--ink-dim);">아티팩트</div>
+    </div>
+  </div>
+
+  <div style="flex:1; min-height:0; display:flex;">
+    <div style="width:240px; flex-shrink:0; background:var(--surface-panel); border-right:1px solid var(--border-hairline);"></div>
+
+    <!-- dag body -->
+    <div style="flex:1; min-width:0; padding:var(--space-4); box-sizing:border-box; display:flex; flex-direction:column; gap:var(--space-3);">
+      <div style="font-size:var(--font-size-lg); font-weight:var(--font-weight-bold);">DAG — 작업 의존 그래프</div>
+      <div style="flex:1; position:relative; background:var(--surface-panel); border-radius:var(--radius-md);">
+        <svg width="100%" height="100%" style="position:absolute; inset:0;">
+          <line x1="180" y1="70" x2="380" y2="70" stroke="var(--border-hairline)" stroke-width="2" />
+          <line x1="180" y1="70" x2="380" y2="200" stroke="var(--border-hairline)" stroke-width="2" />
+          <line x1="512" y1="70" x2="700" y2="140" stroke="var(--border-hairline)" stroke-width="2" />
+          <line x1="512" y1="200" x2="700" y2="140" stroke="var(--border-hairline)" stroke-width="2" />
+          <line x1="832" y1="140" x2="1020" y2="140" stroke="var(--color-accent)" stroke-width="3" />
+        </svg>
+        <div class="dag-node" style="left:48px; top:44px; background:var(--surface-raised); border-color:var(--status-success); color:var(--ink-text);">
+          <div>수집-01</div><div class="mono" style="color:var(--ink-dim); font-size:var(--font-size-2xs);">완료</div>
+        </div>
+        <div class="dag-node" style="left:48px; top:174px; background:var(--surface-raised); border-color:var(--status-success); color:var(--ink-text);">
+          <div>수집-02</div><div class="mono" style="color:var(--ink-dim); font-size:var(--font-size-2xs);">완료</div>
+        </div>
+        <div class="dag-node" style="left:380px; top:44px; background:var(--surface-raised); border-color:var(--color-accent); color:var(--ink-text);">
+          <div>분석-01</div><div class="mono" style="color:var(--ink-dim); font-size:var(--font-size-2xs);">실행 중</div>
+        </div>
+        <div class="dag-node" style="left:380px; top:174px; background:var(--surface-raised); border-color:var(--status-warning); color:var(--ink-dim);">
+          <div>분석-02</div><div class="mono" style="color:var(--ink-dim); font-size:var(--font-size-2xs);">대기</div>
+        </div>
+        <div class="dag-node" style="left:700px; top:110px; border-width:3px; background:var(--surface-raised); border-color:var(--color-accent); color:var(--ink-text);">
+          <div>병합</div><div class="mono" style="color:var(--ink-dim); font-size:var(--font-size-2xs);">critical path</div>
+        </div>
+        <div class="dag-node" style="left:1020px; top:110px; background:var(--surface-raised); border-color:var(--border-hairline); color:var(--ink-dim);">
+          <div>배포-01</div><div class="mono" style="color:var(--ink-dim); font-size:var(--font-size-2xs);">대기</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="width:360px; flex-shrink:0; background:var(--surface-panel); border-left:1px solid var(--border-hairline);"></div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>

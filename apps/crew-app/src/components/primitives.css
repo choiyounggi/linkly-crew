@@ -1,0 +1,241 @@
+/* 8상태 전부 스타일링 (D16): default · hover · focus-visible · active · disabled ·
+ * loading · error · success. focus-visible 은 transition 없이 즉시 나타난다.
+ * transform/opacity 만 애니메이트(D12) — 색·배경 전환에는 transition 을 걸지 않는다.
+ */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  border: thin solid transparent;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
+  font-weight: var(--font-weight-regular);
+  cursor: pointer;
+  transition: transform var(--motion-duration-fast) var(--motion-ease-standard);
+}
+
+.btn--sm {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--font-size-xs);
+}
+
+.btn--md {
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--font-size-sm);
+}
+
+.btn--primary {
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+}
+
+.btn--danger {
+  background: var(--status-danger);
+  color: var(--color-accent-ink);
+}
+
+.btn--ghost {
+  background: transparent;
+  border-color: var(--border-hairline);
+  color: var(--ink-text);
+}
+
+.btn:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.btn:focus-visible {
+  outline: thin solid var(--color-accent);
+  outline-offset: 0;
+  transition: none;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn.is-loading {
+  opacity: 0.7;
+  cursor: progress;
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: thin solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  background: var(--surface-raised);
+  color: var(--ink-text);
+  padding: var(--space-2);
+  cursor: pointer;
+  transition: transform var(--motion-duration-fast) var(--motion-ease-standard);
+}
+
+.icon-btn:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.icon-btn:active:not(:disabled) {
+  transform: scale(0.94);
+}
+
+.icon-btn:focus-visible {
+  outline: thin solid var(--color-accent);
+  outline-offset: 0;
+  transition: none;
+}
+
+.icon-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--radius-circle);
+  padding: var(--space-1) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-2xs);
+  font-weight: var(--font-weight-regular);
+  border: thin solid var(--border-hairline);
+}
+
+.badge--neutral {
+  background: var(--surface-raised);
+  color: var(--ink-dim);
+}
+
+.badge--accent {
+  background: var(--surface-raised);
+  color: var(--color-accent);
+  border-color: var(--color-accent);
+}
+
+.badge--danger {
+  background: var(--surface-raised);
+  color: var(--status-danger);
+  border-color: var(--status-danger);
+}
+
+.badge--success {
+  background: var(--surface-raised);
+  color: var(--status-success);
+  border-color: var(--status-success);
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+}
+
+.panel--level-1 {
+  background: var(--surface-panel);
+}
+
+.panel--level-2 {
+  background: var(--surface-raised);
+}
+
+.panel__title {
+  margin: 0;
+  font-family: var(--font-sans);
+  /* task 03 하이파이 와이어프레임의 화면 제목 처리를 그대로 따른다(r2 F4) —
+   * Board/Dag/Thread/Inbox/Artifacts.dc.html 이 전부 이 조합("보드", "DAG — 작업
+   * 의존 그래프" 등)을 쓰고, --font-size-display 는 와이어프레임 어디에도 없다. */
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-heading);
+  color: var(--ink-text);
+}
+
+.panel__body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-height: 0;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.field__label {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-xs);
+  color: var(--ink-dim);
+}
+
+.field input,
+.field textarea,
+.field select {
+  background: var(--surface-paper);
+  color: var(--ink-text);
+  border: thin solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  transition: transform var(--motion-duration-fast) var(--motion-ease-standard);
+}
+
+.field input:hover:not(:disabled),
+.field textarea:hover:not(:disabled),
+.field select:hover:not(:disabled) {
+  opacity: 0.92;
+}
+
+.field input:active:not(:disabled),
+.field textarea:active:not(:disabled),
+.field select:active:not(:disabled) {
+  transform: scale(0.995);
+}
+
+.field input:focus-visible,
+.field textarea:focus-visible,
+.field select:focus-visible {
+  outline: thin solid var(--color-accent);
+  outline-offset: 0;
+  transition: none;
+}
+
+.field input:disabled,
+.field textarea:disabled,
+.field select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.field--error input,
+.field--error textarea,
+.field--error select {
+  border-color: var(--status-danger);
+}
+
+.field__error {
+  margin: 0;
+  color: var(--status-danger);
+  font-size: var(--font-size-2xs);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn,
+  .icon-btn,
+  .field input,
+  .field textarea,
+  .field select {
+    transition: none;
+  }
+}
