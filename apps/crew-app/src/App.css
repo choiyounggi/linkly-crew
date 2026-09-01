@@ -105,8 +105,7 @@
   border-left: 1px solid var(--border-hairline);
 }
 
-.inbox-view,
-.artifacts-view {
+.inbox-view {
   padding: var(--space-4);
   color: var(--ink-dim);
   font-size: var(--font-size-md);
