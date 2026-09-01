@@ -39,7 +39,7 @@
 }
 
 .req-matrix__cell--covered {
-  background: color-mix(in oklab, var(--status-success) 14%, transparent);
+  background: var(--status-success);
 }
 
 .req-matrix__cell--expected {
