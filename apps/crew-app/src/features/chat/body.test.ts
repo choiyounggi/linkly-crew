@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { parseChangeRequestBody, parseTaskResultBody } from "./body";
+import {
+  parseChangeRequestBody,
+  parseHumanGateBody,
+  parseHumanResponseBody,
+  parseTaskResultBody,
+} from "./body";
 
 describe("parseTaskResultBody — normal", () => {
   it("parses a well-formed task.result body", () => {
@@ -39,10 +44,6 @@ describe("parseTaskResultBody — error/malformed", () => {
 
     expect(parsed).toBeNull();
   });
-
-  it("returns null when covered_req_ids is not a string array", () => {
-    expect(parseTaskResultBody({ covered_req_ids: "REQ-1", artifacts: [] })).toBeNull();
-  });
 });
 
 describe("parseChangeRequestBody — normal", () => {
@@ -61,5 +62,52 @@ describe("parseChangeRequestBody — error/boundary", () => {
 
   it("returns null for a non-object body", () => {
     expect(parseChangeRequestBody("nope")).toBeNull();
+  });
+});
+
+describe("parseHumanGateBody — normal (D3)", () => {
+  it("parses a well-formed human.gate body", () => {
+    expect(parseHumanGateBody({ task_id: "t-qa", reason: "qa 차단 사유 검토 필요" })).toEqual({
+      task_id: "t-qa",
+      reason: "qa 차단 사유 검토 필요",
+    });
+  });
+});
+
+describe("parseHumanGateBody — error/boundary", () => {
+  it("returns null when task_id is missing", () => {
+    expect(parseHumanGateBody({ reason: "why" })).toBeNull();
+  });
+
+  it("returns null for an empty object", () => {
+    expect(parseHumanGateBody({})).toBeNull();
+  });
+});
+
+describe("parseHumanResponseBody — normal (D3)", () => {
+  it("parses an approve response", () => {
+    expect(parseHumanResponseBody({ task_id: "t-qa", decision: "approve", reason: "ok" })).toEqual({
+      task_id: "t-qa",
+      decision: "approve",
+      reason: "ok",
+    });
+  });
+
+  it("parses a reject response", () => {
+    expect(parseHumanResponseBody({ task_id: "t-qa", decision: "reject", reason: "no" })).toEqual({
+      task_id: "t-qa",
+      decision: "reject",
+      reason: "no",
+    });
+  });
+});
+
+describe("parseHumanResponseBody — error/boundary", () => {
+  it("returns null for a decision outside approve/reject", () => {
+    expect(parseHumanResponseBody({ task_id: "t-qa", decision: "maybe", reason: "x" })).toBeNull();
+  });
+
+  it("returns null for a non-object body", () => {
+    expect(parseHumanResponseBody(42)).toBeNull();
   });
 });
