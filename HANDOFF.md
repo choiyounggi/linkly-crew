@@ -390,7 +390,8 @@ M1~M12 완료·실측 검증됨(§3, §3.5).
 > | [#3](https://github.com/choiyounggi/linkly-crew/issues/3) | Browser DoD 실제 실행 (지금은 항상 `skipped`) |
 > | [#4](https://github.com/choiyounggi/linkly-crew/issues/4) | auto-memory 스폰 세션 주입 차단 (함정 8 잔여 ①) |
 > | [#5](https://github.com/choiyounggi/linkly-crew/issues/5) | **함정 29** — 패키지 스크립트 간접 실행 (미해소·해소 불가) |
-> | [#6](https://github.com/choiyounggi/linkly-crew/issues/6) | **함정 30** — `project_root: Some`의 cwd 공유 (**M12 t4에서 해소** — 역할별 리포-밖 worktree, §3.5) |
+> | [#6](https://github.com/choiyounggi/linkly-crew/issues/6) | **함정 30** — `project_root: Some`의 cwd 공유 (**M12 t4에서 해소** — 역할별 리포-밖 worktree, §3.5. 실 런 발화 확인 후 #13과 함께 종료) |
+> | [#13](https://github.com/choiyounggi/linkly-crew/issues/13) | **project_root 배선** — 생성한 프로젝트가 런과 끊겨 worktree 격리·artifacts 규약이 휴면 (§3.5 잔여, **다음 런 최우선**) |
 >
 > ~~`project_root`를 켜는 작업(GUI 피커 등)은 #5와 #6을 **동시에** 무장시킨다.~~
 > **갱신(2026-09-03)**: #6은 M12 t4에서 봉쇄됐다. 이제 `project_root`를 켜면 #5(함정 29)만
