@@ -1,0 +1,166 @@
+/* design_spec: 슬랙형 토큰 체계(다크 사이드바, styles/tokens.css) 위에서
+ * 온보딩·설정은 밝은 중앙 카드 위저드. tokens.css는 dark-only(D19)이므로,
+ * 같은 토큰 이름을 .onboarding-light 스코프 안에서 밝은 값으로 재정의한다 —
+ * Button/Field/Badge(components/primitives.tsx)가 var(--ink-text) 등을 그대로
+ * 참조하므로 컴포넌트 코드를 건드리지 않고 밝은 톤이 적용된다. */
+.onboarding-light {
+  color-scheme: light;
+  --surface-paper: #ffffff;
+  --surface-panel: #f6f7f9;
+  --surface-raised: #ececef;
+  --surface-overlay: #e2e4e9;
+  --border-hairline: #dde1e7;
+  --ink-text: #1a1d23;
+  --ink-dim: #5b6270;
+  --ink-faint: #8a909c;
+  --color-accent: oklch(55% 0.16 var(--surface-hue, 215));
+  --color-accent-ink: #ffffff;
+  --status-danger: oklch(52% 0.19 25);
+  --status-warning: oklch(58% 0.15 80);
+  --status-success: oklch(50% 0.16 150);
+  background: var(--surface-panel);
+  color: var(--ink-text);
+}
+
+.onboarding-flow {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-2xl);
+  box-sizing: border-box;
+}
+
+.onboarding-flow__card,
+.settings-menu__panel {
+  width: min(640px, 100%);
+  max-height: min(760px, 90vh);
+  overflow-y: auto;
+  background: var(--surface-paper);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-xl);
+  box-shadow: 0 20px 60px -24px rgba(20, 24, 32, 0.28);
+}
+
+.onboarding-panels {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xl);
+  padding: var(--space-2xl);
+}
+
+.onboarding-panels__section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.onboarding-panels__section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.onboarding-panels__section-title {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-heading);
+  color: var(--ink-text);
+}
+
+.onboarding-panels__status-ok {
+  color: var(--status-success);
+  font-size: var(--font-size-xs);
+}
+
+.onboarding-panels__error {
+  margin: 0;
+  color: var(--status-danger);
+  font-size: var(--font-size-xs);
+}
+
+.onboarding-panels__footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.onboarding-panels__warning {
+  margin: 0;
+  margin-right: auto;
+  color: var(--status-warning);
+  font-size: var(--font-size-xs);
+}
+
+.onboarding-tool-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.onboarding-tool {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  background: var(--surface-panel);
+}
+
+.onboarding-tool__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.onboarding-tool__id {
+  font-family: var(--font-mono);
+  font-weight: var(--font-weight-bold);
+  min-width: 5.5rem;
+}
+
+.onboarding-tool__version {
+  color: var(--ink-dim);
+  font-size: var(--font-size-xs);
+  font-family: var(--font-mono);
+}
+
+.onboarding-tool__install {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.onboarding-tool__command {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-overlay);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.onboarding-tool__install-actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.onboarding-tool__install-note {
+  margin: 0;
+  font-size: var(--font-size-2xs);
+  color: var(--ink-faint);
+}
+
+.onboarding-panels__terminal {
+  height: 220px;
+}

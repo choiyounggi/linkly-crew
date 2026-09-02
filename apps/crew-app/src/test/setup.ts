@@ -45,3 +45,22 @@ if (!localStorageWorks()) {
     Object.defineProperty(window, "localStorage", { value: memoryStorage, configurable: true });
   }
 }
+
+// jsdom does not implement `matchMedia`. xterm.js's CoreBrowserService calls
+// it unconditionally on `Terminal.open()` (t5-terminal's TerminalPanel,
+// consumed by t8-fe-onboarding's OnboardingFlow/SettingsMenu — both now
+// mount a real TerminalPanel, reachable from App.test.tsx's full-App
+// renders). Minimal stub, only installed if missing, so `term.open()`
+// doesn't throw under jsdom. No new dependency.
+if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
+  window.matchMedia = (query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  }) as MediaQueryList;
+}
