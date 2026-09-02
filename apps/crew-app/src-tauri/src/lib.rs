@@ -25,13 +25,15 @@ async fn start_run(
 ) -> Result<String, String> {
     let data_root = app_runs_root();
     let roster_path = core::roster_path();
-    core::start_run_core(&state, goal, scripted, &data_root, &roster_path, move |event| {
+    core::start_run_core(&state, goal, scripted, &data_root, &roster_path, move |run_id, event| {
         // Best-effort: a closed/gone window means there is nothing left to
         // notify; the pump keeps draining so the run itself is unaffected.
         // Still logged (plan D5) — a closed window is the only expected
         // cause, and this was previously unobservable (`let _ =` swallowed
-        // every emit failure, including real ones).
-        if let Err(err) = app.emit("run://event", &event) {
+        // every emit failure, including real ones). Payload wrapped as
+        // `{run_id, event}` (plan D3) so the frontend can route it to the
+        // right run's channel.
+        if let Err(err) = app.emit("run://event", &serde_json::json!({"run_id": run_id, "event": event})) {
             tracing::warn!(error = %err, "run://event emit failed");
         }
     })
@@ -39,13 +41,23 @@ async fn start_run(
 }
 
 #[tauri::command]
-async fn stop_run(state: State<'_, AppState>) -> Result<(), String> {
-    core::stop_run_core(&state).await
+async fn stop_run(run_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    core::stop_run_core(&state, &run_id).await
 }
 
 #[tauri::command]
-async fn run_snapshot(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    core::run_snapshot_core(&state).await
+async fn run_snapshot(run_id: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    core::run_snapshot_core(&state, &run_id).await
+}
+
+#[tauri::command]
+async fn list_runs(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    core::list_runs_core(&state).await
+}
+
+#[tauri::command]
+async fn remove_run(run_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    core::remove_run_core(&state, &run_id).await
 }
 
 /// contracts-m5.md §C6 verbatim (t-bridge2).
@@ -72,34 +84,41 @@ fn list_presets() -> Result<serde_json::Value, String> {
     core::list_presets_core()
 }
 
-/// contracts-m5.md §C6 verbatim (t-bridge2): Tauri 2 maps the frontend's
-/// camelCase invoke args (`{ agentId, harness }`, see
+/// contracts-m5.md §C6 verbatim (t-bridge2), extended by plan D2: every
+/// run-scoped command is now routed by `run_id` — Tauri 2 maps the
+/// frontend's camelCase invoke args (`{ runId, agentId, harness }`, see
 /// `src/lib/tauri-source.ts`) onto these snake_case parameters
 /// automatically — no `#[serde(rename)]` needed.
 #[tauri::command]
-async fn swap_harness(agent_id: String, harness: String, state: State<'_, AppState>) -> Result<(), String> {
-    core::swap_harness_core(&state, &agent_id, &harness).await
+async fn swap_harness(
+    run_id: String,
+    agent_id: String,
+    harness: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    core::swap_harness_core(&state, &run_id, &agent_id, &harness).await
 }
 
-/// contracts-m7.md §E7 (t-bridge3): frontend already calls
-/// `invoke("resolve_gate", { taskId, decision, reason })`
-/// (`tauri-source.ts`, merged by t-ui-shell2) — name/args unchanged here.
+/// contracts-m7.md §E7 (t-bridge3), extended by plan D2 with `run_id`:
+/// frontend calls `invoke("resolve_gate", { runId, taskId, decision,
+/// reason })` (`tauri-source.ts`, t6-fe-shell owns updating that call site).
 #[tauri::command]
 async fn resolve_gate(
+    run_id: String,
     task_id: String,
     decision: String,
     reason: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    core::resolve_gate_core(&state, &task_id, &decision, &reason).await
+    core::resolve_gate_core(&state, &run_id, &task_id, &decision, &reason).await
 }
 
-/// contracts-m7.md §E7 (t-bridge3): frontend already calls
-/// `invoke("search_messages", { query })` (`tauri-source.ts`, merged by
-/// t-ui-shell2) — name/args unchanged here.
+/// contracts-m7.md §E7 (t-bridge3), extended by plan D2 with `run_id`:
+/// frontend calls `invoke("search_messages", { runId, query })`
+/// (`tauri-source.ts`, t6-fe-shell owns updating that call site).
 #[tauri::command]
-async fn search_messages(query: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    core::search_messages_core(&state, &query).await
+async fn search_messages(run_id: String, query: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    core::search_messages_core(&state, &run_id, &query).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -116,7 +135,9 @@ pub fn run() {
             list_presets,
             swap_harness,
             resolve_gate,
-            search_messages
+            search_messages,
+            list_runs,
+            remove_run
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
