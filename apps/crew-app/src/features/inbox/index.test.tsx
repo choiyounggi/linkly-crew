@@ -65,6 +65,27 @@ describe("Inbox", () => {
     await waitFor(() => expect(resolveGate).toHaveBeenCalledWith("t-a", "approve", "확인함"));
   });
 
+  it("calls resolveGate with `this` bound to the source (regression: unbound extraction broke class sources)", async () => {
+    let receivedThis: unknown = null;
+    defaultSource.resolveGate = function (this: unknown) {
+      receivedThis = this;
+      return Promise.resolve();
+    };
+
+    act(() => {
+      useRunStore.setState({
+        messages: [gateMessage(1, "t-a", "검토 필요")],
+        taskStates: { "t-a": "escalated" },
+      });
+    });
+
+    render(<Inbox />);
+
+    fireEvent.click(screen.getByText("승인"));
+
+    await waitFor(() => expect(receivedThis).toBe(defaultSource));
+  });
+
   it('shows "이 소스에서 지원 안 함" when resolveGate is not provided by the source', () => {
     defaultSource.resolveGate = undefined;
 

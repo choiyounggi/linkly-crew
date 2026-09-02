@@ -17,6 +17,11 @@ interface RosterPanelProps {
 
 const ADDABLE_ROLES = ["pm", "designer", "publisher", "developer", "qa"] as const;
 
+// Backend preset vocabulary (src-tauri core.rs presets: "default"/"opus"/
+// "sonnet"). A slot whose saved model is outside this list still renders it
+// as an extra option so the select never misrepresents saved state.
+const MODEL_OPTIONS: readonly string[] = ["default", "opus", "sonnet", "haiku"];
+
 type LoadState = "loading" | "idle" | "error";
 type SaveState = "idle" | "loading" | "success" | "error";
 
@@ -198,12 +203,20 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
                   ) : (
                     <span className="roster__slot-harness">{agent.harness}</span>
                   )}
-                  <input
+                  <select
                     aria-label={`${agent.role} 모델`}
-                    type="text"
                     value={agent.model}
                     onChange={(e) => updateSlot(agent.id, { model: e.target.value })}
-                  />
+                  >
+                    {!MODEL_OPTIONS.includes(agent.model) && (
+                      <option value={agent.model}>{agent.model}</option>
+                    )}
+                    {MODEL_OPTIONS.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </select>
                   {supportsSwap && (
                     <button
                       type="button"

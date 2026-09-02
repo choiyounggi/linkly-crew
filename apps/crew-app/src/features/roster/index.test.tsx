@@ -72,6 +72,40 @@ describe("RosterPanel", () => {
     expect(await screen.findByText("저장됨")).toBeInTheDocument();
   });
 
+  it("offers models as a select (fixed options + saved value outside the list) and saves the chosen model", async () => {
+    const setRoster = vi.fn(async () => {});
+    const source = createFakeSource({
+      listPresets: vi.fn(async () => []),
+      detectHarnesses: vi.fn(async () => SAMPLE_HARNESSES),
+      getRoster: vi.fn(async () => SAMPLE_ROSTER),
+      setRoster,
+    });
+
+    render(<RosterPanel source={source} />);
+    const designerModel = await screen.findByLabelText("designer 모델");
+
+    // Fixed options are present; the saved value "claude-sonnet-5" (outside
+    // the fixed list) is kept as an extra option so the select shows it.
+    for (const m of ["default", "opus", "sonnet", "haiku", "claude-sonnet-5"]) {
+      expect(within(designerModel).getByRole("option", { name: m })).toBeInTheDocument();
+    }
+    expect(designerModel).toHaveValue("claude-sonnet-5");
+
+    fireEvent.change(designerModel, { target: { value: "opus" } });
+    expect(designerModel).toHaveValue("opus");
+
+    fireEvent.click(screen.getByRole("button", { name: "저장" }));
+
+    await waitFor(() =>
+      expect(setRoster).toHaveBeenCalledWith({
+        agents: [
+          { ...SAMPLE_ROSTER.agents[0], model: "opus" },
+          SAMPLE_ROSTER.agents[1],
+        ],
+      }),
+    );
+  });
+
   it("enables the swap button only while a run is active, and calls swapHarness with the slot's selected harness", async () => {
     const swapHarness = vi.fn(async () => {});
     const source = createFakeSource({

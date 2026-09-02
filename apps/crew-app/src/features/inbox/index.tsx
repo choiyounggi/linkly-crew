@@ -12,7 +12,9 @@ function GateItem({ gate }: { gate: PendingGate }) {
   const [pending, setPending] = useState<Decision | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const resolveGate = defaultSource.resolveGate;
+  // bind: both real sources read `this` (Mock's gateEnvCounter, Tauri's
+  // invoke) — an unbound extraction throws at click time.
+  const resolveGate = defaultSource.resolveGate?.bind(defaultSource);
 
   async function handleDecision(decision: Decision) {
     if (!resolveGate) return;
