@@ -111,10 +111,6 @@
   font-size: var(--font-size-md);
 }
 
-.search-box {
-  flex-shrink: 0;
-}
-
 .search-box input {
   background: var(--surface-paper);
   color: var(--ink-text);

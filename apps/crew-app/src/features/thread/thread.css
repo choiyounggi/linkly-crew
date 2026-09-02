@@ -46,7 +46,7 @@
 
 .thread-row__parties {
   color: var(--ink-text);
-  font-weight: var(--font-weight-semibold);
+  font-weight: var(--font-weight-bold);
 }
 
 .thread-row__ts {
