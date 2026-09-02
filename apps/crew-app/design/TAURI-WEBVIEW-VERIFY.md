@@ -167,3 +167,65 @@ none 셀의 테두리가 배경 대비 1.040 이 되어 격자에서 빠지고, 
 - **스크린샷** — macOS 화면 녹화 권한 부재로 캡처하지 못했다. 색 판정은 엔진이
   래스터한 sRGB 값으로 대체했다(자체 OKLCH→sRGB 변환기가 엔진 측정값 4종과
   정확히 일치함을 대조 확인).
+
+## 5. t1-live-events 후속 조사 — "배지가 idle을 벗어나지 않는다"는 결함이 아니다
+
+측정 날짜: 2026-09-02 (§3의 후속). 위 §3/확인되지 않은 것에서 관찰된 "task가
+idle을 벗어나지 않았다"는 실제 `npm run tauri dev`(WKWebView, 이 문서 상단의
+동일 엔진)로 재현·계측한 결과 **코드 결함이 아니다** — 파이프라인 전 구간이
+정상 동작하며, 스크립티드 데모가 사람 눈으로 포착하기 어려울 만큼 빨리
+끝나는 것이 원인이다.
+
+**측정 방법**: §1의 프로브 방법(WKWebView는 CDP가 없어 `index.html`에 한 줄
+주입 + `src/__verify__/probe.ts` + `127.0.0.1:1421` 수집 서버)을 그대로
+썼다. 두 단계로 계측했다 — 먼저 `invoke("start_run")`과 별도 `listen("run://
+event")`를 직접 호출해 Rust→webview 브리지 자체를 검증했고, 다음으로 실제
+프로덕션 경로(`useRunStore.getState().startRun(goal)` → `TauriEventSource`
+→ zustand store)를 그대로 호출해 UI가 실제로 보는 상태를 검증했다. **검증
+후 두 주입 모두 되돌렸고 저장소에는 남아 있지 않다** (`git status`로 확인).
+
+**1단계 — Rust emit은 한 번도 실패하지 않았다.** `lib.rs`의 `let _ = app.emit(...)`
+를 `if let Err(err) = app.emit(...) { tracing::warn!(...) }`로 바꾼 뒤(현재
+소스에 반영된 수정, 아래 "수정" 절 참조) 진단용으로 성공/실패를 모두
+`eprintln!`(임시, 되돌림)으로도 찍어 확인했다. 한 런(`RunStarted`부터
+`RunFinished`까지, `SprintFinished`/`RosterChanged` 포함 총 84건)에서
+**emit 실패 0건** — `TaskStateChanged` 10건, `Message` 18건 전부 `Ok(())`.
+
+**2단계 — webview `listen`도 전부 수신한다.** `invoke("start_run")`과 별도로
+등록한 `listen("run://event", ...)`가 같은 84건을 전부 받았다(카운트가
+Rust 쪽 emit 횟수와 정확히 일치). 브리지(§ 의심 구간이었던 `lib.rs:31` ↔
+`tauri-source.ts:98`) 자체는 결함이 없다.
+
+**3단계 — store도 정확히 반영한다.** 실제 프로덕션 경로(`useRunStore.startRun`)
+로 다시 실행해 스토어 상태를 직접 읽었다:
+
+| 시점 | `taskStates` | `messages.length` | `finished` |
+|---|---|---|---|
+| `startRun()` 프라미스 resolve 직후 (+0.23s) | `{"t-pm":"assigned"}` | 0 | `null` |
+| +2.4s 하트비트 | 5개 전부 `"accepted"` | 18 | `"completed"` |
+
+`t-pm: "assigned"`는 `deriveRail`(`src/features/rail/derive.ts:91`)이
+working/awaiting 배지로 매핑하는 바로 그 상태다 — **badge 트리거 상태가
+실제로 발생함을 직접 관찰했다.** 단, `roleCard`(같은 파일 75-97행)는 `state
+!== "assigned"`이면 명시적으로 `idle`을 반환한다 — task가 `accepted`(완료)로
+넘어가면 배지가 의도적으로 idle로 돌아간다(계약 §C5: "작업 중"이 아니면
+idle). 스크립티드 데모가 계획된 rework 1회를 포함해 전체 5-role 스프린트를
+**약 0.2~2.4초 안에 끝내므로**, "working" 구간은 실존하지만 매우 짧다 —
+화면을 몇 초 늦게 보거나 스크린샷 한 장으로 판단하면 "idle밖에 없었다"로
+보이기 쉽다. §3에서 "task가 idle을 벗어나지 않았다"고 적은 것은 바로 이
+타이밍 때문으로 보인다(그 세션은 CSS 판정이 목적이라 클래스를 강제했고,
+자연 발생을 기다리지 않았다).
+
+**결론 (plan D8)**: `app.emit` → `listen` → zustand store → `deriveRail`
+전 구간에 결함이 없다. "결함"이 아니라 "의도된 동작(스크립티드 데모가
+사람이 놓치기 쉬울 만큼 빠르다)"으로 판정한다. t1이 유일하게 남긴 실질
+수정은 `lib.rs`의 `let _ = app.emit(...)` → `tracing::warn!` 로깅 전환
+(원인 규명 여부와 무관하게 필요했던 관측성 개선)과, `src-tauri/src/core.rs`
+의 회귀 테스트(`scripted_run_pumps_task_state_changed_and_message_after_
+spec_ready`) — SpecReady 이후 TaskStateChanged/Message가 실제로 펌프까지
+나온다는, 이전에는 어떤 테스트도 증명한 적 없던 사실을 고정한다.
+
+**t2에 대한 함의**: t2(실런 시각 검증)가 "라이브 이벤트가 도달하면"이라는
+전제로 계획됐다면 그 전제 자체는 참이다(도달한다) — 다만 "working/awaiting
+배지가 화면에 몇 초 이상 유지된다"는 가정이 있었다면 이 절의 타이밍
+데이터로 재점검이 필요하다.
