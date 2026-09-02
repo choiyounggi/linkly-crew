@@ -3,6 +3,33 @@ import { parseTaskResultBody } from "../thread/body";
 
 type StoredMessage = { seq: number; envelope: Envelope };
 
+function isAssignBodyWithTaskId(body: unknown): body is { task: { id: string } } {
+  if (typeof body !== "object" || body === null || !("task" in body)) return false;
+  const task = (body as { task: unknown }).task;
+  if (typeof task !== "object" || task === null || !("id" in task)) return false;
+  return typeof (task as { id: unknown }).id === "string";
+}
+
+/**
+ * corr(불투명 상관관계 id, board/rail derive와 동일 관례)→taskId 맵을 task.assign
+ * 메시지의 body.task.id(계약 §M3)에서 얻는다(board/derive.ts findLastAssignCorr와 대칭).
+ * 여러 task.assign이 같은 corr을 공유하면 나중 값이 이김(messages는 seq 오름차순 입력).
+ */
+function buildCorrToTaskId(messages: StoredMessage[]): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const { envelope } of messages) {
+    if (envelope.kind !== "task.assign") continue;
+    if (!isAssignBodyWithTaskId(envelope.body)) continue;
+    map.set(envelope.corr, envelope.body.task.id);
+  }
+  return map;
+}
+
+/** 맵에 없는 corr은 corr 값 자체를 taskId로 폴백(assign 없이 result만 오는 mock/테스트 경로 보존). */
+function resolveTaskId(corr: string, corrToTaskId: Map<string, string>): string {
+  return corrToTaskId.get(corr) ?? corr;
+}
+
 export interface ArtifactVersion {
   msgSeq: number;
   ts: string;
@@ -17,11 +44,13 @@ export interface ArtifactVersions {
 
 /**
  * 계약 §E10: task.result 메시지들에서 (taskId, artifact.name)별 버전 리스트(seq 순).
- * taskId는 board/rail derive와 동일 관례로 envelope.corr(=task.assign과 공유하는
- * 상관관계 id, mock-source.ts 전 케이스에서 task.id와 동일)에서 얻는다. messages는
+ * taskId는 board/rail derive와 동일 관례로 corr을 불투명 토큰으로 취급해
+ * buildCorrToTaskId(task.assign body.task.id)로 해석한다(실백엔드 corr="corr-<id>"
+ * 형식, dispatch.rs:266-268). 매핑 없는 corr은 corr 값 그대로 폴백. messages는
  * store가 seq 오름차순으로 append하므로 입력 순서를 그대로 신뢰(board/rail과 동일 관례).
  */
 export function buildArtifactIndex(messages: StoredMessage[]): ArtifactVersions[] {
+  const corrToTaskId = buildCorrToTaskId(messages);
   const order: string[] = [];
   const byKey = new Map<string, ArtifactVersions>();
 
@@ -30,7 +59,7 @@ export function buildArtifactIndex(messages: StoredMessage[]): ArtifactVersions[
     const parsed = parseTaskResultBody(envelope.body);
     if (!parsed) continue;
 
-    const taskId = envelope.corr;
+    const taskId = resolveTaskId(envelope.corr, corrToTaskId);
     for (const artifact of parsed.artifacts) {
       const key = JSON.stringify([taskId, artifact.name]);
       let entry = byKey.get(key);
@@ -138,12 +167,13 @@ export function buildReqMatrix(spec: SpecDoc | null, dag: TaskDag | null, messag
   const tasks = dag?.tasks ?? [];
   const requirements = spec?.requirements ?? [];
 
+  const corrToTaskId = buildCorrToTaskId(messages);
   const latestCoveredByTask = new Map<string, Set<string>>();
   for (const { envelope } of messages) {
     if (envelope.kind !== "task.result") continue;
     const parsed = parseTaskResultBody(envelope.body);
     if (!parsed) continue;
-    latestCoveredByTask.set(envelope.corr, new Set(parsed.covered_req_ids));
+    latestCoveredByTask.set(resolveTaskId(envelope.corr, corrToTaskId), new Set(parsed.covered_req_ids));
   }
 
   const rows: ReqMatrixRow[] = requirements.map((req) => {
