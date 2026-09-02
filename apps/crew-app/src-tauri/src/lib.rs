@@ -28,7 +28,12 @@ async fn start_run(
     core::start_run_core(&state, goal, scripted, &data_root, &roster_path, move |event| {
         // Best-effort: a closed/gone window means there is nothing left to
         // notify; the pump keeps draining so the run itself is unaffected.
-        let _ = app.emit("run://event", &event);
+        // Still logged (plan D5) — a closed window is the only expected
+        // cause, and this was previously unobservable (`let _ =` swallowed
+        // every emit failure, including real ones).
+        if let Err(err) = app.emit("run://event", &event) {
+            tracing::warn!(error = %err, "run://event emit failed");
+        }
     })
     .await
 }

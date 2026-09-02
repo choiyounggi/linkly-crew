@@ -35,7 +35,7 @@
 .rail-card__name {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  font-weight: var(--font-weight-semibold);
+  font-weight: var(--font-weight-bold);
 }
 
 .rail-card__avatar {
@@ -73,7 +73,7 @@
   align-items: center;
   gap: var(--space-1);
   font-size: var(--font-size-2xs);
-  font-weight: var(--font-weight-semibold);
+  font-weight: var(--font-weight-bold);
   padding: var(--space-1) var(--space-2);
   border-radius: var(--radius-circle);
   border: 1px solid var(--border-hairline);

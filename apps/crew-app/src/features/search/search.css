@@ -1,5 +1,6 @@
 .search-box {
   position: relative;
+  flex-shrink: 0;
 }
 
 .search-box form {
@@ -78,7 +79,7 @@
 }
 
 .search-box__result-kind {
-  font-weight: var(--font-weight-semibold);
+  font-weight: var(--font-weight-bold);
   margin-right: var(--space-2);
 }
 

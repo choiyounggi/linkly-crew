@@ -395,6 +395,22 @@ mod tests {
         }
     }
 
+    /// Short variant name for failure messages (plan D1) — avoids dumping
+    /// full `RunEvent` payloads (spec/dag bodies) into assertion output.
+    fn event_kind(event: &RunEvent) -> &'static str {
+        match event {
+            RunEvent::RunStarted { .. } => "RunStarted",
+            RunEvent::SpecReady { .. } => "SpecReady",
+            RunEvent::Message { .. } => "Message",
+            RunEvent::TaskStateChanged { .. } => "TaskStateChanged",
+            RunEvent::BusLifecycle { .. } => "BusLifecycle",
+            RunEvent::RunFinished { .. } => "RunFinished",
+            RunEvent::SprintStarted { .. } => "SprintStarted",
+            RunEvent::SprintFinished { .. } => "SprintFinished",
+            RunEvent::RosterChanged { .. } => "RosterChanged",
+        }
+    }
+
     /// Collects emitted `RunEvent`s into a shared `Vec` for assertions.
     fn collecting_emit() -> (impl Fn(RunEvent) + Send + 'static, Arc<StdMutex<Vec<RunEvent>>>) {
         let collected = Arc::new(StdMutex::new(Vec::new()));
@@ -437,6 +453,69 @@ mod tests {
         assert!(
             events.iter().any(|e| matches!(e, RunEvent::SpecReady { .. })),
             "expected a SpecReady event, got {events:?}"
+        );
+
+        stop_run_core(&state).await.expect("stop should succeed");
+    }
+
+    /// Reproduction test (plan D1): the existing
+    /// `normal_scripted_run_starts_and_pumps_events` only waits for
+    /// `RunStarted`+`SpecReady` (2 events) — it has never proven that
+    /// anything *after* `SpecReady` reaches the pump, which is exactly
+    /// where the live app is reported stuck. Bounded polling (up to ~20s,
+    /// no fixed sleep) waits for at least one `TaskStateChanged` and one
+    /// `Message` to arrive; `crew-run`'s own `happy_path_...` integration
+    /// test proves the engine emits these in well under a second, so this
+    /// is a generous bound, not a tight one.
+    #[tokio::test]
+    async fn scripted_run_pumps_task_state_changed_and_message_after_spec_ready() {
+        let root = TestDataRoot::new("post-spec-ready");
+        let state = AppState::default();
+        let (emit, collected) = collecting_emit();
+
+        let run_id = start_run_core(
+            &state,
+            "landing page".to_string(),
+            true,
+            &root.0,
+            &root.0.join("roster.json"),
+            emit,
+        )
+        .await
+        .expect("scripted run should start");
+        assert!(!run_id.is_empty());
+
+        let has_task_state_changed = |events: &[RunEvent]| {
+            events.iter().any(|e| matches!(e, RunEvent::TaskStateChanged { .. }))
+        };
+        let has_message = |events: &[RunEvent]| events.iter().any(|e| matches!(e, RunEvent::Message { .. }));
+
+        let mut waited = 0;
+        while waited < 2000 {
+            let events = collected.lock().unwrap().clone();
+            if has_task_state_changed(&events) && has_message(&events) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            waited += 1;
+        }
+
+        let events = collected.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|e| matches!(e, RunEvent::SpecReady { .. })),
+            "precondition: expected a SpecReady event, got {events:?}"
+        );
+        assert!(
+            has_task_state_changed(&events),
+            "expected >=1 TaskStateChanged after SpecReady within the timeout, got {} events: {:?}",
+            events.len(),
+            events.iter().map(event_kind).collect::<Vec<_>>()
+        );
+        assert!(
+            has_message(&events),
+            "expected >=1 Message after SpecReady within the timeout, got {} events: {:?}",
+            events.len(),
+            events.iter().map(event_kind).collect::<Vec<_>>()
         );
 
         stop_run_core(&state).await.expect("stop should succeed");

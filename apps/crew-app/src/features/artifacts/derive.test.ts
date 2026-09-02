@@ -34,6 +34,23 @@ function resultMsg(seq: number, taskId: string, coveredReqIds: string[], artifac
   });
 }
 
+function resultMsgWithCorr(
+  seq: number,
+  corr: string,
+  coveredReqIds: string[],
+  artifacts: { name: string; content: string }[],
+) {
+  return env(seq, {
+    kind: "task.result",
+    corr,
+    body: { covered_req_ids: coveredReqIds, artifacts },
+  });
+}
+
+function assignMsg(seq: number, corr: string, taskId: string) {
+  return env(seq, { kind: "task.assign", corr, body: { task: { id: taskId } } });
+}
+
 describe("buildArtifactIndex — version accumulation", () => {
   it("accumulates versions for the same (taskId, name) in seq order across repeated task.result", () => {
     const messages = [
@@ -63,6 +80,23 @@ describe("buildArtifactIndex — version accumulation", () => {
 
   it("returns an empty index for empty messages", () => {
     expect(buildArtifactIndex([])).toEqual([]);
+  });
+
+  it("resolves corr to taskId via task.assign body.task.id when corr differs from taskId (real backend corr format)", () => {
+    const messages = [
+      assignMsg(1, "corr-t-a", "t-a"),
+      resultMsgWithCorr(2, "corr-t-a", [], [{ name: "spec.md", content: "v1" }]),
+    ];
+    const index = buildArtifactIndex(messages);
+    expect(index).toHaveLength(1);
+    expect(index[0].taskId).toBe("t-a");
+  });
+
+  it("falls back to the corr value itself when no matching task.assign exists (mock/legacy path, no crash)", () => {
+    const messages = [resultMsgWithCorr(1, "corr-orphan", [], [{ name: "spec.md", content: "v1" }])];
+    const index = buildArtifactIndex(messages);
+    expect(index).toHaveLength(1);
+    expect(index[0].taskId).toBe("corr-orphan");
   });
 });
 
@@ -154,5 +188,21 @@ describe("buildReqMatrix — 3-state cells", () => {
     const matrix = buildReqMatrix(null, null, []);
     expect(matrix.rows).toEqual([]);
     expect(matrix.taskIds).toEqual([]);
+  });
+
+  it("resolves covered via corr→taskId map built from task.assign (real backend corr format, e.g. corr-<id>)", () => {
+    const messages = [assignMsg(1, "corr-t-a", "t-a"), resultMsgWithCorr(2, "corr-t-a", ["REQ-1"], [])];
+    const matrix = buildReqMatrix(SPEC, DAG, messages);
+    const req1 = matrix.rows.find((r) => r.reqId === "REQ-1")!;
+    expect(req1.cells["t-a"]).toBe("covered");
+  });
+
+  it("does not crash on an orphan corr with no matching task.assign — falls back to corr as taskId, unmapped to any real task", () => {
+    const messages = [resultMsgWithCorr(1, "corr-unknown", ["REQ-1"], [])];
+    expect(() => buildReqMatrix(SPEC, DAG, messages)).not.toThrow();
+    const matrix = buildReqMatrix(SPEC, DAG, messages);
+    const req1 = matrix.rows.find((r) => r.reqId === "REQ-1")!;
+    expect(req1.cells["t-a"]).toBe("expected");
+    expect(req1.cells["t-b"]).toBe("none");
   });
 });

@@ -65,7 +65,7 @@
 .board-card__badge {
   color: var(--status-danger);
   font-size: var(--font-size-xs);
-  font-weight: var(--font-weight-semibold);
+  font-weight: var(--font-weight-bold);
   flex-shrink: 0;
 }
 
