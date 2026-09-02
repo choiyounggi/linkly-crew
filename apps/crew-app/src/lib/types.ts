@@ -129,3 +129,53 @@ export interface RosterPreset {
   name: string;
   roster: Roster;
 }
+
+// ===== BEGIN MultiRunApi contract stub =====
+// contract: t1-be-multirun owns the implementation
+// run://event payload wrapper — every event is tagged with its run.
+export interface RunEventEnvelope {
+  run_id: string;
+  event: RunEvent;
+}
+// list_runs() row — start_run(goal, scripted) -> run_id (unchanged);
+// stop_run(run_id), run_snapshot(run_id), remove_run(run_id) take run_id.
+export interface RunSummary {
+  run_id: string;
+  goal: string;
+  finished: "completed" | "failed" | null;
+}
+// ===== END MultiRunApi contract stub =====
+
+// ===== BEGIN PresenceEvent contract stub =====
+// contract: t2-be-presence owns the implementation
+// Volatile presence signal (never in ledger/snapshot messages).
+export interface PresenceEvent {
+  type: "presence";
+  agent_id: string;
+  kind: "read" | "typing";
+  target_msg_id?: string;
+  active?: boolean;
+}
+// ===== END PresenceEvent contract stub =====
+
+// ===== BEGIN ProjectApi/OnboardingStatusApi contract stub =====
+// contract: t3-be-project owns the implementation
+// onboarding_status() row per supported tool.
+export interface ToolStatus {
+  id: string;
+  installed: boolean;
+  path: string | null;
+  version: string | null;
+  install_command: string;
+  authenticated?: boolean; // gh only
+}
+// get_settings()/set_settings(settings)
+export interface AppSettings {
+  workspace_root: string;
+}
+// create_project(name) -> { name, path }
+export interface ProjectInfo {
+  name: string;
+  path: string;
+}
+// ===== END ProjectApi/OnboardingStatusApi contract stub =====
