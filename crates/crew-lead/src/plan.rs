@@ -123,25 +123,22 @@ impl LeadPlanner {
         }
 
         let req_ids: Vec<ReqId> = spec.requirements.iter().map(|r| r.id.clone()).collect();
-        let base_dod = vec![DodCheck::ReqCover {
-            ids: req_ids.clone(),
-        }];
 
         let mut tasks = Vec::with_capacity(roles.len());
         let mut prev_id: Option<String> = None;
         for role in ROLE_ORDER.iter().copied().filter(|r| roles.contains(r)) {
             let (id, duty, artifact_name, artifact_kind) = role_meta(role);
             let deps = prev_id.clone().into_iter().collect();
-            let dod = if role == Role::Developer {
-                let mut dod = base_dod.clone();
+            let role_req_ids = role_req_ids(role, &req_ids);
+            let mut dod = vec![DodCheck::ReqCover {
+                ids: role_req_ids.clone(),
+            }];
+            if role == Role::Developer {
                 dod.extend(opts.dev_cmd_checks.iter().map(|c| DodCheck::Cmd {
                     run: c.run.clone(),
                     expect: c.expect.clone(),
                 }));
-                dod
-            } else {
-                base_dod.clone()
-            };
+            }
             tasks.push(role_task(
                 id,
                 role,
@@ -151,7 +148,7 @@ impl LeadPlanner {
                 deps,
                 artifact_name,
                 artifact_kind,
-                &req_ids,
+                &role_req_ids,
             ));
             prev_id = Some(id.to_string());
         }
@@ -183,6 +180,28 @@ fn role_meta(role: Role) -> (&'static str, &'static str, &'static str, &'static 
         Role::Developer => ("t-dev", "개발", "app.js", "code"),
         Role::Qa => ("t-qa", "QA", "qa-report.md", "report"),
     }
+}
+
+/// Per-role REQ subset (t2-plan-none plan D1, fixed — a change here needs a
+/// plan gap, not a silent edit): PM/QA cover every REQ; Designer skips the
+/// footer copyright (REQ-5, unrelated to layout); Publisher skips the
+/// responsive-behavior req (REQ-4, a scripting concern); Developer covers
+/// only the CTA action (REQ-3) and the responsive script (REQ-4). This makes
+/// the matrix's `none` cell (a task role with neither `expected` nor
+/// `covered` for a given REQ) reachable — with the old all-REQ-for-every-role
+/// mapping it never was.
+fn role_req_ids(role: Role, all_req_ids: &[ReqId]) -> Vec<ReqId> {
+    let keep: &[&str] = match role {
+        Role::Pm | Role::Qa => &["REQ-1", "REQ-2", "REQ-3", "REQ-4", "REQ-5"],
+        Role::Designer => &["REQ-1", "REQ-2", "REQ-3", "REQ-4"],
+        Role::Publisher => &["REQ-1", "REQ-2", "REQ-3", "REQ-5"],
+        Role::Developer => &["REQ-3", "REQ-4"],
+    };
+    all_req_ids
+        .iter()
+        .filter(|id| keep.contains(&id.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn requirement(id: &str, text: &str) -> Requirement {
@@ -275,20 +294,20 @@ mod tests {
             ]
         );
 
-        let all_req_ids: Vec<ReqId> = spec.requirements.iter().map(|r| r.id.clone()).collect();
-        let expected_artifacts = [
-            ("spec.md", "doc"),
-            ("design.md", "doc"),
-            ("index.html", "markup"),
-            ("app.js", "code"),
-            ("qa-report.md", "report"),
+        let expected = [
+            ("spec.md", "doc", vec!["REQ-1", "REQ-2", "REQ-3", "REQ-4", "REQ-5"]),
+            ("design.md", "doc", vec!["REQ-1", "REQ-2", "REQ-3", "REQ-4"]),
+            ("index.html", "markup", vec!["REQ-1", "REQ-2", "REQ-3", "REQ-5"]),
+            ("app.js", "code", vec!["REQ-3", "REQ-4"]),
+            ("qa-report.md", "report", vec!["REQ-1", "REQ-2", "REQ-3", "REQ-4", "REQ-5"]),
         ];
-        for (task, (name, kind)) in dag.tasks.iter().zip(expected_artifacts) {
-            assert_eq!(task.dod, vec![DodCheck::ReqCover { ids: all_req_ids.clone() }]);
+        for (task, (name, kind, ids)) in dag.tasks.iter().zip(expected) {
+            let ids: Vec<ReqId> = ids.into_iter().map(|s| ReqId::new(s).unwrap()).collect();
+            assert_eq!(task.dod, vec![DodCheck::ReqCover { ids: ids.clone() }]);
             assert_eq!(task.artifacts_expected.len(), 1);
             assert_eq!(task.artifacts_expected[0].name, name);
             assert_eq!(task.artifacts_expected[0].kind, kind);
-            assert_eq!(task.artifacts_expected[0].req_ids, all_req_ids);
+            assert_eq!(task.artifacts_expected[0].req_ids, ids);
         }
     }
 
@@ -416,13 +435,13 @@ mod tests {
             ],
         };
         let dag = LeadPlanner::plan_dag_with(&spec, &ROLE_ORDER, &opts).unwrap();
-        let all_req_ids: Vec<ReqId> = spec.requirements.iter().map(|r| r.id.clone()).collect();
+        let dev_req_ids = vec![ReqId::new("REQ-3").unwrap(), ReqId::new("REQ-4").unwrap()];
 
         let dev_task = dag.tasks.iter().find(|t| t.role == Role::Developer).unwrap();
         assert_eq!(
             dev_task.dod,
             vec![
-                DodCheck::ReqCover { ids: all_req_ids },
+                DodCheck::ReqCover { ids: dev_req_ids },
                 DodCheck::Cmd {
                     run: "cargo test".to_string(),
                     expect: "exit 0".to_string(),
@@ -448,12 +467,8 @@ mod tests {
         let all_req_ids: Vec<ReqId> = spec.requirements.iter().map(|r| r.id.clone()).collect();
 
         for task in dag.tasks.iter().filter(|t| t.role != Role::Developer) {
-            assert_eq!(
-                task.dod,
-                vec![DodCheck::ReqCover {
-                    ids: all_req_ids.clone()
-                }]
-            );
+            let expected_ids = role_req_ids(task.role, &all_req_ids);
+            assert_eq!(task.dod, vec![DodCheck::ReqCover { ids: expected_ids }]);
         }
     }
 
@@ -528,5 +543,103 @@ mod tests {
         let json = serde_json::to_string(task).unwrap();
         let back: TaskSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, *task);
+    }
+
+    #[test]
+    fn plan_dag_developer_req_ids_are_a_proper_subset_of_the_full_req_set() {
+        // D4①: at least one role's req_ids must be a genuine (strict)
+        // subset of the full REQ set — the precondition for the frontend
+        // matrix's `none` cell (a REQ neither `expected` nor `covered` by a
+        // role) to ever be reachable in production.
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let dag = LeadPlanner::plan_dag(&spec).unwrap();
+        let all_req_ids: Vec<ReqId> = spec.requirements.iter().map(|r| r.id.clone()).collect();
+
+        let dev_task = dag.tasks.iter().find(|t| t.role == Role::Developer).unwrap();
+        let dev_ids = &dev_task.artifacts_expected[0].req_ids;
+
+        assert!(dev_ids.len() < all_req_ids.len());
+        assert!(dev_ids.iter().all(|id| all_req_ids.contains(id)));
+    }
+
+    #[test]
+    fn plan_dag_role_req_subsets_union_to_the_full_req_set_with_no_orphan() {
+        // D4②: no REQ is orphaned — every REQ is `expected` by at least one
+        // role's artifact contract, even though no single role expects all
+        // of them anymore.
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let dag = LeadPlanner::plan_dag(&spec).unwrap();
+        let all_req_ids: Vec<ReqId> = spec.requirements.iter().map(|r| r.id.clone()).collect();
+
+        let mut union: Vec<&str> = dag
+            .tasks
+            .iter()
+            .flat_map(|t| t.artifacts_expected[0].req_ids.iter().map(ReqId::as_str))
+            .collect();
+        union.sort_unstable();
+        union.dedup();
+
+        let mut expected: Vec<&str> = all_req_ids.iter().map(ReqId::as_str).collect();
+        expected.sort_unstable();
+
+        assert_eq!(union, expected);
+    }
+
+    #[test]
+    fn plan_dag_subset_scenario_scripted_result_still_passes_dod_for_every_task() {
+        // D4③ (at the level reachable from crate::dod_exec, without the
+        // full async dispatch/roster machinery which lives outside this
+        // task's scope): a scripted agent that reports exactly its own
+        // task's (now-reduced) req subset as `covered_req_ids`, and an
+        // artifact matching its own contract, must still satisfy
+        // `dod_exec::judge` for every task in the DAG — the subset mapping
+        // does not break DoD gating / scripted-run completion.
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let dag = LeadPlanner::plan_dag(&spec).unwrap();
+
+        for task in &dag.tasks {
+            let artifact = &task.artifacts_expected[0];
+            let covered: Vec<&str> = artifact.req_ids.iter().map(ReqId::as_str).collect();
+            let body = serde_json::json!({
+                "covered_req_ids": covered,
+                "artifacts": [{
+                    "name": artifact.name,
+                    "kind": artifact.kind,
+                    "req_ids": covered,
+                    "content": "ok",
+                }]
+            });
+
+            let verdict = crate::dod_exec::judge(task, &body, &[]);
+
+            assert!(
+                verdict.passed,
+                "task {} must pass DoD for its own subset: {verdict:?}",
+                task.id
+            );
+        }
+    }
+
+    #[test]
+    fn plan_dag_subset_scenario_under_coverage_still_fails_dod() {
+        // Error path: shrinking a role's req subset (D1) must not weaken the
+        // DoD gate — a scripted result that under-covers even the smaller
+        // subset must still be rejected, exactly as it was pre-subset.
+        let spec = LeadPlanner::specify("간단한 랜딩 페이지").unwrap();
+        let dag = LeadPlanner::plan_dag(&spec).unwrap();
+
+        let dev_task = dag.tasks.iter().find(|t| t.role == Role::Developer).unwrap();
+        let dev_ids = &dev_task.artifacts_expected[0].req_ids;
+        assert_eq!(dev_ids.len(), 2, "REQ-3, REQ-4 per D1 — precondition for this test");
+
+        let body = serde_json::json!({
+            "covered_req_ids": [dev_ids[0].as_str()],
+            "artifacts": []
+        });
+
+        let verdict = crate::dod_exec::judge(dev_task, &body, &[]);
+
+        assert!(!verdict.passed);
+        assert_eq!(verdict.uncovered, vec![dev_ids[1].as_str().to_string()]);
     }
 }
