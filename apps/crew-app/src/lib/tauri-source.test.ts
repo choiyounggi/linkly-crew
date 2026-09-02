@@ -89,6 +89,49 @@ describe("TauriEventSource", () => {
     expect(received.at(-1)).toMatchObject({ type: "message", seq: 3 });
   });
 
+  it("delivers buffered live messages when the snapshot's last_seq is stale relative to its own (empty) messages array — root-cause repro of the messages-0 race (plan D4-①)", async () => {
+    const { listen, push } = fakeListen();
+    const invoke: Invoke = vi.fn(async (cmd) => {
+      if (cmd === "start_run") return "run-99" as never;
+      if (cmd === "run_snapshot") {
+        // Simulates controller.rs `RunHandle::snapshot()`'s messages-0 race:
+        // the ledger read that backs `messages` raced with the write that
+        // backs `last_seq`, landing empty while `last_seq` already reflects
+        // 5 committed messages.
+        return {
+          run_id: "run-99",
+          goal: "goal",
+          spec: null,
+          dag: null,
+          sprint: [],
+          task_states: [],
+          messages: [],
+          last_seq: 5,
+          ts,
+        } as never;
+      }
+      throw new Error(`unexpected invoke ${cmd}`);
+    });
+
+    const source = new TauriEventSource(invoke, listen);
+    const received: RunEvent[] = [];
+    source.onEvent((ev) => received.push(ev));
+
+    const startPromise = source.start("goal");
+    // Live messages seq 1..5 arrive while start() is still replaying (buffered).
+    for (let seq = 1; seq <= 5; seq++) {
+      push({ type: "message", seq, envelope: envelope({ id: `env_${seq}`, corr: `corr-t-pm` }) });
+    }
+    await startPromise;
+
+    const messageEvents = received.filter((e) => e.type === "message");
+    // Every buffered live message has seq <= the snapshot's stale last_seq
+    // (5), so the current code's `this.lastSeq = snapshot.last_seq` treats
+    // all five as already-covered duplicates and drops them — 0 messages
+    // reach subscribers even though none were ever actually replayed.
+    expect(messageEvents.map((m) => m.seq)).toEqual([1, 2, 3, 4, 5]);
+  });
+
   it("ignores a live message at or below the snapshot's last_seq, even one buffered before the snapshot replay", async () => {
     const { listen, push } = fakeListen();
     let resolveSnapshot: (v: unknown) => void = () => {};
