@@ -71,7 +71,6 @@
   /* ---- 타이포: weight (양끝에서, D10 — 300 대 700, 400 대 600 아님) ---- */
   --font-weight-light: 300;
   --font-weight-regular: 400;
-  --font-weight-semibold: 600;
   --font-weight-bold: 700;
   --font-weight-heading: var(--font-weight-bold);
   /* 라이트 온 다크 광학 굵어짐 보정: regular 보다 한 단계 가볍게(D4) */
