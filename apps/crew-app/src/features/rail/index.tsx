@@ -1,5 +1,6 @@
 import { useRunStore } from "../../lib/store";
 import { avatarInitials, deriveRail, type AgentCard, type RailStatus } from "./derive";
+import { useMinHoldCards } from "./useMinHold";
 import "./rail.css";
 
 const STATUS_LABEL: Record<RailStatus, string> = {
@@ -40,7 +41,7 @@ export default function Rail() {
   const runId = useRunStore((s) => s.runId);
   const finished = useRunStore((s) => s.finished);
   const roster = useRunStore((s) => s.roster);
-  const cards = deriveRail(dag, taskStates, messages, runId, finished, roster);
+  const cards = useMinHoldCards(deriveRail(dag, taskStates, messages, runId, finished, roster));
 
   return (
     <section className="panel panel--rail" aria-label="에이전트 레일">

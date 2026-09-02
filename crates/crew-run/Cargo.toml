@@ -18,3 +18,9 @@ async-trait = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+# t1-msg-race r2 review F1: a second raw connection to the same file-backed
+# ledger, used only to deterministically force messages_since's Err path in
+# a test (drop its table out from under the ledger's own connection).
+rusqlite = { version = "0.32", features = ["bundled"] }

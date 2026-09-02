@@ -110,7 +110,12 @@ export class TauriEventSource implements RunEventSource {
       for (const ev of synthesizeSnapshotEvents(snapshot)) {
         this.emit(ev);
       }
-      this.lastSeq = snapshot.last_seq;
+      // The max seq actually replayed (0 if none) — not `snapshot.last_seq`,
+      // which can disagree with `snapshot.messages` under a backend race
+      // (t1-msg-race plan D3). Deriving `lastSeq` from what was truly
+      // replayed makes the dedup gate below self-consistent regardless of
+      // that field's value.
+      this.lastSeq = snapshot.messages.reduce((max, m) => Math.max(max, m.seq), 0);
 
       replaying = false;
       for (const ev of buffered) {

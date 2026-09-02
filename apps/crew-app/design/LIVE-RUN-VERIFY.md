@@ -239,3 +239,65 @@ corr 해석 케이스 + 폴백 경계 케이스).
 회피 가능했다(1차 재시도에서 메시지 18건 정상 수신). `src-tauri/**` 무변경
 원칙(t4 범위 밖)에 따라 코드 수정은 하지 않았다 — 다음 라이브 검증
 작업자를 위해 여기 기록만 남긴다.
+
+## 7. t1-msg-race 후속 — messages 0건 레이스 근본 수정 확인 (연속 10런, 2026-09-02)
+
+**배경**: §6 "부수 관찰"에서 보고된 `messages` 0건 레이스(`run_snapshot`의
+`last_seq`가 실제로 반환된 `messages`와 독립적으로 계산되어, 프론트
+`lastSeq` 게이팅이 라이브 메시지 버퍼 전체를 "이미 재생됨"으로 오판하고
+드롭하는 결함)를 근본 수정했다. 수정: `crates/crew-run/src/controller.rs`의
+`RunHandle::snapshot()`이 `last_seq`를 `snap.last_seq`가 아니라 **실제
+반환하는 `messages`의 max seq(빈 배열이면 0)로 계산**하도록 바꿔 구성상
+원자적으로 만들었고(`snapshot_messages_and_last_seq`), 프론트
+`tauri-source.ts`의 `start()`도 `this.lastSeq`를 `snapshot.last_seq`가
+아니라 **실제 재생한 messages의 max seq**로 계산하도록 방어적으로 고쳤다.
+재현·수정 전 과정은 TDD로 못박혔다 — Rust 쪽은 `snapshot_atomicity_tests`
+모듈에 스레드+`Barrier` 강제 인터리브(ledger commit이 `SnapshotState.
+last_seq` 갱신보다 먼저 일어나는 정확한 경합 창)로 불변식
+(`last_seq == messages의 max seq`)이 수정 전엔 깨지고(RED, `left: 0,
+right: 1`) 수정 후엔 항상 성립함을(GREEN) 확인했다. TS 쪽은
+`tauri-source.test.ts`에 `{last_seq: 5, messages: []}` 스냅샷 + 라이브
+seq 1..5 버퍼 시나리오를 추가해 수정 전 0건 전달(RED)→수정 후 5건 전체
+전달(GREEN)을 확인했다.
+
+**측정 방법**: §1/§6과 동일한 프로브 방법(`TAURI-WEBVIEW-VERIFY.md` §1,
+`index.html` 1줄 + `src/__verify__/probe.ts`, `127.0.0.1:1421` 수집
+서버 — OPTIONS/CORS preflight 처리 포함)을 그대로 썼다. 프로브는 앱
+마운트 후 자동으로 `useRunStore.getState().startRun(goal)` → `finished
+!== null` 폴링(50ms 간격, 고정 sleep 아님, 30초 상한) → 결과 리포트 →
+`defaultSource.stop()` → 재시작을 **10회 연속** 반복했다. `npm run tauri
+dev` 실앱(WKWebView, macOS)에서 실행했다. 측정 후 프로브 주입과 수집
+서버는 전부 원복/삭제했다(아래 "프로브 원복" 참조).
+
+**결과**: 10런 전부 `outcome: "completed"`, 전부 `messageCount: 17`
+(손실 0/10), 전부 `hasAssign: true` / `hasResult: true`(`task.assign`·
+`task.result` 포함 확인). 완주 시간은 67–164ms(런1이 164ms로 가장
+길었고 이후 67–77ms로 수렴 — 첫 런의 JIT/캐시 워밍업으로 추정, 판정에
+영향 없음).
+
+| 런 | outcome | messageCount | hasAssign | hasResult | elapsedMs |
+|---|---|---|---|---|---|
+| 1 | completed | 17 | true | true | 164 |
+| 2 | completed | 17 | true | true | 75 |
+| 3 | completed | 17 | true | true | 69 |
+| 4 | completed | 17 | true | true | 69 |
+| 5 | completed | 17 | true | true | 67 |
+| 6 | completed | 17 | true | true | 77 |
+| 7 | completed | 17 | true | true | 77 |
+| 8 | completed | 17 | true | true | 72 |
+| 9 | completed | 17 | true | true | 70 |
+| 10 | completed | 17 | true | true | 70 |
+
+10런 모두 동일한 17개 `kinds` 시퀀스(`task.ack`/`task.result`/
+`task.assign`/`change_request` 조합)를 보여 실행별 편차 없이 재현성이
+있다.
+
+**결론**: §6에서 보고된 `messages` 0건 레이스는 연속 10런에서 재발하지
+않았다 — 수정이 실제 WKWebView/Rust 백엔드 경로에서 유효함을 확인했다.
+
+**프로브 원복**: 측정 후 `index.html`의 임시 스크립트 태그, `src/
+__verify__/`, 수집 서버(`.claude/tmp/t1-msg-race-live-verify/`, 저장소
+밖 취급 — `.git/info/exclude`로 무시됨)를 전부 제거했다. `git status`에는
+이 문서 갱신과 `crates/crew-run/src/controller.rs` /
+`apps/crew-app/src/lib/tauri-source.ts` / `apps/crew-app/src/lib/
+tauri-source.test.ts`(수정 자체)만 남는다.

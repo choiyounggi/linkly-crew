@@ -1048,6 +1048,31 @@ async fn send_swap_control(
     }
 }
 
+/// `RunHandle::snapshot()`'s `(last_seq, messages)` computation, factored
+/// out for unit testing (t1-msg-race plan D2/D4-②) — exercised directly
+/// against a bare `EventLedger` without needing a live `RunHandle`.
+///
+/// `last_seq` is the max seq among the `messages` actually returned (0 if
+/// none) — never a value read from `SnapshotState` independently — so the
+/// pair is atomic by construction: no interleaving with `handle_bus_event`
+/// (which commits to the ledger *before* acquiring the snapshot lock to
+/// update `last_seq`) can produce a `last_seq` that disagrees with
+/// `messages`; that mismatch was the messages-0 race's root cause. A
+/// `messages_since` error is logged, not silently swallowed, and yields the
+/// safe empty pair (frontend D3: `lastSeq` 0 means "replay nothing, trust
+/// the live buffer").
+fn snapshot_messages_and_last_seq(ledger: &EventLedger) -> (i64, Vec<StoredMessage>) {
+    let messages = match ledger.messages_since(0) {
+        Ok(messages) => messages,
+        Err(err) => {
+            tracing::error!(error = %err, "snapshot: messages_since failed, returning empty");
+            Vec::new()
+        }
+    };
+    let last_seq = messages.iter().map(|m| m.seq).max().unwrap_or(0);
+    (last_seq, messages)
+}
+
 impl RunHandle {
     pub fn run_id(&self) -> &str {
         &self.run_id
@@ -1062,10 +1087,12 @@ impl RunHandle {
 
     /// Current state for reconnect/app-restart (contract §C3):
     /// `task_states`/`spec`/`dag`/`sprint` from the in-memory snapshot,
-    /// `messages` from the ledger's `messages_since(0)`.
+    /// `messages`/`last_seq` from `snapshot_messages_and_last_seq` (t1-msg-race
+    /// plan D2 — factored out so the pairing is unit-testable without a live
+    /// `RunHandle`).
     pub fn snapshot(&self) -> RunSnapshot {
         let snap = self.snapshot.lock().unwrap();
-        let messages = self.ledger.messages_since(0).unwrap_or_default();
+        let (last_seq, messages) = snapshot_messages_and_last_seq(&self.ledger);
         RunSnapshot {
             run_id: self.run_id.clone(),
             goal: snap.goal.clone(),
@@ -1080,7 +1107,7 @@ impl RunHandle {
                     envelope: m.envelope,
                 })
                 .collect(),
-            last_seq: snap.last_seq,
+            last_seq,
             ts: now_ts(),
         }
     }
@@ -1616,5 +1643,156 @@ mod role_cli_cwd_tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_atomicity_tests {
+    //! t1-msg-race plan D4-②: `snapshot_messages_and_last_seq`'s
+    //! `last_seq == max(returned messages' seq)` invariant, including under
+    //! the exact write interleave (`ledger.append` durable before the
+    //! snapshot lock's `last_seq` update, `handle_bus_event` at
+    //! `controller.rs:899-919`) that produces the messages-0 race.
+
+    use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+
+    fn test_envelope(n: u32) -> Envelope {
+        Envelope::new(
+            "sp-1".to_string(),
+            "t-pm".to_string(),
+            "agent:pm".to_string(),
+            vec!["lead".to_string()],
+            MessageKind::TaskResult,
+            None,
+            format!("corr-t-pm-{n}"),
+            serde_json::json!({}),
+            Vec::new(),
+            false,
+            60_000,
+        )
+    }
+
+    fn empty_snapshot_state() -> SnapshotState {
+        SnapshotState {
+            goal: "goal".to_string(),
+            spec: None,
+            dag: None,
+            sprint: Vec::new(),
+            task_states: Vec::new(),
+            last_seq: 0,
+        }
+    }
+
+    /// A fresh path under `.crew-test/` (repo convention, never `/tmp`) for a
+    /// file-backed ledger — needed only by the error-path test below, which
+    /// requires a second connection onto the *same* on-disk database
+    /// (`EventLedger::open_in_memory()` databases are private per-connection
+    /// and can't be reached from a second connection).
+    fn test_ledger_path(label: &str) -> std::path::PathBuf {
+        let dir = std::env::current_dir().unwrap().join(".crew-test");
+        std::fs::create_dir_all(&dir).expect("test setup: .crew-test dir");
+        dir.join(format!("{label}-{}.sqlite3", uuid::Uuid::new_v4()))
+    }
+
+    /// Boundary: nothing ever committed -> last_seq 0, messages empty.
+    #[test]
+    fn empty_ledger_yields_last_seq_zero_and_no_messages() {
+        let ledger = EventLedger::open_in_memory().expect("in-memory ledger");
+        let (last_seq, messages) = snapshot_messages_and_last_seq(&ledger);
+        assert_eq!(last_seq, 0);
+        assert!(messages.is_empty());
+    }
+
+    /// Error (t1-msg-race r2 review F1): `messages_since` returning `Err`
+    /// must be logged and yield the safe empty pair `(0, [])` — never a
+    /// fallback that resurrects the old bug (an independent, possibly-stale
+    /// `last_seq`). Forced deterministically, no sleep/flakiness: a second
+    /// raw connection onto the same file-backed ledger drops the `messages`
+    /// table out from under the ledger's own connection, so its next
+    /// `messages_since` call is guaranteed to fail with "no such table".
+    #[test]
+    fn messages_since_error_yields_safe_empty_pair_not_a_stale_last_seq_fallback() {
+        let path = test_ledger_path("snapshot-error-path");
+        let ledger = EventLedger::open(&path).expect("file-backed ledger");
+        ledger
+            .append(&BusLifecycleEvent::EnvelopeAccepted { envelope: test_envelope(1) })
+            .expect("append");
+
+        {
+            let raw = rusqlite::Connection::open(&path).expect("second raw connection to the same file");
+            raw.execute("DROP TABLE messages", []).expect("drop messages table");
+        }
+
+        let (last_seq, messages) = snapshot_messages_and_last_seq(&ledger);
+        assert_eq!(
+            last_seq, 0,
+            "an Err from messages_since must yield last_seq 0, never a value independent of messages"
+        );
+        assert!(messages.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Normal: one committed message -> the pair matches it.
+    #[test]
+    fn single_committed_message_yields_matching_last_seq() {
+        let ledger = EventLedger::open_in_memory().expect("in-memory ledger");
+        ledger
+            .append(&BusLifecycleEvent::EnvelopeAccepted { envelope: test_envelope(1) })
+            .expect("append");
+        let (last_seq, messages) = snapshot_messages_and_last_seq(&ledger);
+        assert_eq!(last_seq, 1);
+        assert_eq!(messages.iter().map(|m| m.seq).max(), Some(1));
+    }
+
+    /// The invariant test (D4-②): two barriers (no sleep) force the exact
+    /// interleave where a ledger commit lands before `SnapshotState.
+    /// last_seq`'s update — mirroring `handle_bus_event`. A snapshot read
+    /// landing in that window must still return a self-consistent pair.
+    #[test]
+    fn last_seq_matches_returned_messages_max_seq_even_when_read_between_ledger_commit_and_snap_state_update() {
+        let ledger = Arc::new(EventLedger::open_in_memory().expect("in-memory ledger"));
+        let snap = Arc::new(Mutex::new(empty_snapshot_state()));
+        let after_append = Arc::new(Barrier::new(2));
+        let after_read = Arc::new(Barrier::new(2));
+
+        let writer = {
+            let ledger = Arc::clone(&ledger);
+            let snap = Arc::clone(&snap);
+            let after_append = Arc::clone(&after_append);
+            let after_read = Arc::clone(&after_read);
+            thread::spawn(move || {
+                // Mirrors handle_bus_event (controller.rs:899): the ledger
+                // commit happens before the snapshot lock is ever touched.
+                ledger
+                    .append(&BusLifecycleEvent::EnvelopeAccepted { envelope: test_envelope(1) })
+                    .expect("append");
+                after_append.wait();
+                // Hold off updating snap.last_seq until the reader has taken
+                // its snapshot in the exact stale window.
+                after_read.wait();
+                snap.lock().unwrap().last_seq = 1;
+            })
+        };
+
+        after_append.wait();
+        // Confirms the interleave actually landed in the stale window (the
+        // writer hasn't updated snap.last_seq yet) before trusting the
+        // invariant check below — otherwise a broken barrier setup could
+        // pass vacuously.
+        let stale_last_seq = snap.lock().unwrap().last_seq;
+        assert_eq!(stale_last_seq, 0, "test setup: must read snap.last_seq before the writer updates it");
+        let (last_seq, messages) = snapshot_messages_and_last_seq(&ledger);
+        after_read.wait();
+        writer.join().expect("writer thread must not panic");
+
+        let max_seq = messages.iter().map(|m| m.seq).max().unwrap_or(0);
+        assert_eq!(
+            last_seq, max_seq,
+            "snapshot's last_seq must equal the max seq among the messages it actually returned, \
+             regardless of how SnapshotState.last_seq's own update happened to be timed"
+        );
     }
 }
