@@ -18,6 +18,10 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 tracing = "0.1"
+# exact version pin + committed Cargo.lock (t5-terminal plan D1,
+# wiki/security/dependencies/supply-chain.md): WezTerm-author (wez)
+# crates.io publisher, cross-platform PTY.
+portable-pty = "0.9.0"
 # path-deps into the root workspace's crates (contracts-m4.md §C6): this
 # crate stays standalone (see the empty [workspace] below) but still
 # consumes crew-run's public API plus the two upstream types it re-exports

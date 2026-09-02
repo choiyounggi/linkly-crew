@@ -6,6 +6,10 @@ node_modules/
 .DS_Store
 .worktrees/
 Cargo.lock
+# t5-terminal plan D1 (wiki/security/dependencies/supply-chain.md): the
+# Tauri app is a binary, not a library — its lockfile IS committed so
+# portable-pty resolves to an exact pinned version.
+!apps/crew-app/src-tauri/Cargo.lock
 .dev-loop/
 
 # 디자인 방향 탐색용 생성 아티팩트 (2.2MB) — 로컬 보관, 히스토리 제외

@@ -5,6 +5,7 @@
 mod core;
 mod onboarding;
 mod project;
+mod pty;
 
 use core::AppState;
 
@@ -170,6 +171,7 @@ async fn create_project(name: String) -> Result<project::ProjectInfo, String> {
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .manage(pty::PtyRegistry::default())
         .invoke_handler(tauri::generate_handler![
             start_run,
             stop_run,
@@ -186,7 +188,11 @@ pub fn run() {
             get_settings,
             set_settings,
             onboarding_status,
-            create_project
+            create_project,
+            pty::pty_open,
+            pty::pty_write,
+            pty::pty_resize,
+            pty::pty_close
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
