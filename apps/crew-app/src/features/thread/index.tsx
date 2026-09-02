@@ -88,7 +88,10 @@ function ThreadRow({ item }: { item: ThreadItem }) {
 }
 
 export default function Thread() {
-  const messages = useRunStore((s) => s.messages);
+  // Mechanical adaptation to the multi-run store (plan D1) — reads the
+  // active channel's messages instead of the old flat field. No
+  // behavior/UI change; this file otherwise stays t7's call.
+  const messages = useRunStore((s) => (s.activeRunId ? (s.channels[s.activeRunId]?.messages ?? []) : []));
   const items = groupThread(messages);
 
   const sectionRef = useRef<HTMLElement | null>(null);

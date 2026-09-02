@@ -8,12 +8,22 @@ import type {
   Roster,
   RosterAgent,
   RosterAgentDto,
+  ProjectInfo,
   RosterPreset,
   RunEvent,
+  RunSummary,
   SpecDoc,
   TaskDag,
   TaskSpec,
 } from "./types";
+
+/** Fixed single demo run id (plan Task01 step3 — one browser demo per source instance, not a real multi-run backend). */
+const MOCK_RUN_ID = "run_mock";
+
+/** Mirrors src-tauri/src/project.rs `validate_name` (t3-be-project): lowercase ascii letters/digits/hyphens, first char not a hyphen, 1-63 chars. */
+function isValidProjectName(name: string): boolean {
+  return /^[a-z0-9][a-z0-9-]{0,62}$/.test(name);
+}
 
 // M3-shaped landing-page run (plan D9): fixed 5-role linear chain
 // t-pm -> t-design -> t-publish -> t-dev -> t-qa, REQ-1..5, with one
@@ -184,7 +194,7 @@ function buildScenario(goal: string, initialRoster: Roster, allocateSeq: () => n
   let envCounter = 0;
   const nextEnvId = () => `env_${++envCounter}`;
 
-  events.push({ type: "run_started", run_id: "run_mock", goal, ts: PENDING_TS });
+  events.push({ type: "run_started", run_id: MOCK_RUN_ID, goal, ts: PENDING_TS });
   events.push({ type: "roster_changed", agents: rosterToDto(initialRoster), ts: PENDING_TS });
 
   const { spec, dag } = buildSpecAndDag(goal);
@@ -406,19 +416,24 @@ function restampWithNow(ev: RunEvent): RunEvent {
 }
 
 /**
- * Demo/test default source (plan D9): replays a scripted M3-shaped,
- * 3-sprint run (plan D4) on timers, `intervalMs` apart (default 300; tests
- * pass 0 with fake timers). Also implements the C7a optional roster/harness
+ * Demo/test default source (plan D9, extended by Task01 step3 for the
+ * multi-run interface): replays a scripted M3-shaped, 3-sprint run (plan D4)
+ * on timers, `intervalMs` apart (default 300; tests pass 0 with fake
+ * timers), under a single fixed demo run id (`MOCK_RUN_ID`) — this is a
+ * browser-dev/test fallback, not a real multi-run backend, so it does not
+ * simulate concurrent runs. Also implements the C7a optional roster/harness
  * methods (plan D5) as an in-memory simulation.
  */
 export class MockEventSource implements RunEventSource {
   private readonly intervalMs: number;
-  private readonly listeners = new Set<(ev: RunEvent) => void>();
+  private readonly listeners = new Set<(runId: string, ev: RunEvent) => void>();
   private timers: ReturnType<typeof setTimeout>[] = [];
   private roster: Roster;
   private nextSeq = 1;
   private swapEnvCounter = 0;
   private gateEnvCounter = 0;
+  private started = false;
+  private goal = "";
   /** Messages actually delivered so far (plan D4) — `searchMessages` filters over this, not the full scripted scenario. */
   private deliveredMessages: { seq: number; envelope: Envelope }[] = [];
 
@@ -427,10 +442,13 @@ export class MockEventSource implements RunEventSource {
     this.roster = roster;
   }
 
-  async start(goal: string): Promise<void> {
+  /** `scripted` is unused: this source IS the scripted demo regardless of the toggle (it only ever runs outside Tauri). */
+  async start(goal: string, _scripted: boolean): Promise<string> {
     this.clearTimers();
     this.nextSeq = 1;
     this.deliveredMessages = [];
+    this.started = true;
+    this.goal = goal;
     const initialRoster = this.roster;
     const events = buildScenario(goal, initialRoster, () => this.nextSeq++);
     // The scripted scenario always ends with the designer swapped to
@@ -446,17 +464,41 @@ export class MockEventSource implements RunEventSource {
       }, index * this.intervalMs);
       this.timers.push(timer);
     });
+
+    return MOCK_RUN_ID;
   }
 
-  onEvent(cb: (ev: RunEvent) => void): () => void {
+  onEvent(cb: (runId: string, ev: RunEvent) => void): () => void {
     this.listeners.add(cb);
     return () => {
       this.listeners.delete(cb);
     };
   }
 
-  async stop(): Promise<void> {
+  async stop(_runId: string): Promise<void> {
     this.clearTimers();
+  }
+
+  async remove(_runId: string): Promise<void> {
+    this.clearTimers();
+    this.started = false;
+  }
+
+  /** No-op: the mock has no separate persisted backend state to re-sync from — every event already went out live. */
+  async resync(_runId: string): Promise<void> {
+    return;
+  }
+
+  async listRuns(): Promise<RunSummary[]> {
+    return this.started ? [{ run_id: MOCK_RUN_ID, goal: this.goal, finished: null }] : [];
+  }
+
+  /** In-memory simulation (no real git/gh) — validates the name like the real backend so the demo flow's error path is exercisable too. */
+  async createProject(name: string): Promise<ProjectInfo> {
+    if (!isValidProjectName(name)) {
+      throw new Error("invalid_name");
+    }
+    return { name, path: `/mock/${name}` };
   }
 
   private clearTimers(): void {
@@ -464,18 +506,18 @@ export class MockEventSource implements RunEventSource {
     this.timers = [];
   }
 
-  /** Delivers one event to subscribers, tracking `message`s for `searchMessages` (plan D4). */
+  /** Delivers one event to subscribers under the fixed demo run id, tracking `message`s for `searchMessages` (plan D4). */
   private emit(ev: RunEvent): void {
     if (ev.type === "message") {
       this.deliveredMessages.push({ seq: ev.seq, envelope: ev.envelope });
     }
-    for (const cb of this.listeners) cb(ev);
+    for (const cb of this.listeners) cb(MOCK_RUN_ID, ev);
   }
 
   // --- C7a optional methods (plan D5) -------------------------------------
 
-  /** In-memory swap: updates the roster, then replays handoff + roster_changed immediately. */
-  async swapHarness(agentId: string, harness: string): Promise<void> {
+  /** In-memory swap: updates the roster, then replays handoff + roster_changed immediately. `runId` is unused — this source is single-run (D8: kept for interface parity with the real backend). */
+  async swapHarness(_runId: string, agentId: string, harness: string): Promise<void> {
     const target = this.roster.agents.find((a) => a.id === agentId);
     if (!target) {
       throw new Error(`swapHarness: unknown agent id "${agentId}"`);
@@ -539,7 +581,7 @@ export class MockEventSource implements RunEventSource {
    * Replays a human.response message, then the resulting state transition:
    * "approve" -> assigned -> accepted; "reject" -> blocked (contracts-m7.md §E8).
    */
-  async resolveGate(taskId: string, decision: "approve" | "reject", reason: string): Promise<void> {
+  async resolveGate(_runId: string, taskId: string, decision: "approve" | "reject", reason: string): Promise<void> {
     if (!ROLE_TASKS.some((t) => t.id === taskId)) {
       throw new Error(`resolveGate: unknown task id "${taskId}"`);
     }
@@ -569,8 +611,8 @@ export class MockEventSource implements RunEventSource {
     }
   }
 
-  /** In-memory, case-insensitive substring filter over kind/from/body of delivered messages (plan D4). */
-  async searchMessages(query: string): Promise<{ seq: number; envelope: Envelope }[]> {
+  /** In-memory, case-insensitive substring filter over kind/from/body of delivered messages (plan D4). `runId` unused — see `swapHarness`. */
+  async searchMessages(_runId: string, query: string): Promise<{ seq: number; envelope: Envelope }[]> {
     const needle = query.toLowerCase();
     return this.deliveredMessages.filter(({ envelope }) => {
       const haystack = `${envelope.kind} ${envelope.from} ${JSON.stringify(envelope.body ?? "")}`.toLowerCase();

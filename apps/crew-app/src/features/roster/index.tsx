@@ -30,7 +30,10 @@ function errorMessage(err: unknown): string {
 }
 
 export default function RosterPanel({ source = defaultSource }: RosterPanelProps) {
-  const canSwap = useRunStore((s) => s.runId !== null && s.finished === null);
+  const activeRunId = useRunStore((s) => s.activeRunId);
+  const canSwap = useRunStore(
+    (s) => s.activeRunId !== null && s.channels[s.activeRunId]?.finished === null,
+  );
 
   const supportsPresets = typeof source.listPresets === "function";
   const supportsHarnesses = typeof source.detectHarnesses === "function";
@@ -140,14 +143,14 @@ export default function RosterPanel({ source = defaultSource }: RosterPanelProps
   };
 
   const handleSwap = async (agentId: string, harness: string) => {
-    if (!supportsSwap) return;
+    if (!supportsSwap || !activeRunId) return;
     setSwapLoadingId(agentId);
     setSwapErrors((prev) => {
       const { [agentId]: _removed, ...rest } = prev;
       return rest;
     });
     try {
-      await source.swapHarness!(agentId, harness);
+      await source.swapHarness!(activeRunId, agentId, harness);
     } catch (err) {
       setSwapErrors((prev) => ({ ...prev, [agentId]: errorMessage(err) }));
     } finally {

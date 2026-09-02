@@ -1,0 +1,50 @@
+/* .modal-overlay lives in App.css (shared with the settings overlay). */
+
+.modal {
+  background: var(--surface-panel);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 var(--space-4) var(--space-8) oklch(5% 0.01 215 / 0.5);
+}
+
+.new-task-modal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: min(32rem, 100%);
+  max-height: min(38rem, 90vh);
+  overflow-y: auto;
+  padding: var(--space-5);
+}
+
+.new-task-modal__title {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-heading);
+  color: var(--ink-text);
+}
+
+.new-task-modal textarea {
+  resize: vertical;
+}
+
+.new-task-modal__scripted {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--ink-dim);
+  font-size: var(--font-size-sm);
+}
+
+.new-task-modal__error {
+  margin: 0;
+  color: var(--status-danger);
+  font-size: var(--font-size-sm);
+}
+
+.new-task-modal__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
