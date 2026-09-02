@@ -301,3 +301,203 @@ __verify__/`, 수집 서버(`.claude/tmp/t1-msg-race-live-verify/`, 저장소
 이 문서 갱신과 `crates/crew-run/src/controller.rs` /
 `apps/crew-app/src/lib/tauri-source.ts` / `apps/crew-app/src/lib/
 tauri-source.test.ts`(수정 자체)만 남는다.
+
+## 8. PR #11 실런 시각 검증 — 매트릭스 none 셀 + awaiting min-hold (lf3, 2026-09-02)
+
+**배경**: PR #11(main `807dfbb`) 변경분의 실런 시각 검증 중 lf2가 테스트·
+통합 리뷰까지 닫고 범위 밖으로 남긴 실앱 육안/실측 확인 1건. 확인 대상:
+(1) requirements 매트릭스 none 셀 5개(design×REQ-5, publish×REQ-4,
+dev×REQ-1,2,5) 렌더, (2) awaiting("응답대기") 배지 ≥600ms 가시성(lf1에서
+0/3 미관측이었던 항목).
+
+**측정 방법**: §1/§7과 동일한 프로브 방법(`TAURI-WEBVIEW-VERIFY.md` §1,
+`index.html` 1줄 + `src/__verify__/probe.ts`, `127.0.0.1:1421` 수집
+서버 — OPTIONS/CORS preflight 처리 포함)을 그대로 썼다. 수집기 생존은
+`curl -X OPTIONS`(204)/`curl -X POST`(200) 왕복 확인 후 실웹뷰의
+`probe_alive` POST 도착으로 재확인했다(`userAgent`: WKWebView, Tauri).
+
+프로브는 마운트 후 "아티팩트" 탭을 클릭해 매트릭스를 마운트 상태로 유지한
+채 세 가지를 계측했다:
+
+- **매트릭스 스냅샷(D4)**: 각 런 완주(`useRunStore.getState().finished
+  !== null`, 50ms 폴링, 30초 상한) 직후 `.req-matrix__cell` 25개 전부에
+  대해 `aria-label`로 reqId/taskId/state를 식별하고
+  `className`/`getBoundingClientRect()`/`getComputedStyle`의
+  `backgroundColor`·`borderColor`·`color`를 기록.
+- **배지 타임라인(D5)**: MutationObserver 대신 rAF 루프에서 매 프레임
+  `.rail-card`마다 `.rail-badge`의 `className`을 이전 프레임과 비교해
+  변화 시점만 `{ts, role, className}`로 기록. 런 시작 전부터 마지막 런
+  완주 후 3초까지 지속.
+- **store 레벨 교차검증(추가)**: `useRunStore.subscribe`로 zustand
+  스토어의 원시 변경을 React 렌더와 무관하게 직접 관측 — 매 변경마다
+  `deriveRail(...)`을 재계산해 idle이 아닌 상태로 바뀔 때만
+  `{ts, id, role, status}`를 기록. DOM이 아무것도 못 그렸어도 데이터
+  계층에서 transient 상태가 실재했는지 판별하기 위함.
+
+스크립티드 런 3회 연속(`stop_run` 후 재시작, D7)을, 아래 §2의 CSS 수정
+전후로 각각 수행했다(수정 전 2세트, 수정 후 1세트 — 총 9런). 프로브
+주입과 수집 서버는 측정 후 전부 원복/삭제했다(§4 참조).
+
+### 1. 커버리지 매트릭스 none 셀 (5/5, 3세트 9런 전부 일치)
+
+9런(수정 전 6런 + 수정 후 3런) 전부 25셀(5 REQ × 5 task) 스냅샷에서
+none 셀이 정확히 다음 5개로 관측됐다:
+
+| REQ × Task | 상태 |
+|---|---|
+| REQ-1 × t-dev | none |
+| REQ-2 × t-dev | none |
+| REQ-4 × t-publish | none |
+| REQ-5 × t-design | none |
+| REQ-5 × t-dev | none |
+
+브리프에 명시된 기대 5셀(design×REQ-5, publish×REQ-4, dev×REQ-1,2,5)과
+정확히 일치 — 9런 모두 편차 없음.
+
+### 2. none 셀 시각 구분 — 결함 발견 및 수정(CSS specificity)
+
+**최초 관측(수정 전, 2세트 6런)**: 매트릭스 스냅샷에서 covered/expected/
+none 세 상태 전부 동일한 `borderColor`(`oklch(0.27 0.014 215)` =
+`--border-hairline`)로 렌더됐다.
+
+| 상태 | backgroundColor | borderColor(수정 전) |
+|---|---|---|
+| covered | `oklch(0.72 0.15 150)` | `oklch(0.27 0.014 215)` |
+| expected | `oklch(0.19 0.012 215)` | `oklch(0.27 0.014 215)` |
+| none | `rgba(0, 0, 0, 0)`(투명) | `oklch(0.27 0.014 215)` |
+
+**원인**: `artifacts.css`의 `.req-matrix__cell--none { border-color:
+var(--surface-panel); }`(specificity 0,1,0)이 `.req-matrix th,
+.req-matrix td { border: 1px solid var(--border-hairline); }`
+(specificity 0,1,1)보다 소스 순서와 무관하게 항상 낮아 — 의도한
+오버라이드가 한 번도 적용되지 않았다. 결과: none과 expected의 유일한
+구분 수단이 background뿐인데(투명 → body `--surface-paper`(13%) vs
+`--surface-raised`(19%)), 이는 `TAURI-WEBVIEW-VERIFY.md` Fix2가
+"수정함"으로 기록한 대비비 1.09(육안 구분 불가) 문제가 실제로는 재발한
+상태였다 — border 기반 보정이 CSS 캐스케이드에서 무력화됐기 때문.
+
+**수정(사용자 승인, 이번 런 범위)**: `.req-matrix__cell--none` 선택자를
+`.req-matrix td.req-matrix__cell--none`(specificity 0,2,1)로 좁혀
+`.req-matrix td` 규칙(0,1,1)을 확실히 이기도록 했다. 토큰 값·background
+규칙·covered/expected·min-width는 변경하지 않았다.
+
+**수정 후 실측(재측정, 1세트 3런 전부 일치)**:
+
+| 상태 | backgroundColor | borderColor(수정 후) |
+|---|---|---|
+| covered | `oklch(0.72 0.15 150)` | `oklch(0.27 0.014 215)` |
+| expected | `oklch(0.19 0.012 215)` | `oklch(0.27 0.014 215)` |
+| none | `rgba(0, 0, 0, 0)`(투명) | `oklch(0.16 0.012 215)` |
+
+`oklch(0.16 0.012 215)`는 `--surface-panel`(`--elev-1: 16%`, chroma
+0.012, hue 215)의 해석값과 정확히 일치 — 오버라이드가 이제 적용된다.
+none의 border가 expected/covered와 명확히 다른 값으로 분리됐다(의도한
+"테두리가 배경 쪽으로 낮아져 격자에서 빠진다"는 시맨틱이 실제로 성립).
+
+**회귀 가드**: `src/test/css-integrity.test.mjs`에 순수 CSS specificity
+계산기(`specificity()` — id/class·pseudo-class/type 카운트, CSS
+cascade 명세 기준)와 CSS 규칙 파서(`parseRules()`)를 추가하고,
+`artifacts.css`에서
+실제 두 규칙의 선택자를 파싱해 none 오버라이드가 공유 `td` 규칙보다
+specificity상 확실히 앞서는지 단정하는 테스트를 추가했다(jsdom의 CSS
+캐스케이드 엔진에 의존하지 않는 순수 구문 분석이라 신뢰 가능 — jsdom
+자체는 실제 브라우저만큼 캐스케이드 해석을 보증하지 않으므로 실측은
+라이브 웹뷰에 의존했고, 이 테스트는 "이 규칙이 다시 낮은 specificity로
+회귀하면" 잡아내는 정적 가드다).
+
+**감사에서 잡힌 자체 결함**: 최초 구현은 선택자를 `/^([^{]+)\{/m` 정규식
+(`}` 경계 없음)으로 추출했는데, `test-quality-auditor` 서브에이전트가
+이 정규식이 이전 규칙·주석까지 걸쳐 매칭돼(이 파일의 none 규칙 바로
+위에 있는 한국어 설명 주석 포함) 잘못된 selector 문자열을 만들고, 그
+잘못된 문자열의 specificity 가 우연히 기준을 통과해 **수정 전 버그가
+있는 CSS 에서도 테스트가 그린으로 나오는 것**을 잡아냈다(수정 전
+선택자로 되돌려 직접 재현·확인함). 주석을 먼저 제거하고 `{`/`}` 로
+규칙을 명확히 경계 짓는 `parseRules()`로 교체해 고쳤다 — 고친 뒤 다시
+`.req-matrix__cell--none`(수정 전 선택자)로 되돌려 이 테스트 **하나만**
+실패함을 확인한 뒤 원복했다(다른 19개 테스트는 영향 없음). 기존 테스트는
+손대지 않았다.
+
+### 3. awaiting/working 배지 min-hold — 하네스(harness) 타이밍 한계(결함 아님)
+
+**결과**: 3세트(9런) 전부에서 DOM(rAF 폴링, 프레임당 `.rail-badge`
+className 비교)은 working/awaiting 배지를 단 한 번도 관측하지
+못했다(모든 `badge_change` 기록이 `--idle`). 반면 zustand store를 React
+렌더와 무관하게 직접 구독해 `deriveRail()` 출력을 재계산하는
+교차검증에서는 "working"이 세 세트 모두에서 lead·pm 카드에 짧게(수 ms)
+실재로 관측됐다. "awaiting"은 store 레벨에서도 9런 전부 0회.
+
+마지막 세트(수정 후, 3런)의 대표값:
+
+| 런 | 완주 ms | store 레벨 관측(working) | DOM 배지 관측 |
+|---|---|---|---|
+| 1 | 66 | lead @+62ms | 없음(전부 idle) |
+| 2 | 127 | lead @+27ms, pm @+28ms | 없음(전부 idle) |
+| 3 | 76 | pm @+19ms, lead @+19ms | 없음(전부 idle) |
+
+**원인 분석**(`useMinHold.ts` + 그 테스트, `derive.ts` 인용):
+
+1. **awaiting이 store 레벨에서도 0/9인 이유**: `derive.ts:65-73`의
+   `isAwaitingResult()`는 "corr 내 최후 이벤트가 `task.result`"일 때만
+   awaiting을 성립시키는데, 스크립티드 하네스
+   (`crates/crew-agent/src/crew_member.rs:96` `ack_and_result` —
+   `MessageKind::TaskAssign` 수신 즉시, 같은 호출에서 인위적 지연 없이
+   `task.ack`+`task.result`를 함께 회신)와 `crew-lead/src/dispatch.rs`의
+   즉시 accept 처리로 인해 태스크 상태가 `Assigned`→`Accepted`로 사실상
+   같은 처리 틱 안에서 넘어간다. `derive.ts:91`의 `if (state !==
+   "assigned") return idle` 분기가 awaiting 판정보다 먼저 실행되므로,
+   "task.result 도착"과 "accepted로의 상태 전이" 사이 창이 실측상 폭이
+   0에 가깝다 — awaiting이 코드상 도달 불가능한 게 아니라, 이 스크립티드
+   하네스의 응답 지연이 사실상 0이라 그 창이 열리지 않는다.
+2. **working은 store 레벨에서 실재하지만 DOM에 전혀 반영되지 않는
+   이유**: `src/main.tsx`는 `createRoot`(React 18)를 쓴다 — React 18은
+   네이티브 이벤트/Promise/타이머를 포함해 자동 배칭(automatic batching)
+   을 전면 적용한다. 스크립티드 런의 연쇄 이벤트(task.assign→task.ack→
+   task.result→상태변경 방송)가 거의 동시에(수 ms 이내) 도착해 zustand의
+   개별 `set()` 호출들이 React의 같은 배치 안에 묶이면, `Rail`
+   (`index.tsx:44`, `useMinHoldCards(deriveRail(...))`)이 실제로
+   커밋·페인트하는 렌더는 그 배치의 **최종 값**뿐이다 — 배치 중간에
+   존재했던 "working" cards 배열은 `useMinHoldCards`에 prop으로 전달되는
+   순간 자체가 없다. `useMinHold.ts`의 hold 로직은 자신이 **받는**
+   transient 값을 최소 600ms 유지하도록 정확히 동작한다(단위테스트로
+   증명됨: `useMinHold.test.ts`의 "holds a transient status (awaiting)
+   for holdMs before dropping to the latest status"[27행], "coalesces
+   multiple status changes during a hold into the latest status at
+   expiry"[48행], "starts a new chained hold if the status is transient
+   again right at expiry"[70행]) — 하지만 애초에 그 값을 한 번도 못
+   받으면 hold 타이머 자체가 시작되지 않는다. 이 단위테스트들은 이벤트가
+   서로 몇 초씩 떨어져 도착하는(각자 별도 React 커밋을 만드는) 실제
+   시나리오에서는 hold가 정상 작동함을 뒷받침한다 — fake timer로 각 상태
+   변화를 개별 `rerender()` 호출로 분리해 놓고 hold가 정확히 600ms 뒤에
+   만료됨을 검증하기 때문이다.
+3. **결론**: `derive.ts`/`useMinHold.ts`는 각각 단위테스트가 증명하는
+   대로 정확히 동작한다 — 결함은 두 컴포넌트 어디에도 없다. 이것은
+   "스크립티드 데모 하네스가 사람이 인지하기엔 물론이고 React의 자동
+   배칭 경계보다도 빠르다"는 **하네스 타이밍 특성**이며,
+   `TAURI-WEBVIEW-VERIFY.md §5`("결론: 결함이 아니라 의도된 동작")·
+   `LIVE-RUN-VERIFY.md §1`(0/3 미관측, MutationObserver 코얼레싱 가설)의
+   결론과 일치·확장한다 — 이번 측정은 MutationObserver뿐 아니라 rAF
+   폴링도, 심지어 React 배칭 자체가 중간 렌더를 아예 커밋하지 않는 한
+   관측할 수 없음을 store-subscribe 교차검증으로 처음 확증했다. 실제
+   프로덕션(느린 진짜 LLM 백엔드, 이벤트 간 간격이 초 단위)에서는 각
+   이벤트가 별도 React 커밋을 만들 가능성이 높아 hold가 정상적으로
+   관측 가능할 것으로 추정되나, 이는 이번 스크립티드 하네스로는 검증할
+   수 없다(범위 밖 — 앱 코드·하네스 수정 없이 사실만 보고).
+
+**결정**: 코디네이터 승인에 따라 알려진 하네스 한계(known limitation)로
+기록하고 완료 처리한다. `derive.ts`/`useMinHold.ts`/스크립티드 하네스
+수정은 하지 않았다.
+
+### 4. 프로브 원복
+
+측정 후 `index.html`의 임시 스크립트 태그, `src/__verify__/`, 수집
+서버(`.claude/tmp/lf3-visual-verify/`, 저장소 밖 취급 —
+`.git/info/exclude`로 무시됨)를 전부 제거했다. `git status`에는 이 문서
+갱신과 `apps/crew-app/src/features/artifacts/artifacts.css`(none 셀
+border-color specificity 수정) / `apps/crew-app/src/test/
+css-integrity.test.mjs`(회귀 가드 추가)만 남는다.
+
+### 5. 회귀 확인
+
+- `npx vitest run`: **213 pass**(기존 206 + 이번에 추가한 specificity/
+  parseRules 계산기 검증 6개 + none-cell 회귀 가드 1개)
+- `cd apps/crew-app/src-tauri && cargo test --lib`: **15 pass**
