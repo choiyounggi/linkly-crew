@@ -184,21 +184,35 @@ async fn rejects_a_real_relative_path_at_the_process_cwd() {
     cleanup(&data_dir);
 }
 
-/// Normal (D10 + minimum-case-set): a real, existing, absolute directory is
-/// accepted — `start` succeeds.
+/// R6 / design D5 (HANDOFF pitfall 30 fix): a real, existing, absolute
+/// directory that is **not** a git repository is now rejected — every role
+/// needs its own `git worktree` under `project_root`, so a plain directory
+/// can no longer be accepted the way pre-this-task M11 accepted it (the old
+/// `accepts_a_real_absolute_directory` test this replaces asserted exactly
+/// that now-superseded acceptance). No fallback to a shared cwd.
 #[tokio::test(flavor = "multi_thread")]
-async fn accepts_a_real_absolute_directory() {
-    let data_dir = test_root("project-root-ok-data");
-    let root = test_root("project-root-ok-root");
-    std::fs::create_dir_all(&root).expect("test setup: create project_root dir");
+async fn rejects_a_real_absolute_directory_that_is_not_a_git_repo() {
+    let data_dir = test_root("project-root-non-git-data");
+    let root = test_root("project-root-non-git-root");
+    std::fs::create_dir_all(&root).expect("test setup: create a real, plain (non-git) directory");
 
     let cfg = config(data_dir.clone(), Some(root.clone()));
-    let handle = tokio::time::timeout(std::time::Duration::from_secs(30), RunController::start(cfg))
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), RunController::start(cfg))
         .await
-        .expect("start must finish within the deterministic budget")
-        .expect("start must succeed for a real, existing, absolute project_root");
+        .expect("start must finish within the deterministic budget");
 
-    handle.shutdown().await;
+    match result {
+        Err(RunError::ProjectRootInvalid(msg)) => {
+            assert!(msg.contains("git"), "the rejection must explain the root isn't a git repo: msg={msg:?}");
+        }
+        Err(other) => panic!("expected ProjectRootInvalid, got a different RunError: {other}"),
+        Ok(_) => panic!("start must reject a non-git project_root now that every role needs a git worktree under it"),
+    }
+    assert!(
+        !data_dir.exists(),
+        "a rejected project_root must leave zero partial run state (no data_dir side effects): {data_dir:?}"
+    );
+
     cleanup(&data_dir);
     cleanup(&root);
 }

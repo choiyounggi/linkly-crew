@@ -6,6 +6,7 @@ mod config;
 mod controller;
 mod events;
 mod observe;
+mod worktree;
 
 pub use config::{
     default_dev_cmd_checks_node, default_dev_cmd_checks_rust, GateDecision, RunConfig, RunError,

@@ -37,7 +37,12 @@ pub struct RunConfig {
     /// The real project tree the crew works in and the Lead's `cmd` DoD checks
     /// execute in. `None` (the shipped default) = the M10-and-earlier behavior
     /// exactly: every role's CLI cwd and the Cmd DoD exec cwd are the per-role
-    /// scratch `<data_dir>/cli-cwd/<role>`. `Some(root)` = **both** are `root`.
+    /// scratch `<data_dir>/cli-cwd/<role>`. `Some(root)` = `root` must be a git
+    /// repository; every role's CLI cwd and the Cmd DoD exec cwd are instead
+    /// that role's own out-of-repo `git worktree` (`crew/<role>` branch) under
+    /// it — distinct per role, never `root` itself (HANDOFF trap 30, this
+    /// crate's `worktree` module) — with a shared `<root>/.crew/artifacts`
+    /// convention injected into each role's spawn spec.
     ///
     /// Caller-designated only — never derived from cwd, git, or a guess
     /// (HANDOFF §5 trap 29 / contracts-m11.md §I6). With `Some`, the Lead

@@ -8,7 +8,7 @@
 //! states of every earlier sprint (`with_prior_states`, contract C3a).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +33,7 @@ use crate::events::{
     now_ts, PresenceKindDto, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto,
 };
 use crate::observe::{ObservingLead, TaskStateChange};
+use crate::worktree;
 
 const CHANNEL_CAPACITY: usize = 256;
 
@@ -74,7 +75,7 @@ fn roles_routing() -> Vec<(Role, String)> {
         .collect()
 }
 
-fn role_dir_name(role: Role) -> &'static str {
+pub(crate) fn role_dir_name(role: Role) -> &'static str {
     match role {
         Role::Pm => "pm",
         Role::Designer => "designer",
@@ -87,10 +88,16 @@ fn role_dir_name(role: Role) -> &'static str {
 /// The agent CLI cwd and the Cmd DoD exec cwd — the same seam feeds both
 /// call sites in `spawn_sprint` (contracts-m11.md §I1/§I3).
 ///
-/// `Some(project_root)` — the human-designated real project tree (M11):
-/// returned verbatim, `create_dir_all` is **not** called since
-/// `RunController::start`'s leading validation (§I2) already guarantees the
-/// directory exists.
+/// `Some(role_worktrees)` — `project_root` is set (M11 + this task's plan
+/// D1-D3, HANDOFF pitfall 30): a pure lookup into the role-\>worktree cache
+/// `RunController::start` precomputes once via `resolve_role_worktrees`, so
+/// every role resolves to its own out-of-repo `git worktree` rather than
+/// `project_root` verbatim (the pitfall 30 bug this replaces). Kept
+/// infallible — and its 16 call sites/tests untouched by `Result` — by
+/// resolving `ensure_role_worktree`'s fallibility once up front instead of
+/// on every lookup; a missing entry means `start` failed to populate every
+/// `ROLE_ORDER` role, which is a `resolve_role_worktrees` bug, not a
+/// reachable runtime state.
 ///
 /// `None` — pre-M11 behavior, unchanged (t-swap follow-up fix,
 /// coordinator-run real-CLI spot check): `data_dir/cli-cwd/<role>`, created
@@ -100,13 +107,56 @@ fn role_dir_name(role: Role) -> &'static str {
 /// claude process: No such file or directory"), which every worker then
 /// reports as blocked, and with the default `escalation_timeout_ms=0` the
 /// run hangs forever waiting on a human gate that never fires.
-fn role_cli_cwd(project_root: Option<&Path>, data_dir: &Path, role: Role) -> std::path::PathBuf {
-    if let Some(root) = project_root {
-        return root.to_path_buf();
+fn role_cli_cwd(role_worktrees: Option<&[(Role, PathBuf)]>, data_dir: &Path, role: Role) -> PathBuf {
+    if let Some(worktrees) = role_worktrees {
+        return worktrees
+            .iter()
+            .find(|(r, _)| *r == role)
+            .map(|(_, path)| path.clone())
+            .unwrap_or_else(|| {
+                panic!("role_cli_cwd: no precomputed worktree for role {role:?} — resolve_role_worktrees must populate every ROLE_ORDER entry")
+            });
     }
     let cwd = data_dir.join("cli-cwd").join(role_dir_name(role));
     let _ = std::fs::create_dir_all(&cwd);
     cwd
+}
+
+/// Precomputes every canonical role's (`ROLE_ORDER`) worktree once for a
+/// `project_root` (plan D1-D3): factored out of `RunController::start` so
+/// it's unit-testable with an injected `worktrees_base` — the production
+/// call site always derives `worktrees_base` from
+/// `worktree::project_worktrees_base`, tests inject a tempdir instead
+/// (tools_guidance: never touch `$HOME` from a test). Fails on the first
+/// role `ensure_role_worktree` can't set up (design D5) — no partial cache
+/// is returned.
+fn resolve_role_worktrees(project_root: &Path, worktrees_base: &Path) -> Result<Vec<(Role, PathBuf)>, String> {
+    let mut worktrees = Vec::with_capacity(ROLE_ORDER.len());
+    for role in ROLE_ORDER {
+        let path = worktree::ensure_role_worktree(project_root, worktrees_base, role)?;
+        worktrees.push((role, path));
+    }
+    Ok(worktrees)
+}
+
+/// The RealCli spawn spec's system hint (`spawn_sprint`'s
+/// `RoleHarnessBehavior::new` argument) — factored out so the artifacts
+/// convention injection (design D4) is unit-testable without a live
+/// bus/harness (RealCli `spawn_sprint` itself stays assembly-only, never
+/// exercised by a worker test). `project_root` is the original repo root
+/// (not any role's worktree, contract deliberately shared across roles),
+/// present only when `RunConfig.project_root` is `Some`.
+fn role_system_hint(role: Role, goal: &str, project_root: Option<&Path>) -> String {
+    let mut hint = format!("You are the {role:?} of a crew building: {goal}");
+    if let Some(root) = project_root {
+        hint.push_str(&format!(
+            "\n\n공유 산출물·문서·이미지·디자인 토큰은 {}/.crew/artifacts 에서 주고받는다(하위 docs/ images/ design-tokens/ deliverables/). \
+             같은 파일을 동시에 편집하지 말고 역할별 파일로 분리하라. \
+             프로젝트에 메인 체크아웃 쓰기를 차단하는 훅을 추가하지 말라.",
+            root.display()
+        ));
+    }
+    hint
 }
 
 /// A roster slot's `role` string (`RosterAgent::role`) to `crew_proto::Role`
@@ -262,6 +312,7 @@ async fn spawn_sprint(
     goal: &str,
     data_dir: &Path,
     project_root: Option<&Path>,
+    role_worktrees: Option<&[(Role, PathBuf)]>,
     roster: &Roster,
     pool: &Arc<HarnessPool>,
     dag: &TaskDag,
@@ -312,10 +363,10 @@ async fn spawn_sprint(
                     continue;
                 };
                 let harness_cfg = HarnessAgentCfg {
-                    cwd: role_cli_cwd(project_root, data_dir, role),
+                    cwd: role_cli_cwd(role_worktrees, data_dir, role),
                     model: None,
                 };
-                let system_hint = format!("You are the {role:?} of a crew building: {goal}");
+                let system_hint = role_system_hint(role, goal, project_root);
                 // Permit is scoped to each CLI interaction (turn), not the
                 // runner's lifetime (contracts-m6.md §D2d) — a runner-
                 // lifetime `pool.acquire` plus `RoleHarnessBehavior`'s
@@ -340,7 +391,7 @@ async fn spawn_sprint(
     let routing: Vec<(Role, String)> = crew.iter().map(|(id, role)| (*role, id.clone())).collect();
     let prior_states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
     let cmd_cwd_base = data_dir.to_path_buf();
-    let cmd_project_root = project_root.map(Path::to_path_buf);
+    let cmd_role_worktrees = role_worktrees.map(<[(Role, PathBuf)]>::to_vec);
     let lead_behavior = LeadBehavior::new(
         "agent:lead",
         dag.clone(),
@@ -351,7 +402,7 @@ async fn spawn_sprint(
     .with_prior_states(prior_states)
     .escalation_timeout_ms(escalation_timeout_ms)
     .with_cmd_exec(Arc::new(move |role| {
-        role_cli_cwd(cmd_project_root.as_deref(), &cmd_cwd_base, role)
+        role_cli_cwd(cmd_role_worktrees.as_deref(), &cmd_cwd_base, role)
     }));
     let observing = ObservingLead::new(lead_behavior, sprint_tasks.to_vec(), ts_tx, cumulative);
     // Lead never gets a control channel (contracts-m6.md §D2a, plan D2/plan
@@ -511,6 +562,22 @@ impl RunController {
             }
         };
 
+        // Plan D1-D3 (HANDOFF pitfall 30): pre-create every canonical
+        // role's out-of-repo worktree once, up front — role_cli_cwd (both
+        // the agent CLI cwd and the Cmd DoD exec cwd call sites) then does
+        // a pure, infallible lookup into this cache rather than threading a
+        // `Result` through spawn_sprint's per-role loop or crew-lead's
+        // infallible `with_cmd_exec` closure signature. No fallback on
+        // failure (design D5) — same rationale as the project_root
+        // validation right above.
+        let role_worktrees: Option<Vec<(Role, std::path::PathBuf)>> = match &project_root {
+            None => None,
+            Some(root) => {
+                let worktrees_base = worktree::project_worktrees_base(root);
+                Some(resolve_role_worktrees(root, &worktrees_base).map_err(RunError::ProjectRootInvalid)?)
+            }
+        };
+
         // Validated before any spec/dag/ledger/spawn work (contracts-m7.md
         // §E4 plan D5) — a rejected roster leaves zero partial run state.
         let roster = cfg.roster.clone().unwrap_or_else(default_roster);
@@ -664,6 +731,7 @@ impl RunController {
             &cfg.goal,
             &cfg.data_dir,
             project_root.as_deref(),
+            role_worktrees.as_deref(),
             &roster_snapshot0,
             &pool,
             &dag,
@@ -690,6 +758,7 @@ impl RunController {
         let goal = cfg.goal.clone();
         let data_dir = cfg.data_dir.clone();
         let project_root = project_root.clone();
+        let role_worktrees = role_worktrees.clone();
         let max_rework = cfg.max_rework;
         let escalation_timeout_ms = cfg.escalation_timeout_ms;
         let finisher_live = live.clone();
@@ -718,6 +787,7 @@ impl RunController {
                         &goal,
                         &data_dir,
                         project_root.as_deref(),
+                        role_worktrees.as_deref(),
                         &roster_snapshot,
                         &pool,
                         &dag,
@@ -1642,61 +1712,181 @@ mod role_cli_cwd_tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
-    /// Normal (M11 §I3): `Some(root)` is returned verbatim and untouched —
-    /// no `cli-cwd/<role>` scratch subdirectory is created under it, since
-    /// `RunController::start`'s leading validation (§I2) already guarantees
-    /// `root` exists.
+    /// Normal (post-pitfall-30-fix): with a precomputed `role_worktrees`
+    /// cache, `role_cli_cwd` is a pure lookup — it returns that role's
+    /// worktree path verbatim and never touches `data_dir` at all (unlike
+    /// the `None` branch above).
     #[test]
-    fn some_project_root_is_returned_verbatim_and_creates_nothing_under_it() {
-        let root = test_data_dir("cli-cwd-project-root");
-        std::fs::create_dir_all(&root).expect("test setup: project_root must exist");
-        let data_dir = test_data_dir("cli-cwd-project-root-data-dir");
+    fn some_role_worktrees_looks_up_the_precomputed_path_for_the_role() {
+        let developer_worktree = test_data_dir("cli-cwd-worktree-developer");
+        let role_worktrees = vec![(Role::Developer, developer_worktree.clone())];
+        let data_dir = test_data_dir("cli-cwd-worktrees-data-dir");
 
-        let cwd = role_cli_cwd(Some(&root), &data_dir, Role::Developer);
+        let cwd = role_cli_cwd(Some(&role_worktrees), &data_dir, Role::Developer);
 
-        assert_eq!(cwd, root, "Some(root) must be returned verbatim, not joined with a per-role subdirectory");
-        assert!(
-            !root.join("cli-cwd").exists(),
-            "no scratch cli-cwd/ subdirectory may be created under project_root: {root:?}"
-        );
-        assert!(!data_dir.exists(), "data_dir must be untouched when project_root is Some");
-
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&data_dir);
+        assert_eq!(cwd, developer_worktree, "must return the precomputed worktree path verbatim");
+        assert!(!data_dir.exists(), "data_dir must be untouched when role_worktrees is Some");
     }
 
-    /// M11 §I1 core contract, plan step 1 priority (a): when `project_root`
-    /// is `Some`, the agent CLI cwd (`spawn_sprint`'s `HarnessAgentCfg.cwd`
+    /// M11 §I1 core contract, post-pitfall-30-fix: when `project_root` is
+    /// `Some`, the agent CLI cwd (`spawn_sprint`'s `HarnessAgentCfg.cwd`
     /// call site) and the Cmd DoD exec cwd (`spawn_sprint`'s `with_cmd_exec`
-    /// closure call site) must resolve to the **same** path for every role.
-    /// Both call sites invoke this exact function with the exact same
-    /// `project_root` value, so this is asserted here directly against two
-    /// independent (and deliberately different) `data_dir` bases — proving
-    /// the equality holds because of `project_root`, not because the two
-    /// call sites happen to share a `data_dir`.
+    /// closure call site) resolve to the **same** path per role — asserted
+    /// here against two independent (deliberately different) `data_dir`
+    /// bases, proving the equality holds because of `role_worktrees`, not
+    /// because the two call sites happen to share a `data_dir` — and
+    /// different roles must resolve to **different** paths (the actual bug
+    /// pitfall 30 was: `project_root` returned verbatim regardless of role).
     #[test]
-    fn some_project_root_makes_both_call_sites_agree_for_every_role() {
-        let root = test_data_dir("cli-cwd-combined-root");
-        std::fs::create_dir_all(&root).expect("test setup: project_root must exist");
+    fn some_role_worktrees_makes_both_call_sites_agree_per_role_and_differ_across_roles() {
+        let role_worktrees: Vec<(Role, std::path::PathBuf)> =
+            [Role::Pm, Role::Designer, Role::Publisher, Role::Developer, Role::Qa]
+                .into_iter()
+                .map(|role| (role, test_data_dir(&format!("cli-cwd-worktree-{role:?}"))))
+                .collect();
         let agent_cli_data_dir = test_data_dir("cli-cwd-combined-agent-base");
         let cmd_dod_data_dir = test_data_dir("cli-cwd-combined-dod-base");
         assert_ne!(
             agent_cli_data_dir, cmd_dod_data_dir,
-            "test setup: the two data_dir bases must differ so equality below proves project_root, not a shared base"
+            "test setup: the two data_dir bases must differ so equality below proves the cache, not a shared base"
         );
 
+        let mut seen_cwds: Vec<std::path::PathBuf> = Vec::new();
         for role in [Role::Pm, Role::Designer, Role::Publisher, Role::Developer, Role::Qa] {
-            let agent_cli_cwd = role_cli_cwd(Some(&root), &agent_cli_data_dir, role);
-            let cmd_dod_cwd = role_cli_cwd(Some(&root), &cmd_dod_data_dir, role);
+            let agent_cli_cwd = role_cli_cwd(Some(&role_worktrees), &agent_cli_data_dir, role);
+            let cmd_dod_cwd = role_cli_cwd(Some(&role_worktrees), &cmd_dod_data_dir, role);
 
             assert_eq!(
                 agent_cli_cwd, cmd_dod_cwd,
                 "agent CLI cwd and Cmd DoD exec cwd must be the same path for role {role:?}"
             );
-            assert_eq!(agent_cli_cwd, root, "both call sites must resolve to project_root itself for role {role:?}");
+            assert!(
+                !seen_cwds.contains(&agent_cli_cwd),
+                "role {role:?} must not share a cwd with an earlier role (pitfall 30): {seen_cwds:?}"
+            );
+            seen_cwds.push(agent_cli_cwd);
         }
+    }
 
-        let _ = std::fs::remove_dir_all(&root);
+    /// Boundary (invariant guard): `role_cli_cwd` panics rather than
+    /// silently falling back if asked for a role missing from the
+    /// precomputed cache — this should never happen in practice
+    /// (`resolve_role_worktrees` always populates every `ROLE_ORDER` entry),
+    /// so a panic surfaces the bug immediately instead of masking it as a
+    /// wrong-but-plausible cwd.
+    #[test]
+    #[should_panic(expected = "no precomputed worktree for role")]
+    fn some_role_worktrees_panics_on_a_missing_role_entry() {
+        let role_worktrees = vec![(Role::Pm, test_data_dir("cli-cwd-only-pm"))];
+        let data_dir = test_data_dir("cli-cwd-missing-role-data-dir");
+
+        let _ = role_cli_cwd(Some(&role_worktrees), &data_dir, Role::Qa);
+    }
+}
+
+#[cfg(test)]
+mod role_system_hint_tests {
+    //! Design D4: the artifacts-sharing convention paragraph is injected
+    //! into the RealCli spawn spec only when `project_root` is `Some`, and
+    //! carries the exact path + no-concurrent-edit + no-hook-addition
+    //! content the plan specifies.
+
+    use super::*;
+
+    /// Normal: `project_root: None` — the hint is just the role/goal line,
+    /// no artifacts paragraph.
+    #[test]
+    fn none_project_root_has_no_artifacts_paragraph() {
+        let hint = role_system_hint(Role::Developer, "goal", None);
+        assert_eq!(hint, "You are the Developer of a crew building: goal");
+    }
+
+    /// Normal/D4: `project_root: Some` injects the absolute path plus the
+    /// no-concurrent-edit and no-hook-addition clauses.
+    #[test]
+    fn some_project_root_injects_the_artifacts_convention() {
+        let root = std::path::Path::new("/tmp-like/does/not/need/to/exist/for/this/pure/test");
+        let hint = role_system_hint(Role::Qa, "goal", Some(root));
+
+        assert!(hint.starts_with("You are the Qa of a crew building: goal"));
+        assert!(
+            hint.contains(&format!("{}/.crew/artifacts", root.display())),
+            "must include the absolute artifacts path: {hint}"
+        );
+        assert!(hint.contains("동시에 편집하지"), "must include the no-concurrent-edit clause: {hint}");
+        assert!(hint.contains("훅을 추가하지"), "must include the no-hook-addition clause: {hint}");
+    }
+}
+
+#[cfg(test)]
+mod resolve_role_worktrees_tests {
+    //! `resolve_role_worktrees` (plan D1-D3): the `RunController::start`
+    //! precompute step, tested directly with an injected tempdir
+    //! `worktrees_base` — production always derives this from
+    //! `worktree::project_worktrees_base` (real `$HOME`), but
+    //! tools_guidance forbids touching `$HOME` from a test.
+
+    use super::*;
+    use std::process::Command;
+
+    fn test_dir(label: &str) -> std::path::PathBuf {
+        std::env::current_dir()
+            .unwrap()
+            .join(".crew-test")
+            .join(format!("{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn run_git_ok(cwd: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git").arg("-C").arg(cwd).args(args).status().expect("git must be on PATH");
+        assert!(status.success(), "test setup: `git {args:?}` failed in {cwd:?}");
+    }
+
+    fn init_test_repo(label: &str) -> std::path::PathBuf {
+        let root = test_dir(label);
+        std::fs::create_dir_all(&root).expect("test setup: repo root");
+        run_git_ok(&root, &["init", "-q"]);
+        run_git_ok(&root, &["config", "user.email", "test@example.com"]);
+        run_git_ok(&root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("README.md"), b"init").expect("test setup: seed file");
+        run_git_ok(&root, &["add", "."]);
+        run_git_ok(&root, &["commit", "-q", "-m", "init"]);
+        root
+    }
+
+    /// Normal: every `ROLE_ORDER` role gets a distinct worktree path.
+    #[test]
+    fn populates_every_canonical_role_with_a_distinct_path() {
+        let repo = init_test_repo("resolve-worktrees-repo");
+        let base = test_dir("resolve-worktrees-base");
+
+        let worktrees = resolve_role_worktrees(&repo, &base).expect("resolution must succeed for a real git repo");
+
+        assert_eq!(worktrees.len(), ROLE_ORDER.len(), "every canonical role must be populated");
+        for role in ROLE_ORDER {
+            assert!(worktrees.iter().any(|(r, _)| *r == role), "role {role:?} must be present: {worktrees:?}");
+        }
+        let mut paths: Vec<_> = worktrees.iter().map(|(_, p)| p.clone()).collect();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), worktrees.len(), "every role's path must be distinct: {worktrees:?}");
+
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Error: a non-git project_root fails the whole resolution (design
+    /// D5) — no partial cache.
+    #[test]
+    fn errors_and_returns_nothing_for_a_non_git_project_root() {
+        let non_repo = test_dir("resolve-worktrees-non-git");
+        std::fs::create_dir_all(&non_repo).expect("test setup: plain (non-git) directory");
+        let base = test_dir("resolve-worktrees-non-git-base");
+
+        let result = resolve_role_worktrees(&non_repo, &base);
+
+        assert!(result.is_err(), "a non-git project_root must fail resolution");
+
+        let _ = std::fs::remove_dir_all(&non_repo);
     }
 }
 
