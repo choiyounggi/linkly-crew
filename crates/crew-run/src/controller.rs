@@ -1685,6 +1685,17 @@ mod snapshot_atomicity_tests {
         }
     }
 
+    /// A fresh path under `.crew-test/` (repo convention, never `/tmp`) for a
+    /// file-backed ledger — needed only by the error-path test below, which
+    /// requires a second connection onto the *same* on-disk database
+    /// (`EventLedger::open_in_memory()` databases are private per-connection
+    /// and can't be reached from a second connection).
+    fn test_ledger_path(label: &str) -> std::path::PathBuf {
+        let dir = std::env::current_dir().unwrap().join(".crew-test");
+        std::fs::create_dir_all(&dir).expect("test setup: .crew-test dir");
+        dir.join(format!("{label}-{}.sqlite3", uuid::Uuid::new_v4()))
+    }
+
     /// Boundary: nothing ever committed -> last_seq 0, messages empty.
     #[test]
     fn empty_ledger_yields_last_seq_zero_and_no_messages() {
@@ -1692,6 +1703,36 @@ mod snapshot_atomicity_tests {
         let (last_seq, messages) = snapshot_messages_and_last_seq(&ledger);
         assert_eq!(last_seq, 0);
         assert!(messages.is_empty());
+    }
+
+    /// Error (t1-msg-race r2 review F1): `messages_since` returning `Err`
+    /// must be logged and yield the safe empty pair `(0, [])` — never a
+    /// fallback that resurrects the old bug (an independent, possibly-stale
+    /// `last_seq`). Forced deterministically, no sleep/flakiness: a second
+    /// raw connection onto the same file-backed ledger drops the `messages`
+    /// table out from under the ledger's own connection, so its next
+    /// `messages_since` call is guaranteed to fail with "no such table".
+    #[test]
+    fn messages_since_error_yields_safe_empty_pair_not_a_stale_last_seq_fallback() {
+        let path = test_ledger_path("snapshot-error-path");
+        let ledger = EventLedger::open(&path).expect("file-backed ledger");
+        ledger
+            .append(&BusLifecycleEvent::EnvelopeAccepted { envelope: test_envelope(1) })
+            .expect("append");
+
+        {
+            let raw = rusqlite::Connection::open(&path).expect("second raw connection to the same file");
+            raw.execute("DROP TABLE messages", []).expect("drop messages table");
+        }
+
+        let (last_seq, messages) = snapshot_messages_and_last_seq(&ledger);
+        assert_eq!(
+            last_seq, 0,
+            "an Err from messages_since must yield last_seq 0, never a value independent of messages"
+        );
+        assert!(messages.is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Normal: one committed message -> the pair matches it.
