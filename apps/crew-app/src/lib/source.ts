@@ -1,28 +1,39 @@
 import { isTauri } from "@tauri-apps/api/core";
 
-import type { Envelope, HarnessInfo, Roster, RosterPreset, RunEvent } from "./types";
+import type { Envelope, HarnessInfo, ProjectInfo, Roster, RosterPreset, RunEvent, RunSummary } from "./types";
 import { MockEventSource } from "./mock-source";
 import { TauriEventSource } from "./tauri-source";
 
 /**
- * Verbatim per contracts-m4.md §C4, extended per contracts-m5.md §C7a and
- * contracts-m7.md §E8. `t-bridge` implements a `TauriEventSource`
- * (`src/lib/tauri-source.ts`) against this same interface — out of scope
- * here. The optional methods are optional so existing sources keep
- * compiling unchanged.
+ * Multi-run source interface (plan D1/D3/D8, extending contracts-m4.md §C4,
+ * contracts-m5.md §C7a, contracts-m7.md §E8 for the run_id-routed backend —
+ * t1-be-multirun's MultiRunApi). `t-bridge` implements `TauriEventSource`
+ * (`src/lib/tauri-source.ts`) against this interface. The optional methods
+ * are optional so a source that doesn't support roster/harness editing
+ * still compiles.
  */
 export interface RunEventSource {
-  start(goal: string): Promise<void>;
-  /** Returns an unsubscribe function. */
-  onEvent(cb: (ev: RunEvent) => void): () => void;
-  stop(): Promise<void>;
-  swapHarness?(agentId: string, harness: string): Promise<void>;
+  /** start_run(goal, scripted) -> run_id. Only allocates the run; no snapshot work (call `resync` after inserting the channel). */
+  start(goal: string, scripted: boolean): Promise<string>;
+  /** Returns an unsubscribe function. Every event is tagged with its run_id (plan D3) so a caller can route/ignore per channel. */
+  onEvent(cb: (runId: string, ev: RunEvent) => void): () => void;
+  stop(runId: string): Promise<void>;
+  remove(runId: string): Promise<void>;
+  /** Re-syncs one channel's state from the backend's current snapshot (plan D3) — called after `start` and on channel (re)selection. */
+  resync(runId: string): Promise<void>;
+  listRuns(): Promise<RunSummary[]>;
+  /** t3-be-project's ProjectApi (decisions.md) — the new-task flow's first step (plan D4), ahead of `start`. */
+  createProject(name: string): Promise<ProjectInfo>;
+  /** D8: run_id-first, per t1's MultiRunApi contract (decisions.md). */
+  swapHarness?(runId: string, agentId: string, harness: string): Promise<void>;
   getRoster?(): Promise<Roster>;
   setRoster?(roster: Roster): Promise<void>;
   listPresets?(): Promise<RosterPreset[]>;
   detectHarnesses?(): Promise<HarnessInfo[]>;
-  resolveGate?(taskId: string, decision: "approve" | "reject", reason: string): Promise<void>;
-  searchMessages?(query: string): Promise<{ seq: number; envelope: Envelope }[]>;
+  /** D8: run_id-first. */
+  resolveGate?(runId: string, taskId: string, decision: "approve" | "reject", reason: string): Promise<void>;
+  /** D8: run_id-first. */
+  searchMessages?(runId: string, query: string): Promise<{ seq: number; envelope: Envelope }[]>;
 }
 
 /**

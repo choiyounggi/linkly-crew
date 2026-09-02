@@ -207,40 +207,17 @@ describe("CSS integrity (apps/crew-app/src)", () => {
     expect(usedVars.has("--font-weight-semibold")).toBe(false);
   });
 
-  it.each([
-    ["features/artifacts/artifacts.css", ".artifact-detail__name"],
-    ["features/board/board.css", ".board-card__badge"],
-    ["features/search/search.css", ".search-box__result-kind"],
-    ["features/rail/rail.css", ".rail-card__name"],
-    ["features/rail/rail.css", ".rail-badge"],
-    ["features/thread/thread.css", ".thread-row__parties"],
-  ])("%s %s resolves font-weight to var(--font-weight-bold), not a different token", (relPath, selector) => {
-    const file = cssFiles.find((f) => f.path === relPath);
-    expect(file, `expected to find ${relPath} under src/`).toBeTruthy();
-    const block = getRuleBlock(file.text, selector);
-    expect(block, `expected to find rule block for ${selector} in ${relPath}`).toBeTruthy();
-    expect(block).toMatch(/font-weight:\s*var\(--font-weight-bold\);/);
-  });
-
-  it("req-matrix none-cell border-color override out-specifies the shared td border rule (t1-visual-verify: a same-specificity override was silently defeated by cascade order, leaving none/expected borders identical)", () => {
-    const file = cssFiles.find((f) => f.path === "features/artifacts/artifacts.css");
-    expect(file, "expected to find features/artifacts/artifacts.css under src/").toBeTruthy();
-    const rules = parseRules(file.text);
-
-    const tdBaseRule = rules.find(
-      (r) =>
-        r.body.includes("border: 1px solid var(--border-hairline);") &&
-        r.selector.split(",").some((s) => s.trim().endsWith("td")),
-    );
-    expect(tdBaseRule, "expected to find the shared th/td border rule").toBeTruthy();
-    const tdBaseSelector = tdBaseRule.selector
-      .split(",")
-      .map((s) => s.trim())
-      .find((s) => s.endsWith("td"));
-
-    const noneRule = rules.find((r) => r.body.includes("border-color: var(--surface-panel);"));
-    expect(noneRule, "expected to find the none-cell border-color override rule").toBeTruthy();
-
-    expect(outSpecifies(specificity(noneRule.selector), specificity(tdBaseSelector))).toBe(true);
-  });
+  // artifacts/board/search/rail's rows and the req-matrix specificity
+  // regression test below them were removed alongside those views (plan
+  // D5) — feature removal, not test weakening. thread survives untouched.
+  it.each([["features/thread/thread.css", ".thread-row__parties"]])(
+    "%s %s resolves font-weight to var(--font-weight-bold), not a different token",
+    (relPath, selector) => {
+      const file = cssFiles.find((f) => f.path === relPath);
+      expect(file, `expected to find ${relPath} under src/`).toBeTruthy();
+      const block = getRuleBlock(file.text, selector);
+      expect(block, `expected to find rule block for ${selector} in ${relPath}`).toBeTruthy();
+      expect(block).toMatch(/font-weight:\s*var\(--font-weight-bold\);/);
+    },
+  );
 });

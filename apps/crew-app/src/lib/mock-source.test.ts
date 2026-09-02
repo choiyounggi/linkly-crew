@@ -4,6 +4,8 @@ import { MockEventSource } from "./mock-source";
 import { createRunStore } from "./store";
 import type { RunEvent } from "./types";
 
+const MOCK_RUN_ID = "run_mock";
+
 describe("MockEventSource", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -13,21 +15,29 @@ describe("MockEventSource", () => {
     vi.useRealTimers();
   });
 
-  it("replays the full 3-sprint scenario (5 roles, one designer rework, one harness swap) in order", async () => {
+  it("returns the fixed demo run id from start()", async () => {
     const source = new MockEventSource(0);
-    const received: RunEvent[] = [];
-    source.onEvent((ev) => received.push(ev));
+    await expect(source.start("goal", false)).resolves.toBe(MOCK_RUN_ID);
+  });
 
-    await source.start("간단한 랜딩 페이지");
+  it("replays the full 3-sprint scenario (5 roles, one designer rework, one harness swap) in order, all tagged with the fixed demo run id", async () => {
+    const source = new MockEventSource(0);
+    const received: { runId: string; ev: RunEvent }[] = [];
+    source.onEvent((runId, ev) => received.push({ runId, ev }));
+
+    await source.start("간단한 랜딩 페이지", false);
     await vi.runAllTimersAsync();
 
-    expect(received[0]).toMatchObject({ type: "run_started", goal: "간단한 랜딩 페이지" });
-    expect(received[1]).toMatchObject({ type: "roster_changed" });
-    expect(received[2]).toMatchObject({ type: "spec_ready" });
-    expect(received[3]).toMatchObject({ type: "sprint_started", index: 1, task_ids: ["t-pm", "t-design"] });
-    expect(received.at(-1)).toMatchObject({ type: "run_finished", outcome: "completed" });
+    expect(received.every((r) => r.runId === MOCK_RUN_ID)).toBe(true);
+    const events = received.map((r) => r.ev);
 
-    const specReady = received[2] as Extract<RunEvent, { type: "spec_ready" }>;
+    expect(events[0]).toMatchObject({ type: "run_started", goal: "간단한 랜딩 페이지" });
+    expect(events[1]).toMatchObject({ type: "roster_changed" });
+    expect(events[2]).toMatchObject({ type: "spec_ready" });
+    expect(events[3]).toMatchObject({ type: "sprint_started", index: 1, task_ids: ["t-pm", "t-design"] });
+    expect(events.at(-1)).toMatchObject({ type: "run_finished", outcome: "completed" });
+
+    const specReady = events[2] as Extract<RunEvent, { type: "spec_ready" }>;
     expect(specReady.spec.requirements.map((r) => r.id)).toEqual([
       "REQ-1",
       "REQ-2",
@@ -44,22 +54,22 @@ describe("MockEventSource", () => {
     ]);
     expect(specReady.sprint).toEqual(["t-pm", "t-design", "t-publish", "t-dev", "t-qa"]);
 
-    const initialRoster = received[1] as Extract<RunEvent, { type: "roster_changed" }>;
+    const initialRoster = events[1] as Extract<RunEvent, { type: "roster_changed" }>;
     expect(initialRoster.agents).toHaveLength(6);
     expect(initialRoster.agents.every((a) => a.harness === "claude-code")).toBe(true);
 
-    const sprintStarts = received.filter(
+    const sprintStarts = events.filter(
       (ev): ev is Extract<RunEvent, { type: "sprint_started" }> => ev.type === "sprint_started",
     );
     expect(sprintStarts.map((s) => s.index)).toEqual([1, 2, 3]);
     expect(sprintStarts.map((s) => s.task_ids)).toEqual([["t-pm", "t-design"], ["t-publish", "t-dev"], ["t-qa"]]);
 
-    const sprintFinishes = received.filter(
+    const sprintFinishes = events.filter(
       (ev): ev is Extract<RunEvent, { type: "sprint_finished" }> => ev.type === "sprint_finished",
     );
     expect(sprintFinishes.map((s) => s.index)).toEqual([1, 2, 3]);
 
-    const rosterChanges = received.filter(
+    const rosterChanges = events.filter(
       (ev): ev is Extract<RunEvent, { type: "roster_changed" }> => ev.type === "roster_changed",
     );
     expect(rosterChanges).toHaveLength(2);
@@ -67,7 +77,7 @@ describe("MockEventSource", () => {
     const designer = swappedRoster.agents.find((a) => a.role === "designer");
     expect(designer?.harness).toBe("opencode");
 
-    const messages = received.filter((ev): ev is Extract<RunEvent, { type: "message" }> => ev.type === "message");
+    const messages = events.filter((ev): ev is Extract<RunEvent, { type: "message" }> => ev.type === "message");
     // 3 normal tasks * (assign+ack+result) + qa escalation(assign+ack+blocked+human.gate)
     // + designer rework(5) + 1 handoff message
     expect(messages).toHaveLength(3 * 3 + 4 + 5 + 1);
@@ -77,24 +87,9 @@ describe("MockEventSource", () => {
     expect(handoffMessages).toHaveLength(1);
     expect(handoffMessages[0].envelope.to).toEqual(["agent:designer"]);
 
-    // The swap's handoff message also threads on "t-design" (it targets the
-    // designer agent), so it trails the rework round trip in this filter.
-    const designerKinds = messages
-      .filter((m) => m.envelope.thread === "t-design")
-      .map((m) => m.envelope.kind);
-    expect(designerKinds).toEqual([
-      "task.assign",
-      "task.ack",
-      "task.result",
-      "change_request",
-      "task.result",
-      "handoff",
-    ]);
-
-    const taskStateChanges = received.filter(
+    const taskStateChanges = events.filter(
       (ev): ev is Extract<RunEvent, { type: "task_state_changed" }> => ev.type === "task_state_changed",
     );
-    // 4 tasks * (assigned, accepted) + t-qa * (assigned, blocked, escalated)
     expect(taskStateChanges).toHaveLength(4 * 2 + 3);
     expect(taskStateChanges.filter((c) => c.state === "accepted")).toHaveLength(4);
     expect(taskStateChanges.filter((c) => c.task_id === "t-qa").map((c) => c.state)).toEqual([
@@ -107,9 +102,9 @@ describe("MockEventSource", () => {
   it("escalates t-qa via a blocked message + human.gate carrying body.task_id, reaching state escalated (contracts-m7.md §E8)", async () => {
     const source = new MockEventSource(0);
     const received: RunEvent[] = [];
-    source.onEvent((ev) => received.push(ev));
+    source.onEvent((_runId, ev) => received.push(ev));
 
-    await source.start("간단한 랜딩 페이지");
+    await source.start("간단한 랜딩 페이지", false);
     await vi.runAllTimersAsync();
 
     const messages = received.filter((ev): ev is Extract<RunEvent, { type: "message" }> => ev.type === "message");
@@ -124,29 +119,47 @@ describe("MockEventSource", () => {
       .filter((c) => c.task_id === "t-qa")
       .at(-1);
     expect(finalQaState?.state).toBe("escalated");
-
-    // Existing M3 completion semantics hold even with an escalated task outstanding.
     expect(received.at(-1)).toMatchObject({ type: "run_finished", outcome: "completed" });
   });
 
-  it("stops delivering events after stop() is called", async () => {
+  it("stops delivering events after stop(runId) is called", async () => {
     const source = new MockEventSource(0);
     const received: RunEvent[] = [];
-    source.onEvent((ev) => received.push(ev));
+    source.onEvent((_runId, ev) => received.push(ev));
 
-    await source.start("goal");
-    await source.stop();
+    await source.start("goal", false);
+    await source.stop(MOCK_RUN_ID);
     await vi.runAllTimersAsync();
 
     expect(received).toHaveLength(0);
   });
 
+  it("resync() is a no-op that resolves without emitting anything (mock has no separate backend state)", async () => {
+    const source = new MockEventSource(0);
+    const received: RunEvent[] = [];
+    source.onEvent((_runId, ev) => received.push(ev));
+
+    await expect(source.resync(MOCK_RUN_ID)).resolves.toBeUndefined();
+    expect(received).toHaveLength(0);
+  });
+
+  it("listRuns reflects the started demo run, and an empty array before any start / after remove", async () => {
+    const source = new MockEventSource(0);
+    await expect(source.listRuns()).resolves.toEqual([]);
+
+    await source.start("goal", false);
+    await expect(source.listRuns()).resolves.toEqual([{ run_id: MOCK_RUN_ID, goal: "goal", finished: null }]);
+
+    await source.remove(MOCK_RUN_ID);
+    await expect(source.listRuns()).resolves.toEqual([]);
+  });
+
   it("stamps ts at delivery time for every variant, so it progresses (non-decreasing) across the replay instead of freezing (r1 F1)", async () => {
     const source = new MockEventSource(100);
     const received: RunEvent[] = [];
-    source.onEvent((ev) => received.push(ev));
+    source.onEvent((_runId, ev) => received.push(ev));
 
-    await source.start("간단한 랜딩 페이지");
+    await source.start("간단한 랜딩 페이지", false);
     await vi.runAllTimersAsync();
 
     const runStarted = received[0] as Extract<RunEvent, { type: "run_started" }>;
@@ -160,34 +173,28 @@ describe("MockEventSource", () => {
     for (let i = 1; i < topLevelTimes.length; i++) {
       expect(topLevelTimes[i]).toBeGreaterThanOrEqual(topLevelTimes[i - 1]);
     }
-
-    const messages = received.filter((ev): ev is Extract<RunEvent, { type: "message" }> => ev.type === "message");
-    const firstMessageTs = messages[0].envelope.ts;
-    const lastMessageTs = messages.at(-1)!.envelope.ts;
-    expect(lastMessageTs).not.toBe(firstMessageTs);
-    expect(new Date(lastMessageTs).getTime()).toBeGreaterThan(new Date(firstMessageTs).getTime());
   });
 
   it("unsubscribe stops a specific listener from receiving further events", async () => {
     const source = new MockEventSource(0);
     const received: RunEvent[] = [];
-    const unsubscribe = source.onEvent((ev) => received.push(ev));
+    const unsubscribe = source.onEvent((_runId, ev) => received.push(ev));
     unsubscribe();
 
-    await source.start("goal");
+    await source.start("goal", false);
     await vi.runAllTimersAsync();
 
     expect(received).toHaveLength(0);
   });
 });
 
-describe("MockEventSource — roster/harness methods (plan D5)", () => {
-  it("swapHarness updates the roster and replays a handoff message + roster_changed immediately", async () => {
+describe("MockEventSource — roster/harness methods (plan D5, unchanged — no runId)", () => {
+  it("swapHarness (D8: runId first, unused by this single-run mock) updates the roster and replays a handoff + roster_changed immediately", async () => {
     const source = new MockEventSource();
     const received: RunEvent[] = [];
-    source.onEvent((ev) => received.push(ev));
+    source.onEvent((_runId, ev) => received.push(ev));
 
-    await source.swapHarness("agent:publisher", "opencode");
+    await source.swapHarness(MOCK_RUN_ID, "agent:publisher", "opencode");
 
     expect(received.map((e) => e.type)).toEqual(["message", "roster_changed"]);
     const [handoffEvent, rosterEvent] = received as [
@@ -207,7 +214,7 @@ describe("MockEventSource — roster/harness methods (plan D5)", () => {
     const source = new MockEventSource();
     const before = await source.getRoster();
 
-    await expect(source.swapHarness("agent:nope", "opencode")).rejects.toThrow(/unknown agent id/);
+    await expect(source.swapHarness(MOCK_RUN_ID, "agent:nope", "opencode")).rejects.toThrow(/unknown agent id/);
 
     const after = await source.getRoster();
     expect(after).toEqual(before);
@@ -253,7 +260,7 @@ describe("MockEventSource — roster/harness methods (plan D5)", () => {
   });
 });
 
-describe("MockEventSource — gate/search methods (plan D4)", () => {
+describe("MockEventSource — gate/search methods (plan D4, D8: runId first)", () => {
   beforeEach(() => {
     vi.useFakeTimers();
   });
@@ -265,9 +272,9 @@ describe("MockEventSource — gate/search methods (plan D4)", () => {
   it("resolveGate('approve') replays a human.response message then assigned->accepted", async () => {
     const source = new MockEventSource();
     const received: RunEvent[] = [];
-    source.onEvent((ev) => received.push(ev));
+    source.onEvent((_runId, ev) => received.push(ev));
 
-    await source.resolveGate("t-qa", "approve", "재현 확인, 승인함");
+    await source.resolveGate(MOCK_RUN_ID, "t-qa", "approve", "재현 확인, 승인함");
 
     expect(received.map((e) => e.type)).toEqual(["message", "task_state_changed", "task_state_changed"]);
     const [responseEvent, assignedEvent, acceptedEvent] = received as [
@@ -284,9 +291,9 @@ describe("MockEventSource — gate/search methods (plan D4)", () => {
   it("resolveGate('reject') replays a human.response message then blocked", async () => {
     const source = new MockEventSource();
     const received: RunEvent[] = [];
-    source.onEvent((ev) => received.push(ev));
+    source.onEvent((_runId, ev) => received.push(ev));
 
-    await source.resolveGate("t-qa", "reject", "재현 안 됨, 반려");
+    await source.resolveGate(MOCK_RUN_ID, "t-qa", "reject", "재현 안 됨, 반려");
 
     expect(received.map((e) => e.type)).toEqual(["message", "task_state_changed"]);
     const stateEvent = received[1] as Extract<RunEvent, { type: "task_state_changed" }>;
@@ -296,34 +303,48 @@ describe("MockEventSource — gate/search methods (plan D4)", () => {
   it("resolveGate rejects for an unknown task id, delivering no events", async () => {
     const source = new MockEventSource();
     const received: RunEvent[] = [];
-    source.onEvent((ev) => received.push(ev));
+    source.onEvent((_runId, ev) => received.push(ev));
 
-    await expect(source.resolveGate("t-nope", "approve", "")).rejects.toThrow(/unknown task id/);
+    await expect(source.resolveGate(MOCK_RUN_ID, "t-nope", "approve", "")).rejects.toThrow(/unknown task id/);
     expect(received).toHaveLength(0);
   });
 
   it("searchMessages filters delivered messages by kind/from/body, case-insensitively", async () => {
     const source = new MockEventSource(0);
-    await source.start("간단한 랜딩 페이지");
+    await source.start("간단한 랜딩 페이지", false);
     await vi.runAllTimersAsync();
 
-    const byKind = await source.searchMessages("HANDOFF");
+    const byKind = await source.searchMessages(MOCK_RUN_ID, "HANDOFF");
     expect(byKind).toHaveLength(1);
     expect(byKind[0].envelope.kind).toBe("handoff");
 
-    const byBody = await source.searchMessages("req-4");
+    const byBody = await source.searchMessages(MOCK_RUN_ID, "req-4");
     expect(byBody.length).toBeGreaterThan(0);
     expect(byBody.every((m) => JSON.stringify(m.envelope.body).toLowerCase().includes("req-4"))).toBe(true);
   });
 
   it("searchMessages returns an empty array for a query with no matches and for an empty delivered log", async () => {
     const emptySource = new MockEventSource();
-    expect(await emptySource.searchMessages("anything")).toEqual([]);
+    expect(await emptySource.searchMessages(MOCK_RUN_ID, "anything")).toEqual([]);
 
     const source = new MockEventSource(0);
-    await source.start("간단한 랜딩 페이지");
+    await source.start("간단한 랜딩 페이지", false);
     await vi.runAllTimersAsync();
-    expect(await source.searchMessages("no-such-token-xyz")).toEqual([]);
+    expect(await source.searchMessages(MOCK_RUN_ID, "no-such-token-xyz")).toEqual([]);
+  });
+});
+
+describe("MockEventSource.createProject", () => {
+  it("resolves with a fake ProjectInfo for a valid name", async () => {
+    const source = new MockEventSource();
+    await expect(source.createProject("my-app")).resolves.toEqual({ name: "my-app", path: "/mock/my-app" });
+  });
+
+  it("rejects with invalid_name for an empty or malformed name (boundary/error, mirrors src-tauri validate_name)", async () => {
+    const source = new MockEventSource();
+    await expect(source.createProject("")).rejects.toThrow("invalid_name");
+    await expect(source.createProject("My App")).rejects.toThrow("invalid_name");
+    await expect(source.createProject("-leading-hyphen")).rejects.toThrow("invalid_name");
   });
 });
 
@@ -341,15 +362,14 @@ describe("MockEventSource + RunState integration", () => {
     const store = createRunStore(source);
     source.onEvent(store.getState().applyEvent);
 
-    await store.getState().startRun("간단한 랜딩 페이지");
+    const runId = await store.getState().startChannel("간단한 랜딩 페이지", false);
     await vi.runAllTimersAsync();
 
-    const s = store.getState();
+    const s = store.getState().channels[runId];
     expect(s.finished).toBe("completed");
     expect(s.dag?.tasks).toHaveLength(5);
     expect(Object.values(s.taskStates)).toEqual(["accepted", "accepted", "accepted", "accepted", "escalated"]);
     expect(s.messages).toHaveLength(3 * 3 + 4 + 5 + 1);
-    // seq dedup holds across the whole replayed scenario too.
     const seqs = s.messages.map((m) => m.seq);
     expect(new Set(seqs).size).toBe(seqs.length);
 

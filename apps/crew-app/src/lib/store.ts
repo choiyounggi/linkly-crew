@@ -4,10 +4,17 @@ import { createDefaultSource } from "./source";
 import type { RunEventSource } from "./source";
 import type { Envelope, RosterAgentDto, RunEvent, SpecDoc, TaskDag, TaskStateDto } from "./types";
 
-/** Verbatim per contracts-m4.md §C4, extended per contracts-m5.md §C7a. */
-export interface RunState {
-  runId: string | null;
-  goal: string | null;
+/**
+ * One channel = one run (plan D1). Shape mirrors the old single-run
+ * `RunState` fields 1:1 (contracts-m4.md §C4 / §C7a), just keyed by `runId`
+ * instead of being the store root. Derived values (labels, status badges,
+ * counts) are computed by consumers from these fields, never stored here
+ * (plan D2 / wiki/frontend/state/derived-state.md).
+ */
+export interface ChannelState {
+  runId: string;
+  goal: string;
+  scripted: boolean;
   spec: SpecDoc | null;
   dag: TaskDag | null;
   sprint: string[];
@@ -18,24 +25,29 @@ export interface RunState {
   sprintSummaries: { index: number; summary: string }[];
   sprintWindows: { index: number; startTs: string; endTs: string | null }[];
   roster: RosterAgentDto[];
-  startRun(goal: string): Promise<void>;
-  applyEvent(ev: RunEvent): void;
 }
 
-/**
- * Builds a fresh RunState store bound to `source` (D5: `startRun` delegates
- * to the injected `RunEventSource`; subscribing to it is the caller's job —
- * one `useEffect` wiring `source.onEvent(store.getState().applyEvent)`, not
- * done here).
- */
-export function createRunStore(source: RunEventSource) {
-  // Idempotency key set (D4) — kept outside the published RunState so the
-  // store's public shape stays exactly the §C4 interface above.
-  const seenSeqs = new Set<number>();
+/** Multi-run store root (plan D1): `channels` keyed by `run_id`, `channelOrder` for sidebar ordering, `activeRunId` for the selected channel. */
+export interface RunState {
+  channels: Record<string, ChannelState>;
+  activeRunId: string | null;
+  channelOrder: string[];
+  /** create_project→start_run flow's last step (plan D4) — resolves once the run exists, selects it, returns its run_id. */
+  startChannel(goal: string, scripted: boolean): Promise<string>;
+  /** Selects a channel and re-syncs its state from the backend (plan D3). */
+  selectChannel(runId: string): void;
+  /** stop_run + remove_run (plan Task01 step1), then drops the channel locally regardless of either call's outcome. */
+  closeChannel(runId: string): Promise<void>;
+  /** Routes an event to its channel only; an unknown run_id is ignored + warned (plan D3), never auto-creates a channel. */
+  applyEvent(runId: string, ev: RunEvent): void;
+}
 
-  return create<RunState>((set) => ({
-    runId: null,
-    goal: null,
+/** Exported for tests that need a fully-shaped `ChannelState` (e.g. features/thread's — t7-owned file, mechanically adapted to the multi-run store shape). */
+export function emptyChannel(runId: string, goal: string, scripted: boolean): ChannelState {
+  return {
+    runId,
+    goal,
+    scripted,
     spec: null,
     dag: null,
     sprint: [],
@@ -46,110 +58,151 @@ export function createRunStore(source: RunEventSource) {
     sprintSummaries: [],
     sprintWindows: [],
     roster: [],
+  };
+}
 
-    async startRun(goal) {
-      await source.start(goal);
+/** Applies one `RunEvent` to one channel's state, returning a new object (or the same reference for a no-op — callers use `===` to skip a `set`). */
+function applyEventToChannel(
+  channel: ChannelState,
+  ev: RunEvent,
+  seenSeqs: Set<number>,
+): ChannelState {
+  switch (ev.type) {
+    case "run_started":
+      seenSeqs.clear();
+      return emptyChannel(channel.runId, ev.goal, channel.scripted);
+
+    case "spec_ready":
+      return { ...channel, spec: ev.spec, dag: ev.dag, sprint: ev.sprint };
+
+    case "message":
+      if (seenSeqs.has(ev.seq)) return channel;
+      seenSeqs.add(ev.seq);
+      return { ...channel, messages: [...channel.messages, { seq: ev.seq, envelope: ev.envelope }] };
+
+    case "task_state_changed":
+      return { ...channel, taskStates: { ...channel.taskStates, [ev.task_id]: ev.state } };
+
+    case "bus_lifecycle":
+      // Not surfaced in ChannelState — lifecycle detail has no consumer yet.
+      return channel;
+
+    case "run_finished":
+      return { ...channel, finished: ev.outcome };
+
+    case "sprint_started": {
+      const existing = channel.sprintWindows.find((w) => w.index === ev.index);
+      const sprintWindows = existing
+        ? channel.sprintWindows.map((w) => (w.index === ev.index ? { ...w, startTs: ev.ts } : w))
+        : [...channel.sprintWindows, { index: ev.index, startTs: ev.ts, endTs: null }].sort(
+            (a, b) => a.index - b.index,
+          );
+      return { ...channel, sprintIndex: ev.index, sprintWindows };
+    }
+
+    case "sprint_finished": {
+      const sprintSummaries = channel.sprintSummaries.some((entry) => entry.index === ev.index)
+        ? channel.sprintSummaries
+        : [...channel.sprintSummaries, { index: ev.index, summary: ev.summary }];
+      const existing = channel.sprintWindows.find((w) => w.index === ev.index);
+      const sprintWindows = existing
+        ? channel.sprintWindows.map((w) => (w.index === ev.index ? { ...w, endTs: ev.ts } : w))
+        : [...channel.sprintWindows, { index: ev.index, startTs: ev.ts, endTs: ev.ts }].sort(
+            (a, b) => a.index - b.index,
+          );
+      return { ...channel, sprintSummaries, sprintWindows };
+    }
+
+    case "roster_changed":
+      // Full replace, never a merge (plan D2).
+      return { ...channel, roster: ev.agents };
+
+    default:
+      // D6: unknown `type` from a newer wire version is ignored, not thrown.
+      console.warn("applyEvent: ignoring unknown RunEvent type", ev);
+      return channel;
+  }
+}
+
+/**
+ * Builds a fresh multi-run store bound to `source`. Subscribing to the
+ * source is the caller's job — one `useEffect` wiring
+ * `source.onEvent(store.getState().applyEvent)` (unchanged from the
+ * single-run shape), not done here.
+ */
+export function createRunStore(source: RunEventSource) {
+  // Per-channel idempotency key sets, kept outside the published RunState
+  // (mirrors the old single-run `seenSeqs`, now one Set per run_id) so the
+  // store's public shape stays exactly the ChannelState fields above.
+  const seenSeqsByRun = new Map<string, Set<number>>();
+
+  function seenSeqsFor(runId: string): Set<number> {
+    let seen = seenSeqsByRun.get(runId);
+    if (!seen) {
+      seen = new Set();
+      seenSeqsByRun.set(runId, seen);
+    }
+    return seen;
+  }
+
+  return create<RunState>((set, get) => ({
+    channels: {},
+    activeRunId: null,
+    channelOrder: [],
+
+    async startChannel(goal, scripted) {
+      // source.start() only allocates the run and returns its id (no
+      // snapshot work) — the channel entry below must exist before
+      // source.resync() below can deliver any event for it, or those
+      // events would be dropped as "unknown run_id" (plan D3).
+      const runId = await source.start(goal, scripted);
+      seenSeqsByRun.set(runId, new Set());
+      set((s) => ({
+        channels: { ...s.channels, [runId]: emptyChannel(runId, goal, scripted) },
+        channelOrder: [...s.channelOrder, runId],
+        activeRunId: runId,
+      }));
+      await source.resync(runId);
+      return runId;
     },
 
-    applyEvent(ev) {
-      switch (ev.type) {
-        case "run_started":
-          seenSeqs.clear();
-          set({
-            runId: ev.run_id,
-            goal: ev.goal,
-            spec: null,
-            dag: null,
-            sprint: [],
-            messages: [],
-            taskStates: {},
-            finished: null,
-            sprintIndex: null,
-            sprintSummaries: [],
-            sprintWindows: [],
-            roster: [],
-          });
-          return;
+    selectChannel(runId) {
+      set({ activeRunId: runId });
+      source.resync(runId).catch((err: unknown) => {
+        console.warn("selectChannel: resync failed", runId, err);
+      });
+    },
 
-        case "spec_ready":
-          set({ spec: ev.spec, dag: ev.dag, sprint: ev.sprint });
-          return;
-
-        case "message":
-          if (seenSeqs.has(ev.seq)) return;
-          seenSeqs.add(ev.seq);
-          set((s) => ({ messages: [...s.messages, { seq: ev.seq, envelope: ev.envelope }] }));
-          return;
-
-        case "task_state_changed":
-          set((s) => ({ taskStates: { ...s.taskStates, [ev.task_id]: ev.state } }));
-          return;
-
-        case "bus_lifecycle":
-          // Not surfaced in RunState — lifecycle detail has no consumer yet.
-          return;
-
-        case "run_finished":
-          set({ finished: ev.outcome });
-          return;
-
-        case "sprint_started":
-          set({ sprintIndex: ev.index });
-          // D3/D4: upsert into sprintWindows — startTs set/refreshed, endTs
-          // left as-is if the window already exists (a finished window must
-          // not be reopened by a re-applied sprint_started).
-          set((s) => {
-            const existing = s.sprintWindows.find((w) => w.index === ev.index);
-            if (existing) {
-              return {
-                sprintWindows: s.sprintWindows.map((w) =>
-                  w.index === ev.index ? { ...w, startTs: ev.ts } : w,
-                ),
-              };
-            }
-            return {
-              sprintWindows: [...s.sprintWindows, { index: ev.index, startTs: ev.ts, endTs: null }].sort(
-                (a, b) => a.index - b.index,
-              ),
-            };
-          });
-          return;
-
-        case "sprint_finished":
-          // Idempotent: same index re-applied is a no-op, not a duplicate append.
-          set((s) =>
-            s.sprintSummaries.some((entry) => entry.index === ev.index)
-              ? {}
-              : { sprintSummaries: [...s.sprintSummaries, { index: ev.index, summary: ev.summary }] },
-          );
-          // D3/D4: upsert into sprintWindows — set endTs if the window exists,
-          // else create one with startTs=endTs=ev.ts (finished-before-started).
-          set((s) => {
-            const existing = s.sprintWindows.find((w) => w.index === ev.index);
-            if (existing) {
-              return {
-                sprintWindows: s.sprintWindows.map((w) =>
-                  w.index === ev.index ? { ...w, endTs: ev.ts } : w,
-                ),
-              };
-            }
-            return {
-              sprintWindows: [...s.sprintWindows, { index: ev.index, startTs: ev.ts, endTs: ev.ts }].sort(
-                (a, b) => a.index - b.index,
-              ),
-            };
-          });
-          return;
-
-        case "roster_changed":
-          // Full replace, never a merge (plan D2).
-          set({ roster: ev.agents });
-          return;
-
-        default:
-          // D6: unknown `type` from a newer wire version is ignored, not thrown.
-          console.warn("applyEvent: ignoring unknown RunEvent type", ev);
+    async closeChannel(runId) {
+      try {
+        await source.stop(runId);
+      } catch (err) {
+        console.warn("closeChannel: stop_run failed", runId, err);
       }
+      try {
+        await source.remove(runId);
+      } catch (err) {
+        console.warn("closeChannel: remove_run failed", runId, err);
+      }
+      seenSeqsByRun.delete(runId);
+      set((s) => {
+        const { [runId]: _removed, ...channels } = s.channels;
+        const channelOrder = s.channelOrder.filter((id) => id !== runId);
+        const activeRunId =
+          s.activeRunId === runId ? (channelOrder[0] ?? null) : s.activeRunId;
+        return { channels, channelOrder, activeRunId };
+      });
+    },
+
+    applyEvent(runId, ev) {
+      const channel = get().channels[runId];
+      if (!channel) {
+        console.warn("applyEvent: ignoring event for unknown run_id", runId, ev);
+        return;
+      }
+      const updated = applyEventToChannel(channel, ev, seenSeqsFor(runId));
+      if (updated === channel) return;
+      set((s) => ({ channels: { ...s.channels, [runId]: updated } }));
     },
   }));
 }

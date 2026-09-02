@@ -2,8 +2,19 @@ import { render, screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import Thread from "./index";
-import { useRunStore } from "../../lib/store";
+import { emptyChannel, useRunStore } from "../../lib/store";
 import type { Envelope } from "../../lib/types";
+
+// Mechanical adaptation to the multi-run store (plan D1): sets the active
+// channel's messages instead of the old flat field. Same envelopes/assertions.
+const RUN_ID = "run_test";
+
+function setMessages(messages: { seq: number; envelope: Envelope }[]) {
+  useRunStore.setState({
+    activeRunId: RUN_ID,
+    channels: { [RUN_ID]: { ...emptyChannel(RUN_ID, "goal", false), messages } },
+  });
+}
 
 function envelope(
   overrides: Partial<Envelope> & Pick<Envelope, "id" | "kind" | "from" | "to" | "corr">,
@@ -22,7 +33,7 @@ function envelope(
 }
 
 beforeEach(() => {
-  useRunStore.setState({ messages: [] });
+  setMessages([]);
 });
 
 describe("Thread — normal rendering", () => {
@@ -54,13 +65,11 @@ describe("Thread — normal rendering", () => {
       body: { covered_req_ids: ["REQ-1"], artifacts: [] },
     });
 
-    useRunStore.setState({
-      messages: [
-        { seq: 1, envelope: assign },
-        { seq: 2, envelope: ack },
-        { seq: 3, envelope: result },
-      ],
-    });
+    setMessages([
+      { seq: 1, envelope: assign },
+      { seq: 2, envelope: ack },
+      { seq: 3, envelope: result },
+    ]);
 
     render(<Thread />);
 
@@ -80,7 +89,7 @@ describe("Thread — normal rendering", () => {
       corr: "t-design",
       body: { violations: ["REQ-2"], reason: "dod unmet" },
     });
-    useRunStore.setState({ messages: [{ seq: 1, envelope: cr }] });
+    setMessages([{ seq: 1, envelope: cr }]);
 
     render(<Thread />);
     expect(screen.getByRole("listitem")).toHaveClass("thread-row--danger");
@@ -95,7 +104,7 @@ describe("Thread — normal rendering", () => {
       corr: "t-pm",
       body: {},
     });
-    useRunStore.setState({ messages: [{ seq: 1, envelope: gate }] });
+    setMessages([{ seq: 1, envelope: gate }]);
 
     render(<Thread />);
     expect(screen.getByRole("listitem")).toHaveClass("thread-row--warning");
@@ -118,7 +127,7 @@ describe("Thread — boundary", () => {
       corr: "t-pm",
       body: { unexpected: true },
     });
-    useRunStore.setState({ messages: [{ seq: 1, envelope: bad }] });
+    setMessages([{ seq: 1, envelope: bad }]);
 
     expect(() => render(<Thread />)).not.toThrow();
     expect(screen.getByText('{"unexpected":true}')).toBeInTheDocument();
@@ -133,7 +142,7 @@ describe("Thread — boundary", () => {
       corr: "t-pm",
       body: { covered_req_ids: [], artifacts: [] },
     });
-    useRunStore.setState({ messages: [{ seq: 1, envelope: result }] });
+    setMessages([{ seq: 1, envelope: result }]);
 
     expect(() => render(<Thread />)).not.toThrow();
   });
@@ -156,12 +165,10 @@ describe("Thread — ack compression", () => {
       corr: "t-pm",
       in_reply_to: "e1",
     });
-    useRunStore.setState({
-      messages: [
-        { seq: 1, envelope: assign },
-        { seq: 2, envelope: ack },
-      ],
-    });
+    setMessages([
+      { seq: 1, envelope: assign },
+      { seq: 2, envelope: ack },
+    ]);
 
     render(<Thread />);
 

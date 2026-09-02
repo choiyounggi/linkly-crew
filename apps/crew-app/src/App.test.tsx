@@ -1,78 +1,85 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import App from "./App";
-import { useRunStore } from "./lib/store";
+import { emptyChannel, useRunStore } from "./lib/store";
 
-describe("App", () => {
-  it("renders the command bar and all four panel stubs", () => {
+const ONBOARDED_KEY = "crew.onboarded";
+
+beforeEach(() => {
+  localStorage.clear();
+});
+
+afterEach(() => {
+  localStorage.clear();
+  useRunStore.setState({ activeRunId: null, channelOrder: [], channels: {} });
+});
+
+describe("App — onboarding gate (plan D7)", () => {
+  it("shows OnboardingFlow when the crew.onboarded flag is absent", () => {
     render(<App />);
-    expect(screen.getByLabelText("요청")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "시작" })).toBeInTheDocument();
-    expect(screen.getByLabelText("에이전트 레일")).toBeInTheDocument();
-    expect(screen.getByLabelText("스프린트 보드")).toBeInTheDocument();
-    expect(screen.getByLabelText("라이브 스레드")).toBeInTheDocument();
-    expect(screen.getByLabelText("로스터")).toBeInTheDocument();
+    expect(screen.getByLabelText("온보딩")).toBeInTheDocument();
+    expect(screen.queryByLabelText("채널 목록")).not.toBeInTheDocument();
   });
 
-  it("shows a validation error and starts no run for an empty/whitespace-only goal", () => {
+  it("shows the shell directly when the flag is already set", () => {
+    localStorage.setItem(ONBOARDED_KEY, "1");
     render(<App />);
-    const input = screen.getByLabelText("요청");
-    const button = screen.getByRole("button", { name: "시작" });
-
-    fireEvent.change(input, { target: { value: "   " } });
-    fireEvent.click(button);
-
-    expect(screen.getByText("요청을 입력하세요")).toBeInTheDocument();
-    expect(useRunStore.getState().runId).toBeNull();
-  });
-
-  it("does not disable the start button before any run has started", () => {
-    render(<App />);
-    expect(screen.getByRole("button", { name: "시작" })).not.toBeDisabled();
+    expect(screen.getByLabelText("채널 목록")).toBeInTheDocument();
+    expect(screen.queryByLabelText("온보딩")).not.toBeInTheDocument();
   });
 });
 
-describe("App — tab switching (plan D1/D2)", () => {
-  it("shows the board by default", () => {
+describe("App — shell shape (plan D5/D6/R5/R6/R8)", () => {
+  beforeEach(() => {
+    localStorage.setItem(ONBOARDED_KEY, "1");
+  });
+
+  it("has no leftover view tabs / command-bar goal input from the old single-run UI", () => {
     render(<App />);
-    expect(screen.getByLabelText("스프린트 보드")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "보드" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByLabelText("요청")).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "뷰 전환" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "시작" })).not.toBeInTheDocument();
   });
 
-  it("switches to the DAG view when the DAG tab is clicked", () => {
-    const { container } = render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "DAG" }));
-    expect(container.querySelector("section.dag-view")).toBeInTheDocument();
-    expect(screen.queryByLabelText("스프린트 보드")).not.toBeInTheDocument();
+  it("shows the empty-channel state with a way to start a new task when there are no channels", () => {
+    render(<App />);
+    expect(screen.getByText("아직 채널이 없습니다")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "새 작업 시작" })).toBeInTheDocument();
   });
 
-  it("switches to the timeline view when the timeline tab is clicked", () => {
-    const { container } = render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "타임라인" }));
-    expect(container.querySelector("section.timeline-view")).toBeInTheDocument();
-    expect(screen.queryByLabelText("스프린트 보드")).not.toBeInTheDocument();
-  });
+  it("mounts ChatPane for the active channel once one exists", () => {
+    act(() => {
+      useRunStore.setState({
+        activeRunId: "run-1",
+        channelOrder: ["run-1"],
+        channels: { "run-1": emptyChannel("run-1", "랜딩 페이지", false) },
+      });
+    });
 
-  it("switches to the inbox stub when the 승인함 tab is clicked", () => {
-    const { container } = render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "승인함" }));
-    expect(container.querySelector("section.inbox-view")).toBeInTheDocument();
-    expect(screen.queryByLabelText("스프린트 보드")).not.toBeInTheDocument();
-  });
+    render(<App />);
 
-  it("switches to the artifacts stub when the 아티팩트 tab is clicked", () => {
-    const { container } = render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "아티팩트" }));
-    expect(container.querySelector("section.artifacts-view")).toBeInTheDocument();
-    expect(screen.queryByLabelText("스프린트 보드")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("채널 대화")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "랜딩 페이지" })).toBeInTheDocument();
   });
 });
 
-describe("App — search widget (plan D2)", () => {
-  it("mounts the search stub in the header, alongside the command bar", () => {
-    const { container } = render(<App />);
-    const commandBar = container.querySelector(".command-bar");
-    expect(commandBar?.querySelector(".search-box")).toBeInTheDocument();
+describe("App — sidebar new-task / settings routing", () => {
+  beforeEach(() => {
+    localStorage.setItem(ONBOARDED_KEY, "1");
+  });
+
+  it("opens the new-task modal from the sidebar's + button", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "새 작업" }));
+    expect(screen.getByRole("dialog", { name: "새 작업" })).toBeInTheDocument();
+  });
+
+  it("opens SettingsMenu from the sidebar's settings button", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "설정" }));
+    // SettingsMenu's <section aria-label="설정"> exposes accessible role
+    // "region" — distinct from the sidebar's still-mounted "설정" button.
+    expect(screen.getByRole("region", { name: "설정" })).toBeInTheDocument();
   });
 });

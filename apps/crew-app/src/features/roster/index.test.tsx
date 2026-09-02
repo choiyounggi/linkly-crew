@@ -1,16 +1,20 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { useRunStore } from "../../lib/store";
+import { emptyChannel, useRunStore } from "../../lib/store";
 import type { RunEventSource } from "../../lib/source";
 import type { HarnessInfo, Roster, RosterPreset } from "../../lib/types";
 import RosterPanel from "./index";
 
 function createFakeSource(overrides: Partial<RunEventSource> = {}): RunEventSource {
   return {
-    start: vi.fn(async () => {}),
+    start: vi.fn(async () => "run-1"),
     onEvent: vi.fn(() => () => {}),
     stop: vi.fn(async () => {}),
+    remove: vi.fn(async () => {}),
+    resync: vi.fn(async () => {}),
+    listRuns: vi.fn(async () => []),
+    createProject: vi.fn(async (name: string) => ({ name, path: `/tmp/${name}` })),
     ...overrides,
   };
 }
@@ -39,7 +43,7 @@ const SAMPLE_HARNESSES: HarnessInfo[] = [
 ];
 
 afterEach(() => {
-  useRunStore.setState({ runId: null, finished: null, roster: [] });
+  useRunStore.setState({ activeRunId: null, channelOrder: [], channels: {} });
 });
 
 describe("RosterPanel", () => {
@@ -122,7 +126,11 @@ describe("RosterPanel", () => {
     expect(swapButton).toBeDisabled();
 
     act(() => {
-      useRunStore.getState().applyEvent({ type: "run_started", run_id: "run-1", goal: "g", ts: "" });
+      useRunStore.setState({
+        activeRunId: "run-1",
+        channelOrder: ["run-1"],
+        channels: { "run-1": emptyChannel("run-1", "g", false) },
+      });
     });
 
     expect(swapButton).toBeEnabled();
@@ -130,10 +138,10 @@ describe("RosterPanel", () => {
     fireEvent.change(screen.getByLabelText("designer 하네스"), { target: { value: "opencode" } });
     fireEvent.click(swapButton);
 
-    await waitFor(() => expect(swapHarness).toHaveBeenCalledWith("agent:designer", "opencode"));
+    await waitFor(() => expect(swapHarness).toHaveBeenCalledWith("run-1", "agent:designer", "opencode"));
 
     act(() => {
-      useRunStore.getState().applyEvent({ type: "run_finished", outcome: "completed", ts: "" });
+      useRunStore.getState().applyEvent("run-1", { type: "run_finished", outcome: "completed", ts: "" });
     });
 
     expect(swapButton).toBeDisabled();
