@@ -51,7 +51,7 @@
  * --surface-raised(19%) 와 --surface-paper(13%) 의 6pp 차이가 sRGB 에서 붕괴한다.
  * 명도 사다리로는 해결되지 않아(overlay 22% 로 올려도 1.165) 채움 대신 윤곽으로
  * 구분한다: 기대되지 않는 칸은 테두리를 배경 쪽으로 낮춰 격자에서 빠지게 한다. */
-.req-matrix__cell--none {
+.req-matrix td.req-matrix__cell--none {
   background: transparent;
   border-color: var(--surface-panel);
 }

@@ -63,6 +63,50 @@ function getRuleBlock(text, selector) {
   return text.slice(bodyStart, bodyEnd);
 }
 
+/**
+ * CSS specificity per the cascade spec, as (id, class-or-pseudo-class, type)
+ * counts, computed for a single compound selector (no combinators besides
+ * whitespace-separated descendant chains; no :not()/:is() argument parsing —
+ * not needed by any selector in this codebase). Ignores the universal `*`.
+ */
+function specificity(compoundSelector) {
+  let ids = 0;
+  let classes = 0;
+  let types = 0;
+  for (const part of compoundSelector.trim().split(/\s+/)) {
+    classes += (part.match(/\.[a-zA-Z0-9_-]+/g) ?? []).length;
+    classes += (part.match(/:(?!:)[a-zA-Z-]+/g) ?? []).length;
+    ids += (part.match(/#[a-zA-Z0-9_-]+/g) ?? []).length;
+    if (/^[a-zA-Z][a-zA-Z0-9]*/.test(part)) types += 1;
+  }
+  return [ids, classes, types];
+}
+
+/** True iff `a` strictly out-specifies `b` in cascade precedence (higher wins regardless of source order). */
+function outSpecifies(a, b) {
+  if (a[0] !== b[0]) return a[0] > b[0];
+  if (a[1] !== b[1]) return a[1] > b[1];
+  return a[2] > b[2];
+}
+
+/**
+ * Splits CSS text into { selector, body } rules. Comments are stripped first
+ * so a rule's selector capture can't accidentally swallow a preceding
+ * comment block (a `[^{]+` selector match with no `}` boundary would span
+ * into whatever text precedes it, including unrelated prior rules/comments —
+ * this is exactly what made an earlier version of the none-cell specificity
+ * regression test below pass even against the pre-fix, buggy CSS). Assumes
+ * no nested braces (true of this codebase's CSS, per `getRuleBlock` above).
+ */
+function parseRules(text) {
+  const withoutComments = text.replace(/\/\*[\s\S]*?\*\//g, "");
+  const rules = [];
+  for (const m of withoutComments.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    rules.push({ selector: m[1].trim(), body: m[2] });
+  }
+  return rules;
+}
+
 describe("analyzeCssFiles (detector fixtures)", () => {
   it("flags a selector declared in two different files", () => {
     const { duplicateSelectors } = analyzeCssFiles([
@@ -93,6 +137,53 @@ describe("analyzeCssFiles (detector fixtures)", () => {
       { path: "a.css", text: ".x {\n  color: var(--known);\n}\n" },
     ]);
     expect(undefinedVars).toEqual([]);
+  });
+});
+
+describe("specificity (detector fixtures)", () => {
+  it("counts one type and one class for a type+class compound selector", () => {
+    expect(specificity(".req-matrix td")).toEqual([0, 1, 1]);
+  });
+
+  it("counts one type and two classes for a type+class+class compound selector", () => {
+    expect(specificity(".req-matrix td.req-matrix__cell--none")).toEqual([0, 2, 1]);
+  });
+
+  it("counts an id selector", () => {
+    expect(specificity("#root")).toEqual([1, 0, 0]);
+  });
+
+  it("outSpecifies compares by id, then class, then type, in that order", () => {
+    expect(outSpecifies([0, 2, 1], [0, 1, 1])).toBe(true);
+    expect(outSpecifies([0, 1, 1], [0, 1, 1])).toBe(false);
+    expect(outSpecifies([0, 1, 0], [1, 0, 0])).toBe(false);
+  });
+});
+
+describe("parseRules (detector fixtures)", () => {
+  it("isolates a rule's selector without swallowing a preceding comment block", () => {
+    const text = [
+      ".a {",
+      "  color: red;",
+      "}",
+      "",
+      "/* explains why .b looks the way it does",
+      " * across several lines of prose */",
+      ".b {",
+      "  color: blue;",
+      "}",
+    ].join("\n");
+    const rules = parseRules(text);
+    expect(rules).toEqual([
+      { selector: ".a", body: "\n  color: red;\n" },
+      { selector: ".b", body: "\n  color: blue;\n" },
+    ]);
+  });
+
+  it("isolates a rule's selector without swallowing the immediately preceding rule (no `}` boundary bug)", () => {
+    const text = ".a {\n  color: red;\n}\n.b {\n  color: blue;\n}\n";
+    const rules = parseRules(text);
+    expect(rules.find((r) => r.selector === ".b").body).toBe("\n  color: blue;\n");
   });
 });
 
@@ -129,5 +220,27 @@ describe("CSS integrity (apps/crew-app/src)", () => {
     const block = getRuleBlock(file.text, selector);
     expect(block, `expected to find rule block for ${selector} in ${relPath}`).toBeTruthy();
     expect(block).toMatch(/font-weight:\s*var\(--font-weight-bold\);/);
+  });
+
+  it("req-matrix none-cell border-color override out-specifies the shared td border rule (t1-visual-verify: a same-specificity override was silently defeated by cascade order, leaving none/expected borders identical)", () => {
+    const file = cssFiles.find((f) => f.path === "features/artifacts/artifacts.css");
+    expect(file, "expected to find features/artifacts/artifacts.css under src/").toBeTruthy();
+    const rules = parseRules(file.text);
+
+    const tdBaseRule = rules.find(
+      (r) =>
+        r.body.includes("border: 1px solid var(--border-hairline);") &&
+        r.selector.split(",").some((s) => s.trim().endsWith("td")),
+    );
+    expect(tdBaseRule, "expected to find the shared th/td border rule").toBeTruthy();
+    const tdBaseSelector = tdBaseRule.selector
+      .split(",")
+      .map((s) => s.trim())
+      .find((s) => s.endsWith("td"));
+
+    const noneRule = rules.find((r) => r.body.includes("border-color: var(--surface-panel);"));
+    expect(noneRule, "expected to find the none-cell border-color override rule").toBeTruthy();
+
+    expect(outSpecifies(specificity(noneRule.selector), specificity(tdBaseSelector))).toBe(true);
   });
 });
