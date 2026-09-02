@@ -83,6 +83,7 @@ fn event_type_name(ev: &RunEvent) -> &'static str {
         RunEvent::SprintStarted { .. } => "sprint_started",
         RunEvent::SprintFinished { .. } => "sprint_finished",
         RunEvent::RosterChanged { .. } => "roster_changed",
+        RunEvent::Presence { .. } => "presence",
     }
 }
 
@@ -100,6 +101,13 @@ fn event_ts(ev: &RunEvent) -> &str {
             // `BusLifecycle` carries no `ts` field (contract §C3) — excluded
             // from the monotonic-ts assertion by the caller instead.
             unreachable!("event_ts must not be called on BusLifecycle")
+        }
+        RunEvent::Presence { .. } => {
+            // `Presence` carries no `ts` field either (t2-be-presence D3:
+            // it's a volatile signal, deliberately excluded from every
+            // ledger-adjacent contract, `ts` included) — same treatment as
+            // `BusLifecycle` above, excluded by the caller instead.
+            unreachable!("event_ts must not be called on Presence")
         }
     }
 }
@@ -196,12 +204,18 @@ async fn three_sprints_happy_path_all_accepted() {
     // `Message.ts` mirrors the envelope's own creation time (application
     // data, unrelated to when the controller published the `RunEvent`) —
     // its ordering guarantee is `seq` (asserted above), not `ts`, so it's
-    // excluded here alongside `BusLifecycle` (which carries no `ts` at
-    // all). Every controller-stamped event type (`now_ts()` at the moment
-    // of `run_tx.send`, plan D8/함정 12) must still be non-decreasing.
+    // excluded here alongside `BusLifecycle` and `Presence` (neither
+    // carries a `ts` at all — t2-be-presence D3 for the latter). Every
+    // controller-stamped event type (`now_ts()` at the moment of
+    // `run_tx.send`, plan D8/함정 12) must still be non-decreasing.
     let timestamped: Vec<(&'static str, OffsetDateTime)> = events
         .iter()
-        .filter(|ev| !matches!(ev, RunEvent::BusLifecycle { .. } | RunEvent::Message { .. }))
+        .filter(|ev| {
+            !matches!(
+                ev,
+                RunEvent::BusLifecycle { .. } | RunEvent::Message { .. } | RunEvent::Presence { .. }
+            )
+        })
         .map(|ev| (event_type_name(ev), parse_ts(event_ts(ev))))
         .collect();
     for w in timestamped.windows(2) {

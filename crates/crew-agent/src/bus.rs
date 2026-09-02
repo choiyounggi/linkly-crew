@@ -161,6 +161,27 @@ impl BusConn {
 
         Err(BusError::SendFailed { id })
     }
+
+    /// Writes `env` to the wire once and returns — no `Receipt` wait, no
+    /// retry, no `pending_receipts` bookkeeping (t2-be-presence D2: a
+    /// volatile signal whose failure is meant to be ignored, not retried).
+    /// `requires_ack=false` on the envelope only marks it as needing no
+    /// *application*-level ack; the bus's own transport-level Receipt-relay
+    /// to this sender is a separate mechanism gated on that same field
+    /// (`crew-bus/src/routing.rs::route_one` only tracks a pending receipt
+    /// when `envelope.requires_ack`), so a presence envelope's Receipt
+    /// never arrives back here — [`Self::send`]'s normal wait-then-retry
+    /// path would always exhaust `SEND_ATTEMPTS * RECEIPT_TIMEOUT` (~6s)
+    /// before giving up, which is both wasted latency and, chained across a
+    /// real conversation's every envelope hop, enough to stall the whole
+    /// exchange. This is what `emit_presence_start`/`emit_presence_end`
+    /// (crew-agent/src/runner.rs) use instead.
+    pub async fn send_best_effort(&self, env: Envelope) -> Result<(), BusError> {
+        let text = serde_json::to_string(&ClientFrame::Envelope(env))?;
+        let mut out = self.outbound.lock().await;
+        out.send(Message::Text(text.into())).await?;
+        Ok(())
+    }
 }
 
 impl Drop for BusConn {

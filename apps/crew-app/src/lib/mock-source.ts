@@ -395,6 +395,11 @@ function restampWithNow(ev: RunEvent): RunEvent {
     case "bus_lifecycle":
       // No top-level `ts` on this variant, and the mock never emits it.
       return ev;
+    case "presence":
+      // No `ts` field on this variant either (t2-be-presence D3: a
+      // volatile signal, not restamped like the ledgered types below), and
+      // the mock never emits it.
+      return ev;
     default:
       return { ...ev, ts: now };
   }
