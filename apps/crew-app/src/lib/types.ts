@@ -95,7 +95,8 @@ export type RunEvent =
   | { type: "run_finished"; outcome: "completed" | "failed"; ts: string }
   | { type: "sprint_started"; index: number; task_ids: string[]; ts: string }
   | { type: "sprint_finished"; index: number; summary: string; ts: string }
-  | { type: "roster_changed"; agents: RosterAgentDto[]; ts: string };
+  | { type: "roster_changed"; agents: RosterAgentDto[]; ts: string }
+  | PresenceEvent;
 
 // --- crew-run/crew-proto M5 roster mirrors (C7a) -----------------------
 

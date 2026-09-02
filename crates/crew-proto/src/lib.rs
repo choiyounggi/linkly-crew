@@ -15,7 +15,10 @@ pub use envelope::Envelope;
 pub use error::ProtoError;
 pub use guard::{CorrGuard, Verdict};
 pub use handoff::{handoff_body, handoff_pack_from_body, HandoffPack};
-pub use kind::MessageKind;
+pub use kind::{
+    presence_read_body, presence_read_from_body, presence_typing_body, presence_typing_from_body,
+    MessageKind, PresenceReadBody, PresenceTypingBody,
+};
 pub use roster::{Roster, RosterAgent};
 pub use spec::{ArtifactContract, ReqId, Requirement, SpecDoc, SpecError};
 pub use wire::{ClientFrame, ServerFrame};

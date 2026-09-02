@@ -64,6 +64,29 @@ pub enum RunEvent {
         agents: Vec<RosterAgentDto>,
         ts: String,
     },
+    /// Volatile signal — never ledgered (t2-be-presence D3): the reader/
+    /// typing-indicator equivalent of a chat app's "seen" and "is typing…".
+    /// Broadcast directly from `handle_bus_event`'s presence guard, which
+    /// intercepts a presence-kind envelope before `EventLedger::append`
+    /// even runs — it never appears in `RunSnapshot.messages` or any
+    /// `messages_since` read. `target_msg_id` is set only for `kind: read`;
+    /// `active` only for `kind: typing` (contracts-m4.md §C3/§C4 mirror:
+    /// `apps/crew-app/src/lib/types.ts`'s `PresenceEvent`).
+    Presence {
+        agent_id: String,
+        kind: PresenceKindDto,
+        target_msg_id: Option<String>,
+        active: Option<bool>,
+    },
+}
+
+/// `RunEvent::Presence.kind` (t2-be-presence D3/D4) — wire values
+/// "read"/"typing" match `PresenceEvent.kind`'s TS union exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceKindDto {
+    Read,
+    Typing,
 }
 
 /// One roster slot, without `instructions` (contracts-m5.md §C5a,
@@ -383,5 +406,75 @@ mod tests {
         assert_eq!(dto.role, "pm");
         assert_eq!(dto.harness, "claude-code");
         assert_eq!(dto.model, "sonnet");
+    }
+
+    /// Normal: a `read` presence event carries `target_msg_id`, no
+    /// `active`, and the outer tag is "presence" (not "message").
+    #[test]
+    fn presence_read_serializes_with_target_msg_id_and_no_active() {
+        let ev = RunEvent::Presence {
+            agent_id: "agent:developer".to_string(),
+            kind: PresenceKindDto::Read,
+            target_msg_id: Some("msg_01H".to_string()),
+            active: None,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "presence");
+        assert_eq!(json["agent_id"], "agent:developer");
+        assert_eq!(json["kind"], "read");
+        assert_eq!(json["target_msg_id"], "msg_01H");
+        assert!(json["active"].is_null());
+
+        let back: RunEvent = serde_json::from_value(json).unwrap();
+        match back {
+            RunEvent::Presence { kind, target_msg_id, active, .. } => {
+                assert_eq!(kind, PresenceKindDto::Read);
+                assert_eq!(target_msg_id, Some("msg_01H".to_string()));
+                assert_eq!(active, None);
+            }
+            other => panic!("expected Presence, got {other:?}"),
+        }
+    }
+
+    /// Normal + boundary (active=false): a `typing` presence event carries
+    /// `active`, no `target_msg_id`, for both boolean values.
+    #[test]
+    fn presence_typing_serializes_with_active_and_no_target_msg_id() {
+        for active in [true, false] {
+            let ev = RunEvent::Presence {
+                agent_id: "agent:developer".to_string(),
+                kind: PresenceKindDto::Typing,
+                target_msg_id: None,
+                active: Some(active),
+            };
+            let json = serde_json::to_value(&ev).unwrap();
+            assert_eq!(json["kind"], "typing");
+            assert_eq!(json["active"], active);
+            assert!(json["target_msg_id"].is_null());
+
+            let back: RunEvent = serde_json::from_value(json).unwrap();
+            match back {
+                RunEvent::Presence { active: back_active, target_msg_id, .. } => {
+                    assert_eq!(back_active, Some(active));
+                    assert_eq!(target_msg_id, None);
+                }
+                other => panic!("expected Presence, got {other:?}"),
+            }
+        }
+    }
+
+    /// Error: a `presence` event missing the required `kind` field fails to
+    /// deserialize, naming the missing field.
+    #[test]
+    fn presence_missing_kind_field_fails_to_deserialize() {
+        let malformed = serde_json::json!({
+            "type": "presence",
+            "agent_id": "agent:developer",
+        });
+        let err = serde_json::from_value::<RunEvent>(malformed).unwrap_err();
+        assert!(
+            err.to_string().contains("kind"),
+            "deserialize error must name the missing field, got: {err}"
+        );
     }
 }
