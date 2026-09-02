@@ -3,6 +3,8 @@
 //! wired to `AppState` and the `"run://event"` pump.
 
 mod core;
+mod onboarding;
+mod project;
 
 use core::AppState;
 
@@ -102,6 +104,49 @@ async fn search_messages(query: String, state: State<'_, AppState>) -> Result<se
     core::search_messages_core(&state, &query).await
 }
 
+/// `t3-be-project` (`ProjectApi`/`OnboardingStatusApi` contract stub,
+/// `apps/crew-app/src/lib/types.ts`): plain-object argument mirroring
+/// `AppSettings` — accepted as-is (not yet `~`-expanded/validated) so
+/// `onboarding::set_settings_core` stays the single place that does so.
+#[derive(serde::Deserialize)]
+struct SetSettingsArgs {
+    workspace_root: String,
+}
+
+#[tauri::command]
+fn get_settings() -> onboarding::Settings {
+    onboarding::get_settings_core(&onboarding::settings_path())
+}
+
+#[tauri::command]
+fn set_settings(settings: SetSettingsArgs) -> Result<onboarding::Settings, String> {
+    onboarding::set_settings_core(&onboarding::settings_path(), &settings.workspace_root)
+}
+
+#[tauri::command]
+async fn onboarding_status() -> Vec<onboarding::ToolStatus> {
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    onboarding::onboarding_status_core(&path_env).await
+}
+
+#[tauri::command]
+async fn create_project(name: String) -> Result<project::ProjectInfo, String> {
+    let settings = onboarding::get_settings_core(&onboarding::settings_path());
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let gh_status = onboarding::detect_single("gh", &path_env).await;
+    let gh_installed = gh_status.installed;
+    let gh_authenticated = gh_status.authenticated.unwrap_or(false);
+    let workspace_root = settings.workspace_root;
+    // `create_project_core` shells out (git/gh) and can block up to gh's
+    // 120s timeout — off the async runtime via `spawn_blocking` so it never
+    // stalls other in-flight commands.
+    tokio::task::spawn_blocking(move || {
+        project::create_project_core(&name, &workspace_root, gh_installed, gh_authenticated, project::real_create_and_clone)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -116,7 +161,11 @@ pub fn run() {
             list_presets,
             swap_harness,
             resolve_gate,
-            search_messages
+            search_messages,
+            get_settings,
+            set_settings,
+            onboarding_status,
+            create_project
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
