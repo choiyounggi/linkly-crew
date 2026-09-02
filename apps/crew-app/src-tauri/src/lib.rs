@@ -3,6 +3,7 @@
 //! wired to `AppState` and the `"run://event"` pump.
 
 mod core;
+mod pty;
 
 use core::AppState;
 
@@ -106,6 +107,7 @@ async fn search_messages(query: String, state: State<'_, AppState>) -> Result<se
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
+        .manage(pty::PtyRegistry::default())
         .invoke_handler(tauri::generate_handler![
             start_run,
             stop_run,
@@ -116,7 +118,11 @@ pub fn run() {
             list_presets,
             swap_harness,
             resolve_gate,
-            search_messages
+            search_messages,
+            pty::pty_open,
+            pty::pty_write,
+            pty::pty_resize,
+            pty::pty_close
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
