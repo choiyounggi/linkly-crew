@@ -1,9 +1,14 @@
 # 세션 인계 — linkly-crew
 
 **한 줄**: 구독 중인 AI CLI들을 역할별 팀원으로 묶어, 요청 한 줄을 팀장 에이전트가
-스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M11 완료·실측 검증**
+스프린트로 쪼개고 에이전트끼리 협업시켜 완주시키는 macOS 앱 (Rust/Tauri). 현재 **M1~M12 완료·실측 검증**
 (멀티 스프린트 + 압축 + 핸드오프/스왑 + 하네스 레지스트리/세마포어 + 로스터 UI + LLM 스펙화 +
-Cmd DoD 플래너 방출 + 타임아웃 프로세스 그룹 kill) — 다음은 §4 잔여·3단계 후보.
+Cmd DoD 플래너 방출 + 타임아웃 프로세스 그룹 kill + **M12 슬랙형 멀티채널 개편**) — 다음은 §3.5의
+project_root 배선(휴면 기능 3개를 깨우는 최우선 과제)과 §4 잔여.
+
+**UI 형태 확정(2026-09-02, 사용자 결정)**: 상단 단일 인풋·5뷰(보드/DAG/타임라인/승인함/
+아티팩트) 체제를 폐기하고 **슬랙형 멀티채널**로 전환 — 좌측 채널(작업) 목록 + `+` 모달로
+작업 생성, 채널마다 대화·스레드·인라인 게이트 승인. M12에서 구현·머지됨(§3.5).
 
 **이름 확정(2026-08-28, 사용자 결정)**: 프로젝트명 **linkly-crew** (구 가칭 agent-crew).
 프론트엔드 **React 19 + Vite** (DESIGN §12.6 추천안 채택).
@@ -325,9 +330,56 @@ task.result body=`{"covered_req_ids","artifacts"}` 인밴드).
 
 ---
 
+## 3.5. M12 — 슬랙형 멀티채널 개편 (2026-09-03 완료, run-id slk1)
+
+8태스크 오케스트레이션 런으로 구현·머지됨(main `177c37e`). 런 기록 전문:
+`.orchestration-archive-20260903-slk1/`(graph.json, conflict-matrix.md, plans/, briefs/,
+notes/decisions.md — **태스크 간 계약의 정본**), 다음 런 인계 프롬프트는 같은 폴더의
+`NEXT-RUN-PROMPT.md`. 기존 관례대로 런 아카이브는 **로컬 전용**(커밋되지 않음)이므로,
+다른 머신에서 이어받을 때는 이 §3.5 요약이 정본이다.
+
+| 태스크 | 산출 |
+|---|---|
+| t1-be-multirun | `AppState.runs: HashMap<run_id, ActiveRun>` — 동시 N개 런. `stop_run/run_snapshot/remove_run/list_runs`가 run_id 라우팅, `swap_harness/resolve_gate/search_messages`도 run_id 첫 인자. `run://event` payload는 `{run_id, event}` 래퍼. finished 런 상한 K=20(최고령 evict, 실행 중은 보호) |
+| t2-be-presence | kind `presence.read`/`presence.typing` 추가(requires_ack=false). controller `handle_bus_event`가 **ledger.append 앞 가드**로 presence를 걸러 `RunEvent::Presence`로만 방출 — 원장·스냅샷 미오염(§C3 계약은 "원장 기록 대상 envelope 한정"으로 스코프 축소). 전송은 `BusConn::send_best_effort`(receipt 대기 없음) |
+| t3-be-project | `~/.linkly-crew/settings.json`(workspace_root), 도구 감지 8종(git/gh/claude/codex/opencode/gemini/grok/pi + 설치 명령 레지스트리), `create_project(name)`: 이름 검증 → `gh repo create --private --clone` → `.crew/artifacts/` 스캐폴드 → 초기 커밋. 에러 어휘: invalid_name/project_exists/gh_missing/gh_unauthenticated/create_failed/clone_failed/scaffold_failed/commit_failed |
+| t4-be-worktree | **함정 30 봉쇄** — `project_root: Some`이면 역할마다 리포 **밖** worktree(`~/.linkly-crew/projects/<basename>-<fnv8>/worktrees/<role>`, 브랜치 `crew/<role>`)를 만들고 CLI cwd·Cmd DoD cwd 둘 다 거기로. 비-git 루트는 런 시작 실패(폴백 없음). 스폰 스펙에 `<root>/.crew/artifacts` 공유 규약 주입 |
+| t5-terminal | `portable-pty` PTY 백엔드(`pty_open/write/resize/close`, 출력은 `pty://output/<id>`, reader는 blocking read 전용 std::thread) + xterm.js `TerminalPanel`. `injectText`는 **주입만, 자동 Enter 금지**(보안 경계) |
+| t6-fe-shell | 슬랙형 셸 — `channels: Record<runId, ChannelState>` + activeRunId 스토어, 채널 사이드바, 새작업 모달(작업 내용/프로젝트명/로스터/scripted 토글 **기본 false=실 CLI 런**), 기존 5뷰+rail+search+커맨드바 삭제, 온보딩 게이트(localStorage `crew.onboarded` — **플래그 소유는 t6**) |
+| t7-fe-chat | ChatPane — 스레드 루트만 스트림에 + "댓글 N개", 우측 `#channel-side-panel` portal에 ThreadPanel, kind별 카드 렌더(미지 kind는 raw 접힘), 게이트 인라인 승인/반려(`human.gate`는 root-only 필터의 **예외로 메인 스트림 승격**), 👀 읽음·입력 중, 채널 검색(레이스 가드) |
+| t8-fe-onboarding | 온보딩 위저드(워크스페이스 → 도구 체크리스트 + 임베디드 터미널) + 설정 메뉴(동일 패널 재사용). 설치 명령 복사·터미널 주입, gh auth login 안내, 재검사, 완료/건너뛰기 → `onComplete` |
+
+**검증(머지 트리 실측)**: `cargo test --workspace` 425 passed/0 failed, src-tauri 스위트 49/0,
+`tsc --noEmit` rc=0, `vitest run` 204/204. 통합 리뷰(프레시 컨텍스트 서브에이전트) **approve,
+발견 0건**. 플랜 리뷰 7라운드에서 실결함 9건 사전 차단(계약 스텁 부재, unbounded 런 맵,
+§C3 원장 계약 충돌, 추적 트리 내 worktree git 파손(로컬 재현), 훅 면제 오주장 등).
+
+**시맨틱 머지 충돌 1건**: t1(RunEvent match 추가) × t2(variant 추가)가 각자 그린인데 합치면
+E0004 비망라 — 머지 후 통합 테스트가 잡아 1줄로 해소(`core.rs` event_kind에 Presence 추가).
+병렬 브랜치가 같은 enum을 각자 건드리면 머지 직후 전체 빌드가 필수.
+
+### 🔴 M12 잔여 — project_root 배선 (최우선, 휴면 기능 3개를 한 번에 깨움)
+
+`create_project`가 레포를 만들고 클론까지 하지만 **그 경로가 런에 전달되지 않는다.** 지금
+작업을 시작하면 에이전트는 실제 프로젝트가 아니라 임시 스크래치(`app-runs/<id>/cli-cwd/<role>`)
+에서 돈다. t4의 역할별 worktree와 `.crew/artifacts` 규약 주입도 `project_root: Some`에서만
+발화하므로 **셋 다 잠들어 있다.**
+
+끊긴 지점(실측): `src-tauri/src/core.rs:134` `project_root: None` 하드코딩 ·
+`src-tauri/src/lib.rs:23-28` `start_run(goal, scripted)`에 파라미터 없음 ·
+`src/lib/tauri-source.ts:109` invoke 인자 · `src/lib/store.ts:42,176` `startChannel(goal, scripted)`
+와 `ChannelState`에 경로 필드 없음 · `src/features/channels/NewTaskModal.tsx:107`이
+`createProject`의 반환 `ProjectInfo{name, path}`를 버림. 더불어 **기존 프로젝트 재열기 경로가
+없다**(`list_projects`/`open_project` 커맨드 0건).
+
+착수 조건은 이제 충족됐다 — 함정 30이 t4에서 봉쇄됐으므로 project_root를 켜도 안전하다.
+단 **함정 29는 계속 비무장 유지**(`dev_cmd_checks: Vec::new()`), 켜려면 별도 판단 필요.
+
+---
+
 ## 4. 다음 스텝 — M11 완료 후 잔여
 
-M1~M11 완료·실측 검증됨(§3).
+M1~M12 완료·실측 검증됨(§3, §3.5).
 
 > **작업 항목은 이제 GitHub 이슈가 정본이다** (2026-09-01). 아래 목록은 이력으로 남긴다 —
 > 새 작업을 고를 때는 이슈를 볼 것. 이슈는 자기완결적이라 이 문서를 읽지 않아도 착수할 수 있다.
@@ -338,9 +390,12 @@ M1~M11 완료·실측 검증됨(§3).
 > | [#3](https://github.com/choiyounggi/linkly-crew/issues/3) | Browser DoD 실제 실행 (지금은 항상 `skipped`) |
 > | [#4](https://github.com/choiyounggi/linkly-crew/issues/4) | auto-memory 스폰 세션 주입 차단 (함정 8 잔여 ①) |
 > | [#5](https://github.com/choiyounggi/linkly-crew/issues/5) | **함정 29** — 패키지 스크립트 간접 실행 (미해소·해소 불가) |
-> | [#6](https://github.com/choiyounggi/linkly-crew/issues/6) | **함정 30** — `project_root: Some`의 cwd 공유 (미해소) |
+> | [#6](https://github.com/choiyounggi/linkly-crew/issues/6) | **함정 30** — `project_root: Some`의 cwd 공유 (**M12 t4에서 해소** — 역할별 리포-밖 worktree, §3.5) |
 >
-> `project_root`를 켜는 작업(GUI 피커 등)은 #5와 #6을 **동시에** 무장시킨다. 착수 전 둘 다 읽을 것.
+> ~~`project_root`를 켜는 작업(GUI 피커 등)은 #5와 #6을 **동시에** 무장시킨다.~~
+> **갱신(2026-09-03)**: #6은 M12 t4에서 봉쇄됐다. 이제 `project_root`를 켜면 #5(함정 29)만
+> 무장 대상으로 남는데, `dev_cmd_checks`가 빈 벡터인 한 발화하지 않는다 — 배선(§3.5 잔여)은
+> `dev_cmd_checks`를 건드리지 않는 조건에서 안전하다.
 
 **M11 완료 후 잔여 (작은 것부터)**:
 
@@ -591,8 +646,15 @@ PlanOptions}`, `LeadPlanner::plan_dag_with`, `RunConfig.dev_cmd_checks`,
     남은 상태: `project_root`를 지정하고 `dev_cmd_checks`에 `npm run`/`npm test`류를
     포함시키면, 함정 29가 조용히 통과한다. 봉쇄는 argv 허용목록이 아니라 `project_root`를
     지정하는 사람의 판단뿐이다(DESIGN §4.2 신뢰 경계 문단).
-30. **`project_root: Some`이면 로스터 전원의 CLI 세션 cwd가 동일하다 — 락·역할별 브랜치·
-    충돌 감지가 전부 없다** (Phase 5 통합 리뷰 발, 코디네이터 재현, 2026-08-31):
+30. **[해소됨 — M12 t4, 2026-09-03]** `project_root: Some`이면 로스터 전원의 CLI 세션 cwd가
+    동일하다 — 락·역할별 브랜치·충돌 감지가 전부 없다 (Phase 5 통합 리뷰 발, 코디네이터
+    재현, 2026-08-31). **해소 내용**: `role_cli_cwd`의 `Some` 분기가 역할별 리포-밖 git
+    worktree(`~/.linkly-crew/projects/<basename>-<fnv8>/worktrees/<role>`, 브랜치
+    `crew/<role>`)를 반환하도록 교체됐고(`crates/crew-run/src/worktree.rs` 신설), Cmd DoD
+    exec cwd도 같은 worktree를 쓴다. 비-git 루트는 런 시작 실패(조용한 공유 cwd 폴백
+    없음). worktree를 **리포 안**(`.crew/` 등)에 두면 t3가 `.crew/artifacts`를 커밋하고
+    gitignore가 없어 embedded-repo로 깨진다 — 리뷰어가 로컬 재현했으므로 리포 밖 배치는
+    타협 대상이 아니다. 아래 원 분석은 이력으로 남긴다:
     1. `role_cli_cwd`의 `Some(root)` 분기(`controller.rs:98-101`)는 역할과 무관하게
        `root.to_path_buf()`를 그대로 반환한다 — 역할별 하위 디렉토리를 만들지 않는다.
     2. `spawn_sprint`(`controller.rs:277`)는 `crew_agents(roster)`로 얻은 로스터 전원을
