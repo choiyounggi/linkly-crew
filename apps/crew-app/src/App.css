@@ -100,7 +100,7 @@
 
 .layout__right {
   display: grid;
-  grid-template-rows: 1fr auto;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
   min-height: 0;
   border-left: 1px solid var(--border-hairline);
 }

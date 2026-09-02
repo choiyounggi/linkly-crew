@@ -43,7 +43,7 @@
 }
 
 .req-matrix__cell--expected {
-  background: var(--border-hairline);
+  background: var(--surface-raised);
 }
 
 .req-matrix__cell--none {
