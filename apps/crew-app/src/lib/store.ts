@@ -25,6 +25,12 @@ export interface ChannelState {
   sprintSummaries: { index: number; summary: string }[];
   sprintWindows: { index: number; startTs: string; endTs: string | null }[];
   roster: RosterAgentDto[];
+  /** t7 plan D4: agent ids that have read each message, keyed by message id. Reset on resync (run_started). */
+  readReceipts: Record<string, string[]>;
+  /** t7 plan D5: whether each agent is currently typing. Reset on resync (run_started). */
+  typing: Record<string, boolean>;
+  /** t7 plan D1 (Task 03): thread id open in the right-panel ThreadPanel, or null when none. Set directly via `useRunStore.setState` from chat/index.tsx — no dedicated action, per this task's field-only store scope. */
+  selectedThread: string | null;
 }
 
 /** Multi-run store root (plan D1): `channels` keyed by `run_id`, `channelOrder` for sidebar ordering, `activeRunId` for the selected channel. */
@@ -42,7 +48,7 @@ export interface RunState {
   applyEvent(runId: string, ev: RunEvent): void;
 }
 
-/** Exported for tests that need a fully-shaped `ChannelState` (e.g. features/thread's — t7-owned file, mechanically adapted to the multi-run store shape). */
+/** Exported for tests that need a fully-shaped `ChannelState` (e.g. features/chat's). */
 export function emptyChannel(runId: string, goal: string, scripted: boolean): ChannelState {
   return {
     runId,
@@ -58,6 +64,9 @@ export function emptyChannel(runId: string, goal: string, scripted: boolean): Ch
     sprintSummaries: [],
     sprintWindows: [],
     roster: [],
+    readReceipts: {},
+    typing: {},
+    selectedThread: null,
   };
 }
 
@@ -116,6 +125,20 @@ function applyEventToChannel(
     case "roster_changed":
       // Full replace, never a merge (plan D2).
       return { ...channel, roster: ev.agents };
+
+    case "presence":
+      if (ev.kind === "read") {
+        // target_msg_id is optional on the wire (t2 stub) — no-op if absent (plan D4).
+        if (!ev.target_msg_id) return channel;
+        const readers = channel.readReceipts[ev.target_msg_id] ?? [];
+        if (readers.includes(ev.agent_id)) return channel;
+        return {
+          ...channel,
+          readReceipts: { ...channel.readReceipts, [ev.target_msg_id]: [...readers, ev.agent_id] },
+        };
+      }
+      // kind === "typing"; active is optional on the wire (t2 stub) — absent means off (plan D5).
+      return { ...channel, typing: { ...channel.typing, [ev.agent_id]: Boolean(ev.active) } };
 
     default:
       // D6: unknown `type` from a newer wire version is ignored, not thrown.

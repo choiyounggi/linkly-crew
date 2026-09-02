@@ -53,7 +53,7 @@ export default function App() {
             </header>
             <div className="channel-view">
               <ChatPane runId={activeRunId} />
-              <aside className="channel-view__side" aria-label="상세 패널" />
+              <aside id="channel-side-panel" className="channel-view__side" aria-label="상세 패널" />
             </div>
           </>
         ) : (

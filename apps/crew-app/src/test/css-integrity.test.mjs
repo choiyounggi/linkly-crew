@@ -209,8 +209,10 @@ describe("CSS integrity (apps/crew-app/src)", () => {
 
   // artifacts/board/search/rail's rows and the req-matrix specificity
   // regression test below them were removed alongside those views (plan
-  // D5) — feature removal, not test weakening. thread survives untouched.
-  it.each([["features/thread/thread.css", ".thread-row__parties"]])(
+  // D5) — feature removal, not test weakening. features/thread was replaced
+  // by features/chat (plan D7); this case now points at chat's equivalent
+  // bold-party-name rule instead of being dropped.
+  it.each([["features/chat/chat.css", ".message-row__from"]])(
     "%s %s resolves font-weight to var(--font-weight-bold), not a different token",
     (relPath, selector) => {
       const file = cssFiles.find((f) => f.path === relPath);

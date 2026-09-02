@@ -1,6 +1,6 @@
 // Runtime guards for Envelope.body (typed `unknown` on the wire — D2).
 // Malformed shapes return null; callers fall back to a raw JSON render.
-// Never throw — a bad body must not crash the thread view.
+// Never throw — a bad body must not crash the stream.
 
 export interface Artifact {
   name: string;
@@ -16,6 +16,17 @@ export interface TaskResultBody {
 
 export interface ChangeRequestBody {
   violations: string[];
+  reason: string;
+}
+
+export interface HumanGateBody {
+  task_id: string;
+  reason: string;
+}
+
+export interface HumanResponseBody {
+  task_id: string;
+  decision: "approve" | "reject";
   reason: string;
 }
 
@@ -57,4 +68,21 @@ export function parseChangeRequestBody(body: unknown): ChangeRequestBody | null 
   if (!isStringArray(body.violations)) return null;
   if (typeof body.reason !== "string") return null;
   return { violations: body.violations, reason: body.reason };
+}
+
+/** contracts-m7.md §E8: `{"task_id": "...", "reason": "..."}`. */
+export function parseHumanGateBody(body: unknown): HumanGateBody | null {
+  if (!isRecord(body)) return null;
+  if (typeof body.task_id !== "string") return null;
+  if (typeof body.reason !== "string") return null;
+  return { task_id: body.task_id, reason: body.reason };
+}
+
+/** mock-source's resolveGate response shape: `{"task_id","decision","reason"}`. */
+export function parseHumanResponseBody(body: unknown): HumanResponseBody | null {
+  if (!isRecord(body)) return null;
+  if (typeof body.task_id !== "string") return null;
+  if (body.decision !== "approve" && body.decision !== "reject") return null;
+  if (typeof body.reason !== "string") return null;
+  return { task_id: body.task_id, decision: body.decision, reason: body.reason };
 }

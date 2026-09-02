@@ -326,3 +326,168 @@ describe("RunState — empty store (boundary)", () => {
     expect(s.channelOrder).toEqual([]);
   });
 });
+
+// t7 plan D4/D5: ChannelState gains readReceipts/typing (fields only, store
+// structure unchanged); applyEvent's "presence" branch writes into them.
+describe("RunState.applyEvent — presence (D4/D5)", () => {
+  it("records a read receipt for the target message, keyed by run (normal, R4/D4)", async () => {
+    const store = createRunStore(fakeSource());
+    await store.getState().startChannel("goal", false);
+
+    store.getState().applyEvent("run_1", {
+      type: "presence",
+      agent_id: "agent:pm",
+      kind: "read",
+      target_msg_id: "env_1",
+    });
+
+    expect(store.getState().channels["run_1"].readReceipts["env_1"]).toEqual(["agent:pm"]);
+  });
+
+  it("does not duplicate an agent that re-reads the same message (normal)", async () => {
+    const store = createRunStore(fakeSource());
+    await store.getState().startChannel("goal", false);
+
+    store.getState().applyEvent("run_1", {
+      type: "presence",
+      agent_id: "agent:pm",
+      kind: "read",
+      target_msg_id: "env_1",
+    });
+    store.getState().applyEvent("run_1", {
+      type: "presence",
+      agent_id: "agent:pm",
+      kind: "read",
+      target_msg_id: "env_1",
+    });
+
+    expect(store.getState().channels["run_1"].readReceipts["env_1"]).toEqual(["agent:pm"]);
+  });
+
+  it("is a safe no-op for a read event with no target_msg_id (boundary — optional wire field)", async () => {
+    const store = createRunStore(fakeSource());
+    await store.getState().startChannel("goal", false);
+    const before = store.getState().channels["run_1"];
+
+    expect(() =>
+      store.getState().applyEvent("run_1", { type: "presence", agent_id: "agent:pm", kind: "read" }),
+    ).not.toThrow();
+
+    expect(store.getState().channels["run_1"]).toEqual(before);
+  });
+
+  it("reflects typing on and off for an agent (normal, R4/D5)", async () => {
+    const store = createRunStore(fakeSource());
+    await store.getState().startChannel("goal", false);
+
+    store.getState().applyEvent("run_1", {
+      type: "presence",
+      agent_id: "agent:pm",
+      kind: "typing",
+      active: true,
+    });
+    expect(store.getState().channels["run_1"].typing["agent:pm"]).toBe(true);
+
+    store.getState().applyEvent("run_1", {
+      type: "presence",
+      agent_id: "agent:pm",
+      kind: "typing",
+      active: false,
+    });
+    expect(store.getState().channels["run_1"].typing["agent:pm"]).toBe(false);
+  });
+
+  it("treats a typing event with no active field as off (boundary — optional wire field)", async () => {
+    const store = createRunStore(fakeSource());
+    await store.getState().startChannel("goal", false);
+
+    store.getState().applyEvent("run_1", { type: "presence", agent_id: "agent:pm", kind: "typing" });
+
+    expect(store.getState().channels["run_1"].typing["agent:pm"]).toBe(false);
+  });
+
+  it("keeps presence isolated per channel — no cross-run_id contamination (error/boundary, R4)", async () => {
+    const source = fakeSource({
+      start: vi.fn().mockResolvedValueOnce("run_a").mockResolvedValueOnce("run_b"),
+    });
+    const store = createRunStore(source);
+    await store.getState().startChannel("goal a", false);
+    await store.getState().startChannel("goal b", false);
+
+    store.getState().applyEvent("run_a", {
+      type: "presence",
+      agent_id: "agent:pm",
+      kind: "read",
+      target_msg_id: "env_1",
+    });
+    store.getState().applyEvent("run_a", {
+      type: "presence",
+      agent_id: "agent:pm",
+      kind: "typing",
+      active: true,
+    });
+
+    const s = store.getState();
+    expect(s.channels["run_a"].readReceipts["env_1"]).toEqual(["agent:pm"]);
+    expect(s.channels["run_a"].typing["agent:pm"]).toBe(true);
+    expect(s.channels["run_b"].readReceipts).toEqual({});
+    expect(s.channels["run_b"].typing).toEqual({});
+  });
+
+  it("resets readReceipts/typing on a re-applied run_started for that run (resync reset, boundary)", async () => {
+    const store = createRunStore(fakeSource());
+    await store.getState().startChannel("goal", false);
+    store.getState().applyEvent("run_1", {
+      type: "presence",
+      agent_id: "agent:pm",
+      kind: "typing",
+      active: true,
+    });
+    expect(store.getState().channels["run_1"].typing["agent:pm"]).toBe(true);
+
+    store.getState().applyEvent("run_1", runStarted);
+
+    expect(store.getState().channels["run_1"].typing).toEqual({});
+    expect(store.getState().channels["run_1"].readReceipts).toEqual({});
+  });
+});
+
+// t7 plan D1 (Task 03): selectedThread is a field-only addition, set directly
+// via useRunStore.setState from chat/index.tsx (no dedicated store action).
+describe("ChannelState.selectedThread — field default and isolation (normal/boundary, D1)", () => {
+  it("defaults to null for a freshly started channel", async () => {
+    const store = createRunStore(fakeSource());
+    await store.getState().startChannel("goal", false);
+
+    expect(store.getState().channels["run_1"].selectedThread).toBeNull();
+  });
+
+  it("is independent per channel when set directly via setState (boundary)", async () => {
+    const source = fakeSource({
+      start: vi.fn().mockResolvedValueOnce("run_a").mockResolvedValueOnce("run_b"),
+    });
+    const store = createRunStore(source);
+    await store.getState().startChannel("goal a", false);
+    await store.getState().startChannel("goal b", false);
+
+    store.setState((s) => ({
+      channels: { ...s.channels, run_a: { ...s.channels["run_a"], selectedThread: "t-pm" } },
+    }));
+
+    expect(store.getState().channels["run_a"].selectedThread).toBe("t-pm");
+    expect(store.getState().channels["run_b"].selectedThread).toBeNull();
+  });
+
+  it("resets to null on a re-applied run_started for that run (resync reset, boundary)", async () => {
+    const store = createRunStore(fakeSource());
+    await store.getState().startChannel("goal", false);
+    store.setState((s) => ({
+      channels: { ...s.channels, run_1: { ...s.channels["run_1"], selectedThread: "t-pm" } },
+    }));
+    expect(store.getState().channels["run_1"].selectedThread).toBe("t-pm");
+
+    store.getState().applyEvent("run_1", runStarted);
+
+    expect(store.getState().channels["run_1"].selectedThread).toBeNull();
+  });
+});
