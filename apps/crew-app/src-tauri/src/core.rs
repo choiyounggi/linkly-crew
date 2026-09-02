@@ -508,6 +508,7 @@ mod tests {
             RunEvent::SprintStarted { .. } => "SprintStarted",
             RunEvent::SprintFinished { .. } => "SprintFinished",
             RunEvent::RosterChanged { .. } => "RosterChanged",
+            RunEvent::Presence { .. } => "Presence",
         }
     }
 
