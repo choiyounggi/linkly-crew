@@ -199,3 +199,43 @@ PM 배지 전이는 2/3런에서만 관측됐다(§1 참조, MutationObserver �
 제거했다. `.claude/tmp/t2-live-visual-verify/`(수집 서버·원시 JSON,
 저장소 밖)도 삭제했다. `git status` 에는 이 문서(및 `TAURI-WEBVIEW-VERIFY.md`
 갱신)만 남는다.
+
+## 6. t4-covered-corr-fix 후속 — `covered` 수정 확인 (2026-09-02)
+
+**수정**: `src/features/artifacts/derive.ts`의 `buildReqMatrix`/`buildArtifactIndex`가
+`envelope.corr`을 bare task id로 오인하던 것을, board/rail derive와 동일하게
+corr을 불투명 토큰으로 취급하도록 고쳤다 — `task.assign` 메시지의
+`body.task.id`에서 corr→taskId 맵을 만들고(`buildCorrToTaskId`), `task.result`의
+corr을 이 맵으로 해석한다. 맵에 없는 corr(assign 없이 result만 오는
+mock/테스트 경로)은 corr 값 그대로 폴백해 기존 mock 동작을 보존한다. 파생
+시맨틱(`covered > expected > none` 우선순위 등)은 변경하지 않았다.
+
+**실측**: 위 §2와 동일한 방법(`TAURI-WEBVIEW-VERIFY.md` §1, index.html 1줄 +
+`src/__verify__/probe.ts`, `127.0.0.1:1421` 수집 서버)으로 수정 후
+`npm run tauri dev` 실런 1회를 완주까지 실행해 `buildReqMatrix`/
+`buildArtifactIndex` 결과를 직접 측정했다(1회 시도만에 메시지 18건 수신,
+D8 재시도 루프 불필요):
+
+| 항목 | 수정 전(§2, 3런 125셀) | 수정 후(1런 25셀) |
+|---|---|---|
+| `covered` | 0 | **25** |
+| `expected` | 125 | 0 |
+| `none` | 0 | 0 |
+| `buildArtifactIndex` taskId | `"corr-t-pm"`류(오염) | `t-pm` 등 bare id(정상) |
+
+셀 5개 requirement × 5개 task = 25셀 전부가 `covered`로 전환됐고,
+`buildArtifactIndex`가 반환한 `taskId`도 전부 `corr-` 접두어 없는 bare task
+id였다(`["t-pm","t-design","t-publish","t-dev","t-qa"]`). `npx vitest run`은
+197/197 통과(기존 193 + 신규 4: `buildArtifactIndex`/`buildReqMatrix` 각
+corr 해석 케이스 + 폴백 경계 케이스).
+
+**부수 관찰(범위 밖, 코드 무변경, 보고만)**: 측정 중 `run_snapshot`
+직후 재시작 없이 진행한 첫 시도에서 `finished`/`taskStates`는 정상 도달했지만
+`messages`가 0건인 경우를 관측했다(task.assign/result 포함 전 종류
+메시지가 0건 — §4의 "메시지 1건 차이" 레이스보다 심한 사례). `TauriEventSource.start()`의
+스냅샷 replay(`snapshot.messages`)와 라이브 이벤트 버퍼링(`lastSeq` 게이팅)
+사이에 스크립티드 런(70–220ms 완주)이 워낙 빨라 생기는 것으로 보이는
+경합으로 추정되며, D8과 동일하게 `defaultSource.stop()` → 재시작으로
+회피 가능했다(1차 재시도에서 메시지 18건 정상 수신). `src-tauri/**` 무변경
+원칙(t4 범위 밖)에 따라 코드 수정은 하지 않았다 — 다음 라이브 검증
+작업자를 위해 여기 기록만 남긴다.
