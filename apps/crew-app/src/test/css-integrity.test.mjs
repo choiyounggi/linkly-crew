@@ -64,6 +64,32 @@ function getRuleBlock(text, selector) {
 }
 
 /**
+ * Returns every `border-radius:` declaration value that is not composed
+ * exclusively of `var(--radius-*)` tokens (plus the literals `0`/`inherit`,
+ * which name no scale step and so carry no drift risk).
+ */
+function findLiteralRadii(css) {
+  const hits = [];
+  for (const m of css.matchAll(/border-radius:\s*([^;]+);/g)) {
+    const value = m[1].trim();
+    const stripped = value.replace(/var\(--radius-[a-zA-Z0-9-]+\)/g, "").trim();
+    if (stripped !== "" && stripped !== "0" && stripped !== "inherit") {
+      hits.push(value);
+    }
+  }
+  return hits;
+}
+
+/** Returns every non-OKLCH color literal (`#hex`, `rgb(`, `rgba(`, `hsl(`) found in css text. */
+function findNonOklchColors(css) {
+  const hits = [];
+  for (const m of css.matchAll(/#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(/g)) {
+    hits.push(m[0]);
+  }
+  return hits;
+}
+
+/**
  * CSS specificity per the cascade spec, as (id, class-or-pseudo-class, type)
  * counts, computed for a single compound selector (no combinators besides
  * whitespace-separated descendant chains; no :not()/:is() argument parsing —
@@ -137,6 +163,26 @@ describe("analyzeCssFiles (detector fixtures)", () => {
       { path: "a.css", text: ".x {\n  color: var(--known);\n}\n" },
     ]);
     expect(undefinedVars).toEqual([]);
+  });
+});
+
+describe("findLiteralRadii (detector fixtures)", () => {
+  it("flags a literal border-radius value", () => {
+    expect(findLiteralRadii(".x {\n  border-radius: 4px;\n}\n")).toEqual(["4px"]);
+  });
+
+  it("does not flag a border-radius composed of --radius-* tokens", () => {
+    expect(findLiteralRadii(".x {\n  border-radius: var(--radius-md);\n}\n")).toEqual([]);
+  });
+});
+
+describe("findNonOklchColors (detector fixtures)", () => {
+  it("flags a hex color", () => {
+    expect(findNonOklchColors(".x { color: #fff; }")).toEqual(["#fff"]);
+  });
+
+  it("does not flag an oklch() color", () => {
+    expect(findNonOklchColors(".x { color: oklch(50% 0 0); }")).toEqual([]);
   });
 });
 
@@ -222,4 +268,35 @@ describe("CSS integrity (apps/crew-app/src)", () => {
       expect(block).toMatch(/font-weight:\s*var\(--font-weight-bold\);/);
     },
   );
+
+  it("declares every border-radius through a --radius token", () => {
+    const hits = cssFiles.flatMap(({ path: filePath, text }) =>
+      findLiteralRadii(text).map((value) => `${filePath}: ${value}`),
+    );
+    expect(hits).toEqual([]);
+  });
+
+  it("tokens.css colors are OKLCH only", () => {
+    const tokensFile = cssFiles.find((f) => f.path === "styles/tokens.css");
+    expect(tokensFile, "expected to find styles/tokens.css under src/").toBeTruthy();
+    expect(findNonOklchColors(tokensFile.text)).toEqual([]);
+  });
+
+  it.each([
+    ["--control-h-md"],
+    ["--focus-ring"],
+    ["--color-primary"],
+    ["--border-strong"],
+    ["--scrim"],
+  ])("%s is defined and referenced", (varName) => {
+    expect(definedVars.has(varName), `expected ${varName} to be defined somewhere under src/`).toBe(true);
+    expect(usedVars.has(varName), `expected ${varName} to be referenced (var(${varName})) somewhere under src/`).toBe(true);
+  });
+
+  // --radius-2xl (plan design.md D1) is mapped to the onboarding card, which
+  // is features/** and owned by t3 — t2 only declares the token; the
+  // reference lands when t3 skins onboarding on top of it.
+  it("--radius-2xl is defined", () => {
+    expect(definedVars.has("--radius-2xl"), "expected --radius-2xl to be defined somewhere under src/").toBe(true);
+  });
 });

@@ -2,38 +2,42 @@
  * 표면·잉크는 앵커 hue 로 tint, 액센트 1개(D6), 상태색은 별도 hue.
  * 한글 라벨(보드/DAG/타임라인/승인함/아티팩트)이 시스템 폰트로 폴백되지 않도록
  * 라틴 페이스마다 한글 동반 페이스를 명시적으로 짝짓는다(D7 확장, 사용자 결정).
+ * D20 (2026-09-03): v2 — hue 327 / Orca-neutral / Slack accents / radius base 10px.
  */
 :root {
   color-scheme: dark;
 
-  /* ---- 색: 표면 계단 (elevation = lightness, D4·D5) ---- */
-  --elev-0: 13%;
-  --elev-1: 16%;
-  --elev-2: 19%;
-  --elev-3: 22%;
-  --surface-chroma: 0.012;
-  --surface-hue: 215;
+  /* ---- 색: 표면 계단 (elevation = lightness, D4·D5, D2 hue 327) ---- */
+  --elev-0: 14%;
+  --elev-1: 17%;
+  --elev-2: 21%;
+  --elev-3: 25%;
+  --surface-chroma: 0.006;
+  --surface-hue: 327;
 
   --surface-paper: oklch(var(--elev-0) var(--surface-chroma) var(--surface-hue));
   --surface-panel: oklch(var(--elev-1) var(--surface-chroma) var(--surface-hue));
   --surface-raised: oklch(var(--elev-2) var(--surface-chroma) var(--surface-hue));
   --surface-overlay: oklch(var(--elev-3) var(--surface-chroma) var(--surface-hue));
 
-  --border-hairline: oklch(27% 0.014 var(--surface-hue));
+  --border-hairline: oklch(29% 0.008 var(--surface-hue));
+  --border-strong: oklch(36% 0.01 var(--surface-hue));
 
   /* ---- 색: 잉크 (같은 hue 로 tint, D5) ---- */
-  --ink-text: oklch(92% 0.01 var(--surface-hue));
-  --ink-dim: oklch(68% 0.014 var(--surface-hue));
-  --ink-faint: oklch(50% 0.014 var(--surface-hue));
+  --ink-text: oklch(94% 0.006 var(--surface-hue));
+  --ink-dim: oklch(70% 0.01 var(--surface-hue));
+  --ink-faint: oklch(52% 0.01 var(--surface-hue));
 
-  /* ---- 색: 액센트 1개 (D6) ---- */
-  --color-accent: oklch(68% 0.16 var(--surface-hue));
-  --color-accent-ink: oklch(14% 0.02 var(--surface-hue));
+  /* ---- 색: 액센트 2개 (D3 — 오베르진 선택/포커스, 그린 주요 액션) ---- */
+  --color-accent: oklch(58% 0.14 327);
+  --color-accent-ink: oklch(98% 0.01 327);
+  --color-primary: oklch(52% 0.11 165);
+  --color-primary-ink: oklch(98% 0.01 165);
 
-  /* ---- 색: 상태 (D3 전부 oklch) ---- */
-  --status-danger: oklch(66% 0.19 25);
-  --status-warning: oklch(76% 0.15 80);
-  --status-success: oklch(72% 0.15 150);
+  /* ---- 색: 상태 (D3 전부 oklch; success = primary) ---- */
+  --status-danger: oklch(58% 0.19 5);
+  --status-warning: oklch(78% 0.15 85);
+  --status-success: var(--color-primary);
 
   /* ---- spacing: 4pt 원시 스케일 (D8) ---- */
   --space-1: 0.25rem;
@@ -43,13 +47,8 @@
   --space-5: 1.25rem;
   --space-6: 1.5rem;
   --space-8: 2rem;
-  --space-10: 2.5rem;
 
   /* ---- spacing: 시맨틱 ---- */
-  --space-xs: var(--space-1);
-  --space-sm: var(--space-2);
-  --space-md: var(--space-3);
-  --space-lg: var(--space-4);
   --space-xl: var(--space-6);
   --space-2xl: var(--space-8);
 
@@ -83,20 +82,28 @@
   /* ---- 타이포: 숫자 정렬 (D11) ---- */
   --font-numeric: tabular-nums;
 
-  /* ---- radius: base 하나에서 배수 파생 (D9, Orca 구조 참고) ---- */
-  --radius: 0.5rem;
-  --radius-xs: calc(var(--radius) * 0.25);
-  --radius-sm: calc(var(--radius) * 0.5);
-  --radius-md: var(--radius);
-  --radius-lg: calc(var(--radius) * 1.5);
-  --radius-xl: calc(var(--radius) * 2);
+  /* ---- radius: base 하나에서 가감 파생 (D1, Orca base 10px 참고) ---- */
+  --radius: 0.625rem;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 10px);
   --radius-circle: 9999px;
 
-  /* ---- elevation: 레벨별 표면 명도 (그림자 아님, D4) ---- */
-  --elev-level-0: var(--surface-paper);
-  --elev-level-1: var(--surface-panel);
-  --elev-level-2: var(--surface-raised);
-  --elev-level-3: var(--surface-overlay);
+  /* ---- 컨트롤: 고정 높이/패딩 (D4) ---- */
+  --control-h-sm: 2rem;
+  --control-h-md: 2.25rem;
+  --control-px-sm: var(--space-3);
+  --control-px-md: var(--space-4);
+
+  /* ---- 포커스 링 (D6) ---- */
+  --focus-ring: 0 0 0 2px var(--surface-paper), 0 0 0 4px var(--color-accent);
+
+  /* ---- 섀도/스크림 (D7) ---- */
+  --shadow-floating: 0 10px 24px oklch(0% 0 0 / 0.45);
+  --shadow-sm: 0 1px 2px oklch(0% 0 0 / 0.35);
+  --scrim: oklch(8% 0.01 var(--surface-hue) / 0.6);
 
   /* ---- 모션: duration + named easing (transform/opacity 전용, D12) ---- */
   --motion-duration-fast: 100ms;
@@ -122,24 +129,4 @@
     --motion-duration-base: 0s;
     --motion-duration-slow: 0s;
   }
-}
-
-/* contract: t2-fe-tokens owns the implementation — token v2 NAMES declared
-   here (orchestration run fxd1, 2026-09-03) so t3-fe-feature-skins can plan
-   against them. Values below are placeholders equal to today's look; t2
-   replaces them (plan D1–D7) and t3 consumes them. Do not reference from
-   feature css until t2 has merged. */
-:root {
-  --radius-2xl: calc(var(--radius) * 2.5);
-  --border-strong: oklch(34% 0.014 215);
-  --color-primary: var(--color-accent);
-  --color-primary-ink: var(--color-accent-ink);
-  --control-h-sm: 2rem;
-  --control-h-md: 2.25rem;
-  --control-px-sm: var(--space-3);
-  --control-px-md: var(--space-4);
-  --focus-ring: 0 0 0 2px var(--surface-paper), 0 0 0 4px var(--color-accent);
-  --shadow-floating: 0 10px 24px oklch(0% 0 0 / 0.45);
-  --shadow-sm: 0 1px 2px oklch(0% 0 0 / 0.35);
-  --scrim: oklch(10% 0.01 215 / 0.6);
 }

@@ -65,6 +65,6 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: oklch(10% 0.01 215 / 0.6);
+  background: var(--scrim);
   padding: var(--space-4);
 }

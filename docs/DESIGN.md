@@ -592,6 +592,15 @@ decisions(id, run_id, text, rationale, made_by, ts)  -- L1 컨텍스트 소스
    **검토했던 대안**: Svelte — 번들 크기가 더 작다는 서술이 반복적으로 확인됐으나
    [docs/RESEARCH.md §7][R22][R23][R26], Tauri 앱 자체가 이미 Electron 대비 5~10MB로
    작아(§10) 번들 크기 이점의 체감 효과가 제한적이라는 게 React를 우선한 이유였다.
+7. ~~crew-app 디자인 토큰 v2~~ **결정됨(2026-09-03)**: Orca 앱(라디우스·컨트롤 치수)과
+   Slack(오베르진/그린 액센트)을 모방해 `apps/crew-app/src/styles/tokens.css`를 재작성.
+   - 라디우스: base `--radius` 0.625rem에서 가감 파생 — sm(base−4px) / md(base−2px) /
+     lg(base) / xl(base+4px) / 2xl(base+10px). `.panel`은 라디우스 없음(레이아웃 제약, 불변).
+   - 액센트 2개: `--color-accent`(오베르진, hue 327 — 선택/포커스) + `--color-primary`
+     (그린, hue 165 — 주요 액션 버튼). `--status-success`는 `--color-primary`에 합류.
+   - 고정 컨트롤 높이: `--control-h-sm`(2rem)/`--control-h-md`(2.25rem) + 대응 패딩 토큰.
+   - 포커스 링: `--focus-ring`(box-shadow, outline 대체, ≥3:1). 섀도/스크림 토큰 신설.
+   - 다크 전용 유지(D19) — 라이트 테마는 추가하지 않는다.
 
 ### 남은 미결
 5. 앱/프로젝트 이름 (`agent-crew` 가칭)
