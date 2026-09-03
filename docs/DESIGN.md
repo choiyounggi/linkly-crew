@@ -4,6 +4,12 @@
 > 목표: 구독 중인 여러 AI CLI(클로드 코드/코덱스/그록/제미나이…)를 **하나의 팀**으로 묶어,
 > 사용자의 요청 한 줄을 팀장 에이전트가 스프린트로 쪼개고, 역할별 에이전트가 서로 대화하며
 > 끝까지 완주시키는 macOS 앱.
+>
+> **이 문서가 서술하는 코드**: `orch-projroot-integ` @ `a9f8475`(2026-09-03) —
+> t1-be-projroot·t2-fe-picker가 머지된 지점(이 문서 자체를 갱신한 워커 브랜치
+> `t3-docs-design`은 여기서 분기했고, teardown 시 사라진다). 이후 코드가 바뀌면 이 문서는
+> 그만큼 드리프트한다 — 이 레포에는 문서를 코드에서 생성하는 도구가 없으므로 갱신은
+> 손으로 한다.
 
 ---
 
@@ -262,10 +268,15 @@ Lead는 `task.result`를 받으면 위 예시의 `kind:"cmd"` 체크를 셸을 �
   범위 안에서는 영향 없음). 근거: `docs/SPIKE-M10.md` §2 A/B 표(FIX ON: exit `0`·잔존
   프로세스 **0개** / FIX OFF: exit `101`·잔존 **1개**, 기록된 손자는 타임아웃 후에도
   `kill(pid,0)`이 생존을 반환).
-- **실행 cwd** (M11 갱신, `crew-run`의 `role_cli_cwd(project_root, data_dir, role)`):
-  `project_root: Some(root)`이면 해당 태스크 역할의 CLI 세션 cwd와 Cmd DoD 실행 cwd가
-  **둘 다 `root`** — Lead 자신의 cwd가 아니다. `project_root: None`(기본)이면 M10까지의
-  동작 그대로 스크래치 `<data_dir>/cli-cwd/<role>`.
+- **실행 cwd** (M12 갱신, `crew-run`의 `role_cli_cwd(role_worktrees, data_dir, role)` +
+  `resolve_role_worktrees`/`worktree::ensure_role_worktree`): `project_root: Some(root)`이면
+  역할마다 **리포 밖** git worktree가 만들어지고(`~/.linkly-crew/projects/<basename>-<fnv1a
+  hash8hex>/worktrees/<role>`, 전용 브랜치 `crew/<role>`), 해당 태스크 역할의 CLI 세션 cwd와
+  Cmd DoD 실행 cwd가 **둘 다 그 worktree** — `root` 자체도, Lead 자신의 cwd도 아니다.
+  worktree는 런이 끝나도 유지되며 재실행 시 멱등이다. 이것이 로스터 전원이 같은 cwd를
+  공유하던 **함정 30의 봉쇄책**이다(M12 t4, HANDOFF §5 함정 30 — M11까지는 실제로
+  "둘 다 `root`"였다). `project_root: None`(기본)이면 M10까지의 동작 그대로 스크래치
+  `<data_dir>/cli-cwd/<role>`.
 - `kind:"browser"`는 **M10에서도 아직 미실행**이다 — 항상 `skipped`로만 기록된다(스코프
   아웃).
 - 실행 결과 중 하나라도 `Refused`/`TimedOut`/`SpawnFailed`이거나 exit code가 `expect`와
@@ -307,6 +318,23 @@ Lead가 그대로 실행해 판정한다. 이 실행을 봉쇄하는 것은 argv
 §5 함정 29) —
 `npm|yarn|pnpm run`류 간접 실행이 위치별 허용목록을 무력화한다는 사실 — 를 감안해야
 한다. **함정 29는 이 마일스톤으로 닫히지 않는다.**
+
+**GUI 배선 (issue #13, 2차 런)**: `project_root`는 M11이 필드를 신설한 뒤에도 GUI에서 실제로
+채워지지 않아 M12까지 휴면이었다 — 위의 역할별 worktree 격리와 `.crew/artifacts` 규약
+주입은 코드상 완성돼 있었지만 아무 GUI 경로도 `Some`을 전달하지 않았다. 이번 런이 그 배선을
+잇는다: 새 작업 모달이 **새로 만들기/기존 선택** 두 모드를 제공하고, 어느 쪽이든 확정된
+프로젝트의 절대 경로가 `start_run`의 `projectRoot` 인자로 전달된다(`apps/crew-app/src-tauri/
+src/lib.rs`의 `start_run(goal, scripted, project_root)`, `apps/crew-app/src/lib/
+tauri-source.ts`의 `invoke("start_run", { goal, scripted, projectRoot })`). 그 값이
+`resolve_project_root`(`apps/crew-app/src-tauri/src/core.rs`)를 거쳐 `RunConfig.project_root
+= Some(path)`가 되는 순간, 위에서 설명한 역할별 worktree 격리와 `.crew/artifacts` 규약
+주입이 비로소 발화한다 — **상대 경로·빈 문자열은 런 시작 전에 거부되고(조용한 폴백 없음),
+`projectRoot`가 `null`이면 종전대로 `project_root: None`(스크래치 cwd)이다.**
+기존 프로젝트를 다시 여는 경로는 인자 없는 `list_projects` 커맨드다 — 워크스페이스 루트
+바로 아래의 git 레포만 이름순으로 돌려주고, 루트 자체가 없으면 빈 목록이 아니라
+`workspace_missing: <path>` 에러로 구분된다(`apps/crew-app/src-tauri/src/project.rs`의
+`list_projects_core`). **단, `dev_cmd_checks`는 이번 배선으로도 여전히 빈 벡터다** —
+함정 29(위 문단)는 이 GUI 배선으로 무장되지 않으며, 켜는 것은 별도 판단이다.
 
 ### 4.3 Lead 에이전트의 실제 구현
 - Lead도 LLM 세션이지만, **출력은 반드시 구조화 JSON** (툴 스키마 강제).
@@ -357,13 +385,25 @@ L3 개인 세션 (에이전트 내부)         : 해당 CLI 세션의 자체 히
 
 ## 6. 파일 충돌 — 병렬 에이전트의 진짜 지뢰
 
-**이 절은 설계 목표이며 미구현이다** — M11의 `project_root: Some`은 아래 통제 없이 로스터
-전원이 같은 cwd를 공유하는 트리를 만든다(HANDOFF §5 함정 30 참고).
+**이 절은 항목별로 구현 상태가 갈린다** — M12 t4가 아래 첫 항목을 봉쇄했지만
+(HANDOFF §5 함정 30 참고), 나머지는 여전히 설계 목표 단계다.
 
-- 에이전트마다 **git worktree + 전용 브랜치**(`crew/sprint-3/dev`). 같은 파일 동시 수정 원천 차단.
-- Lead가 스프린트 종료 시 순차 머지, 충돌 시 해당 에이전트에게 `change_request`.
-- 워크스페이스 루트에 `.crew/` (DB·로그·임시파일). **`/tmp` 사용 금지** — 보안 정책.
-- 파일 쓰기는 워크트리 경계 밖으로 못 나가게 러너 프로세스에서 경로 검증.
+- 에이전트마다 **git worktree + 전용 브랜치** → **구현됨**(M12 t4, `crates/crew-run/src/worktree.rs`의
+  `ensure_role_worktree`). 단 브랜치는 이 절이 예시로 든 `crew/sprint-3/dev`가 아니라
+  스프린트 구분 없는 `crew/<role>`이다. 같은 파일 동시 수정 원천 차단이라는 목적은 동일.
+- Lead가 스프린트 종료 시 순차 머지, 충돌 시 해당 에이전트에게 `change_request` →
+  **여전히 미구현**. 런이 끝나도 역할별 worktree만 남고, 그것들을 되돌려 합치는 통합
+  경로는 코드에 없다(`grep -rn 'change_request' crates/crew-run/src` → 0 hits).
+- **`.crew/artifacts`**(공유 산출물·문서·이미지·디자인 토큰) → **생성된 대상 프로젝트** 안,
+  즉 `<project_root>/.crew/artifacts`다(워크스페이스 루트가 아니다) — `create_project`가
+  스캐폴드해 그 프로젝트에서 커밋하고(`apps/crew-app/src-tauri/src/project.rs`의
+  `scaffold_and_commit`), `project_root`가 Some일 때 이 규약 문단이 역할 스폰 스펙에
+  주입된다(`crates/crew-run/src/controller.rs`의 `role_system_hint`). 리포 **안**에 두는
+  것은 사용자 명시 결정(2026-09-02)이다 — linkly-crew 자신의 `.gitignore`가 `.crew/`를
+  무시하는 것은 대상 프로젝트가 아니라 이 레포 자신의 이야기이므로 혼동하지 말 것.
+  **`/tmp` 사용 금지** — 보안 정책은 그대로 유효.
+- 파일 쓰기는 워크트리 경계 밖으로 못 나가게 러너 프로세스에서 경로 검증 → **여전히
+  미구현**(§4.2 "신뢰 경계" 문단 참고 — `project_root`에는 봉쇄 목록이 없다).
 
 ---
 
@@ -374,14 +414,24 @@ L3 개인 세션 (에이전트 내부)         : 해당 CLI 세션의 자체 히
 | **커맨드 바** | 요청 한 줄 입력 → Lead 기동 |
 | **스프린트 보드** | 칸반(대기/진행/검토/완료/차단). 카드=태스크, 담당 에이전트 아바타 |
 | **에이전트 레일** | 에이전트별 카드: 상태(대기/작업 N초/응답대기), 현재 태스크, 하네스 배지(클로드/코덱스…), 토큰·사용량 게이지 |
-| **라이브 스레드** | 슬랙 형태. `task.ack`는 👀 뱃지, `change_request`는 색상 강조, 첨부 아티팩트 인라인 |
-| **DAG 뷰** | 의존성 그래프. 크리티컬 패스 하이라이트, 차단 노드 빨강 (M6 구현: `features/dag`, `@xyflow/react`) |
-| **타임라인** | 가로 시간축 스윔레인 — 누가 언제 뭘 했는지, 유휴 구간이 어디인지 (M6 구현: `features/timeline`) |
-| **승인함** | `human.gate` 대기 목록. 클릭 한 번으로 승인/반려+사유 (M7 구현: `features/inbox`) |
-| **아티팩트/디프** | 산출물 미리보기 + 커밋 디프 + REQ-id 커버리지 매트릭스 (M7 구현: `features/artifacts`) |
+| **라이브 스레드** | 슬랙 형태. `task.ack`는 👀 뱃지, `change_request`는 색상 강조, 첨부 아티팩트 인라인 (M12에서 `features/chat`의 ChatPane으로 실현 — 아래 스레드 패널·읽음/입력 중 행 참고) |
+| **DAG 뷰** | 의존성 그래프. 크리티컬 패스 하이라이트, 차단 노드 빨강 (M6에서 `features/dag`+`@xyflow/react`로 구현 → **M12 슬랙형 셸 도입 시 삭제**(§11 M12), 대체 뷰 없음 — `apps/crew-app/src/features/`에 더 이상 없다) |
+| **타임라인** | 가로 시간축 스윔레인 — 누가 언제 뭘 했는지, 유휴 구간이 어디인지 (M6에서 `features/timeline`으로 구현 → **M12에서 삭제**(§11 M12), 대체 뷰 없음) |
+| **승인함** | `human.gate` 대기 목록. 클릭 한 번으로 승인/반려+사유 (M7에서 `features/inbox`로 별도 화면 구현 → **M12에서 삭제**, 같은 기능은 채널 스트림의 게이트 인라인 카드로 흡수됨 — 아래 게이트 인라인 행 참고) |
+| **아티팩트/디프** | 산출물 미리보기 + 커밋 디프 + REQ-id 커버리지 매트릭스 (M7에서 `features/artifacts`로 구현 → **M12에서 삭제**(§11 M12), 대체 뷰 없음) |
+| **채널 사이드바** | 런 하나 = 채널 하나. 진행 중/완료 채널 목록 (M12 구현: `features/channels/Sidebar.tsx`) |
+| **새 작업 모달** | 새로 만들기/기존 선택 토글로 프로젝트를 확정한 뒤 실행 (M12 구현: `features/channels/NewTaskModal.tsx`, §4.2 GUI 배선 참고) |
+| **스레드 패널** | 스레드 루트만 메인 스트림에, 댓글은 우측 패널로 분리 (M12 구현: `features/chat/ThreadPanel.tsx`) |
+| **게이트 인라인** | `human.gate`는 메인 스트림에 카드로 승격돼 인라인 승인/반려 (M12 구현: `features/chat/GateCard.tsx`) |
+| **읽음·입력 중** | 👀 읽음 표시 + 입력 중 인디케이터 (M12 구현: `features/chat/MessageRow.tsx`, `features/chat/index.tsx`) |
+| **임베디드 터미널** | PTY 백엔드 + xterm.js 패널. 텍스트 주입만 하고 자동 Enter는 금지(보안 경계) (M12 구현: `components/terminal`, `src-tauri/src/pty.rs`) |
+| **온보딩 위저드** | 워크스페이스 지정 → 도구 체크리스트 + 임베디드 터미널 안내, 설정 메뉴가 같은 패널 재사용 (M12 구현: `features/onboarding`) |
 
 - 모든 뷰는 **이벤트 원장 스트림 구독**으로 갱신 (폴링 금지).
-- 전역 검색: 메시지·산출물·결정 로그 (SQLite FTS5). (M7 구현: `features/search`)
+- 전역 검색: 메시지·산출물·결정 로그 (SQLite FTS5). (M7에서 `features/search`로 구현 →
+  **M12에서 삭제**. FTS5 백엔드 자체는 남아 있으나(`crates/crew-ledger/src/store.rs`) 현재
+  UI는 채널 단위 검색뿐 — 아래 채널 검색 참고)
+- 채널 검색: 레이스 가드가 걸린 채널 내 검색 (M12 구현: `features/chat/SearchOverlay.tsx`)
 
 ---
 
@@ -463,6 +513,55 @@ decisions(id, run_id, text, rationale, made_by, ts)  -- L1 컨텍스트 소스
 - ✅ 3스프린트 연속 실행에서 에이전트 컨텍스트가 한계 미만으로 유지,
   하네스 강제 교체 후에도 작업 연속성 유지.
 
+**M6 — mid-스프린트 즉시 스왑 + DAG/타임라인 뷰** ✅ 완료 (2026-08-29, 실측: 통합 브랜치 `ea5fd4a`)
+- 제어 채널 기반 로스터 즉시 스왑(3단계 실패 시 `SwapIncomplete`로 1~2단계만 유지) +
+  DAG 뷰(`@xyflow/react`) + 타임라인 스윔레인.
+- ✅ 성공 기준: 2스프린트 `RealCli` 런에서 mid-sprint designer 스왑이 ack 완주하고 사람
+  개입 0회로 끝남(178.97s).
+
+**M7 — 승인함/아티팩트/전역검색 + 가변 로스터** ✅ 완료 (2026-08-30, 실측: `docs/SPIKE-M7.md`)
+- `human.gate` 승인함, 아티팩트/디프+REQ 매트릭스, SQLite FTS5 전역 검색, `crew_agents`/
+  `validate_roster` 기반 가변 로스터 스폰.
+- ✅ 성공 기준: 3인팀(lead+developer+qa) `RealCli` 런이 1스프린트를 완주(78.87s).
+
+**M8 — 적응형 동시성 세마포어 + Pi 하네스** ✅ 완료 (2026-08-31, 실측: `docs/SPIKE-M8.md`)
+- rate-limit 신호 기반 세마포어 한도 축소/쿨다운/lazy 회복, Pi(RPC 모드) 하네스로 opencode
+  스텁을 대체.
+- ✅ 성공 기준: 실제 pi 프로세스 1턴 라운드트립 통과(6.70s).
+
+**M9 — 스폰 세션 유저 훅 차단 + Cmd DoD 실행기** ✅ 완료 (2026-08-31, 실측: `docs/SPIKE-M9.md`)
+- 스폰된 claude 세션의 유저 전역 Stop 훅 차단(`with_setting_sources`), `cmd` DoD 위치별
+  허용목록 argv 실행기(§4.2)와 `dod_exec::judge/3` 판정 신설. **단 이 시점엔 어떤 플래너
+  경로도 `DodCheck::Cmd`를 방출하지 않아 실 런에서는 여전히 휴면**(M10에서 해소).
+- ✅ 성공 기준: 스폰 세션에서 `hook_started` 이벤트 9→0(claude 2.1.236 실측).
+
+**M10 — 타임아웃 프로세스 그룹 kill + Cmd DoD 플래너 방출** ✅ 완료 (2026-08-31, 실측: `docs/SPIKE-M10.md`)
+- 타임아웃과 `ProcessGroupGuard::Drop` 양쪽에서 `killpg`로 자식 프로세스 그룹 전체를 죽여
+  손자 프로세스 잔존을 막고(함정 26 해소), `plan_dag_with(dev_cmd_checks)`가 Developer
+  태스크에 `DodCheck::Cmd`를 이어붙이게 함(§4.2 — 기본값은 여전히 빈 벡터라 방출 없음).
+- ✅ 성공 기준: FIX ON에서 잔여 `sleep 300` 프로세스 0개(FIX OFF는 1개 생존).
+
+**M11 — `project_root` 필드 도입 + 실행 cwd 배선** ✅ 완료 (2026-08-31, 실측: `docs/SPIKE-M11.md`)
+- `RunConfig.project_root: Option<PathBuf>` 신설(기본 `None`, M10까지 동작 유지) +
+  `RunController::start` 선행 검증(절대경로·존재 디렉토리) + 실행 cwd 배선. **이 시점의
+  cwd 배선은 역할별로 분리돼 있지 않았다**(§4.2 참고 — M12 t4가 역할별 worktree로 교체).
+- ✅ 성공 기준: `project_root: Some(<레포 루트>)`일 때 `cargo test` exit `0`
+  (394 passed / 0 failed / 9 ignored).
+
+**M12 — 슬랙형 멀티채널 개편 + `project_root` 배선 완결** ✅ 완료 (2026-09-03, 실측: HANDOFF §3.5, run-id slk1)
+- 8태스크 런: 동시 다중 런(`AppState.runs`), presence(👀 읽음·입력 중), `create_project`+
+  도구 감지, **역할별 리포 밖 git worktree로 함정 30 봉쇄**(t4, §4.2·§6 참고), 임베디드 PTY
+  터미널(`portable-pty`+xterm.js), 채널=런 슬랙형 셸(기존 보드/DAG/타임라인/레일/검색/
+  커맨드바 5뷰를 대체 — `features/dag`·`features/timeline`·`features/inbox`·
+  `features/artifacts`·`features/search` 삭제), ChatPane+ThreadPanel+게이트 인라인+채널검색,
+  온보딩 위저드+설정.
+- 이번 2차 런(issue #13)이 `create_project`가 만든 프로젝트 경로를 `start_run`에 실제로
+  연결해 역할별 worktree 격리와 `.crew/artifacts` 규약 주입을 발화시켰다(§4.2 GUI 배선,
+  §6 참고). **Lead의 스프린트 종료 순차 머지는 여전히 미구현**(3차 이월 — §6 참고,
+  `grep -rn 'change_request' crates/crew-run/src` → 0 hits).
+- ✅ 성공 기준: `cargo test --workspace` 425/0, src-tauri 66/0, `tsc --noEmit` rc=0,
+  `vitest run` 220/220(통합 브랜치 `orch-projroot-integ` @ `a9f8475` 실측).
+
 **3단계(후순위)**: ed25519 서명, 원격 릴레이, 사람 참여, 모바일.
 
 ---
@@ -480,6 +579,19 @@ decisions(id, run_id, text, rationale, made_by, ts)  -- L1 컨텍스트 소스
    이미지 생성 하네스는 붙이지 않는다. 퍼블리셔가 토큰 일치 여부를 기계적으로 대조할 수 있다.
 4. ~~사람 개입 지점~~ **결정됨: 완전 자율 + 예외만 에스컬레이션.**
    스프린트 경계 승인 게이트 없음. 대신 §4.4의 자율 안전장치로 리스크를 막는다.
+6. ~~프론트엔드 프레임워크~~ **결정됨: React + Vite.** `apps/crew-app/package.json`이
+   `react`를 의존성으로 신고 있다(코드 근거) — 이 아래 추천안이 그대로 채택됐다.
+
+   **추천(2026-08-27, 리서치 기반)**: **React + Vite**.
+   근거 — Tauri 2 공식 보일러플레이트 생태계에서 React+Vite 조합이 "가장 흔한 조합"으로
+   소개되어 예제·트러블슈팅 자료가 가장 풍부할 가능성이 높고 [docs/RESEARCH.md §7][R22],
+   DAG 뷰(§7 UI 요구)에 필요한 `xyflow`가 React Flow/Svelte Flow를 동일 팀·동일 API
+   철학으로 유지보수해 두 프레임워크 모두 DAG 시각화는 검증된 선택지였다 [docs/RESEARCH.md
+   §7][R27]. 1인 개발 생산성 기준으로는 React 생태계 자료량이 더 많을 가능성이 있다는
+   정황은 있었으나 이를 정량 비교한 출처는 찾지 못했다 [docs/RESEARCH.md §7].
+   **검토했던 대안**: Svelte — 번들 크기가 더 작다는 서술이 반복적으로 확인됐으나
+   [docs/RESEARCH.md §7][R22][R23][R26], Tauri 앱 자체가 이미 Electron 대비 5~10MB로
+   작아(§10) 번들 크기 이점의 체감 효과가 제한적이라는 게 React를 우선한 이유였다.
 
 ### 남은 미결
 5. 앱/프로젝트 이름 (`agent-crew` 가칭)
@@ -496,21 +608,6 @@ decisions(id, run_id, text, rationale, made_by, ts)  -- L1 컨텍스트 소스
    멀티 CLI 오케스트레이터가 이미 2개 존재)·상용 제품명 충돌·동명이인(다른 도메인) 문제가
    확인되어 추천에서 제외했다 [docs/RESEARCH.md §6]. 이것은 추천이며 결정이 아니다 —
    최종 선택은 사용자 몫이다.
-
-6. 프론트엔드 프레임워크 (Tauri 안에서 React vs Svelte vs 순수 TS)
-
-   **추천(2026-08-27, 리서치 기반)**: **React + Vite**.
-   근거 — Tauri 2 공식 보일러플레이트 생태계에서 React+Vite 조합이 "가장 흔한 조합"으로
-   소개되어 예제·트러블슈팅 자료가 가장 풍부할 가능성이 높고 [docs/RESEARCH.md §7][R22],
-   DAG 뷰(§7 UI 요구)에 필요한 `xyflow`가 React Flow/Svelte Flow를 동일 팀·동일 API
-   철학으로 유지보수해 두 프레임워크 모두 DAG 시각화는 검증된 선택지다 [docs/RESEARCH.md
-   §7][R27]. 1인 개발 생산성 기준으로는 React 생태계 자료량이 더 많을 가능성이 있다는
-   정황은 있으나 이를 정량 비교한 출처는 찾지 못했다 [docs/RESEARCH.md §7].
-   **대안**: Svelte — 번들 크기가 더 작다는 서술이 반복적으로 확인되고
-   [docs/RESEARCH.md §7][R22][R23][R26], Tauri 앱 자체가 이미 Electron 대비 5~10MB로
-   작아(§10) 번들 크기 이점의 체감 효과가 제한적이라는 게 이번 추천에서 React를 우선한
-   이유다. **트레이드오프**: 팀이 나중에 커지거나 번들 크기가 실제 병목으로 확인되면
-   Svelte로 전환하는 옵션은 열려 있다 — 이것은 추천이며 결정이 아니다.
 
 ---
 
@@ -549,9 +646,11 @@ decisions(id, run_id, text, rationale, made_by, ts)  -- L1 컨텍스트 소스
 
 ### 13.5 유사 OSS 대조 및 이름/FE 추천 요약
 
-- §12 미해결 1~4번(결정됨)을 뒤집는 근거는 조사 범위에서 발견되지 않았다.
+- §12 1~4번·6번(모두 결정됨)을 뒤집는 근거는 조사 범위에서 발견되지 않았다.
 - 유사 OSS 조사([docs/RESEARCH.md §5](RESEARCH.md)) 결과, "여러 구독 CLI를 팀으로 묶는다"는
   문제의식 자체는 이미 여러 프로젝트가 다루고 있어 agent-crew의 차별점은 DAG+DoD 자동 진행
   루프, change_request 왕복 제한, Tauri 통합 UI 조합에 있다는 것이 이번 조사로 뒷받침된다.
-- §12 미해결 5(이름)·6(프론트엔드)의 리서치 기반 추천안은 §12 해당 항목 아래에 직접
-  기록했다 (형식: 추천 + 근거 [R-n] + 대안 + 트레이드오프, "결정" 아님).
+- §12 미해결 5(이름)의 리서치 기반 추천안은 §12 해당 항목 아래에 직접 기록했다
+  (형식: 추천 + 근거 [R-n] + 대안 + 트레이드오프, "결정" 아님). 6(프론트엔드)의 같은 형식
+  추천안은 2차 런(issue #13) 시점 기준 이미 결정으로 채택돼 있었다(`package.json`의
+  `react` 의존성이 근거).
