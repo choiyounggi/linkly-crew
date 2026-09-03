@@ -16,11 +16,10 @@
 }
 
 .sidebar__title {
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-bold);
   color: var(--ink-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
 }
 
 .sidebar__empty {
@@ -57,7 +56,8 @@
   background: transparent;
   border: none;
   border-radius: var(--radius-sm);
-  padding: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  min-height: var(--control-h-sm);
   color: var(--ink-dim);
   font-family: var(--font-sans);
   font-size: var(--font-size-sm);
@@ -66,24 +66,32 @@
 }
 
 .sidebar__channel-label {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.sidebar__channel .badge {
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .sidebar__channel:hover {
-  background: var(--surface-raised);
+  background: color-mix(in oklab, var(--ink-text) 6%, transparent);
   color: var(--ink-text);
 }
 
 .sidebar__channel:focus-visible {
-  outline: thin solid var(--color-accent);
-  outline-offset: 0;
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
-.sidebar__channel--active {
-  background: var(--surface-raised);
-  color: var(--ink-text);
+.sidebar__channel--active,
+.sidebar__channel--active:hover {
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
 }
 
 .sidebar__footer {

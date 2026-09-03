@@ -90,6 +90,25 @@ function findNonOklchColors(css) {
 }
 
 /**
+ * Returns every `box-shadow:` declaration value that does not reference a
+ * `--shadow-*` token and still carries a color literal (hex/rgb/hsl/oklch/oklab)
+ * outside of any `var(--...)` reference — i.e. a shadow whose color is
+ * hand-authored instead of drawn from the token scale.
+ */
+function findLiteralShadowColors(css) {
+  const hits = [];
+  for (const m of css.matchAll(/box-shadow:\s*([^;]+);/g)) {
+    const value = m[1].trim();
+    if (/var\(--shadow-[a-zA-Z0-9-]+\)/.test(value)) continue;
+    const strippedVars = value.replace(/var\(--[a-zA-Z0-9-]+\)/g, "");
+    if (/#[0-9a-fA-F]{3,8}\b|rgba?\(|hsla?\(|oklch\(|oklab\(/.test(strippedVars)) {
+      hits.push(value);
+    }
+  }
+  return hits;
+}
+
+/**
  * CSS specificity per the cascade spec, as (id, class-or-pseudo-class, type)
  * counts, computed for a single compound selector (no combinators besides
  * whitespace-separated descendant chains; no :not()/:is() argument parsing —
@@ -183,6 +202,22 @@ describe("findNonOklchColors (detector fixtures)", () => {
 
   it("does not flag an oklch() color", () => {
     expect(findNonOklchColors(".x { color: oklch(50% 0 0); }")).toEqual([]);
+  });
+});
+
+describe("findLiteralShadowColors (detector fixtures)", () => {
+  it("flags a box-shadow with a literal rgba color", () => {
+    expect(findLiteralShadowColors(".x {\n  box-shadow: 0 1px 2px rgba(0,0,0,.2);\n}\n")).toEqual([
+      "0 1px 2px rgba(0,0,0,.2)",
+    ]);
+  });
+
+  it("does not flag a box-shadow that references a --shadow token", () => {
+    expect(findLiteralShadowColors(".x {\n  box-shadow: var(--shadow-sm);\n}\n")).toEqual([]);
+  });
+
+  it("does not flag a box-shadow whose only color-looking segment is var(--x)", () => {
+    expect(findLiteralShadowColors(".x {\n  box-shadow: 0 0 0 2px var(--surface-paper);\n}\n")).toEqual([]);
   });
 });
 
@@ -280,6 +315,20 @@ describe("CSS integrity (apps/crew-app/src)", () => {
     const tokensFile = cssFiles.find((f) => f.path === "styles/tokens.css");
     expect(tokensFile, "expected to find styles/tokens.css under src/").toBeTruthy();
     expect(findNonOklchColors(tokensFile.text)).toEqual([]);
+  });
+
+  it("no css file uses hex/rgb/hsl colors", () => {
+    const hits = cssFiles.flatMap(({ path: filePath, text }) =>
+      findNonOklchColors(text).map((value) => `${filePath}: ${value}`),
+    );
+    expect(hits).toEqual([]);
+  });
+
+  it("every box-shadow uses a --shadow token", () => {
+    const hits = cssFiles.flatMap(({ path: filePath, text }) =>
+      findLiteralShadowColors(text).map((value) => `${filePath}: ${value}`),
+    );
+    expect(hits).toEqual([]);
   });
 
   it.each([
