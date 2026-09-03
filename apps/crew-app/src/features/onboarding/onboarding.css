@@ -3,7 +3,7 @@
  * referencing it) but no longer redefines any custom property; the light
  * theme itself was removed. */
 .onboarding-light {
-  background: var(--surface-panel);
+  background: var(--surface-paper);
   color: var(--ink-text);
 }
 
