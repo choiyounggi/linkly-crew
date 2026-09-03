@@ -42,6 +42,7 @@ fn config(data_dir: PathBuf, project_root: Option<PathBuf>) -> RunConfig {
         roster: None,
         dev_cmd_checks: vec![],
         project_root,
+        turn_timeout_secs: 900,
     }
 }
 

@@ -377,6 +377,31 @@ E0004 비망라 — 머지 후 통합 테스트가 잡아 1줄로 해소(`core.r
 
 ---
 
+## 3.6. M13 — 턴 타임아웃 복구·로그 파일 (2026-09-03, run-id fxd1)
+
+**결함(`ledger.sqlite` run `66bb1a79-…` 실측)**: `task.assign` 04:13:19Z → 정확히 120초 뒤
+`blocked: role turn failed: timeout` → 이후 승인마다 `harness send error: failed to write
+turn to child stdin: Broken pipe (os error 32)` 반복 — `claude.rs::send`가 타임아웃 시 자식을
+kill하지만 `RoleHarnessBehavior`/`DesignerHarnessBehavior`가 죽은 `Session`을 계속 들고 있었다.
+
+**수정**: (D1) `Ok(Failed{..})`/`Err(_)` 시 두 behavior 모두 `discard_session()`으로 세션 폐기,
+다음 envelope에서 lazy respawn(자동 재시도는 안 만듦 — 게이트 승인이 재시도, 사용자 결정).
+(D3) `RunConfig.turn_timeout_secs`(기본 900=deadline_ms/1000) 노브를
+`with_turn_timeout`/`specify_with_timeout`로 threading, `DEFAULT_TURN_TIMEOUT` 120→900s.
+(D4) `turn_timeout_secs: 0` → `RunError::ConfigInvalid`, 스폰 전 거부.
+(D5) Tauri에 tracing-subscriber+tracing-appender 로그 싱크(`~/.linkly-crew/logs/crew-app.log`,
+daily-rolling, non-blocking, `WorkerGuard`는 `app.manage` 보관).
+
+**검증(실측)**: `cargo test --workspace` passed=439 failed=0,
+`(cd apps/crew-app/src-tauri && cargo test)` passed=70 failed=0(1 ignored), `cargo check` OK.
+(`runner::tests::presence_read_...`는 이 태스크가 건드리지 않은 `runner.rs`의 기존 WS 레이스로
+단독 실행에도 간헐 실패(원인 불명, 이 diff와 무관) — 재실행으로 그린 확보)
+
+**남은 것**: 자동 재시도·GUI 타임아웃 노브 노출 둘 다 안 함(요청 범위 밖). 실제 `tauri dev` 기동
+스모크는 무인 세션 GUI 팝업을 피해 생략 — `log_dir()` 단위 테스트로 대체.
+
+---
+
 ## 4. 다음 스텝 — M11 완료 후 잔여
 
 M1~M12 완료·실측 검증됨(§3, §3.5).

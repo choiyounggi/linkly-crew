@@ -320,6 +320,7 @@ async fn spawn_sprint(
     l1: Option<&str>,
     max_rework: u32,
     escalation_timeout_ms: u64,
+    turn_timeout: Duration,
     cumulative: Arc<Mutex<HashMap<String, TaskState>>>,
     ts_tx: mpsc::UnboundedSender<TaskStateChange>,
 ) -> Result<SpawnedSprint, RunError> {
@@ -376,7 +377,8 @@ async fn spawn_sprint(
                 // check). `with_pool` acquires/drops the permit around each
                 // turn's spawn+send instead.
                 let mut behavior = RoleHarnessBehavior::new(harness, harness_cfg, role, system_hint)
-                    .with_pool(pool.clone(), harness_id.clone());
+                    .with_pool(pool.clone(), harness_id.clone())
+                    .with_turn_timeout(turn_timeout);
                 if let Some(text) = l1 {
                     behavior = behavior.with_injected_context(text.to_string());
                 }
@@ -536,6 +538,16 @@ pub struct RunController;
 
 impl RunController {
     pub async fn start(cfg: RunConfig) -> Result<RunHandle, RunError> {
+        // Validated before anything else (M13 turn-recovery fix D4) — `0`
+        // would make every turn instantly time out; a misconfiguration must
+        // not silently become that.
+        if cfg.turn_timeout_secs == 0 {
+            return Err(RunError::ConfigInvalid(
+                "turn_timeout_secs must be > 0".to_string(),
+            ));
+        }
+        let turn_timeout = Duration::from_secs(cfg.turn_timeout_secs);
+
         // Validated before anything else, including the roster check right
         // below (contracts-m11.md §I2) — same rationale: a rejected config
         // leaves zero partial run state. No fallback to the scratch cwd on
@@ -598,7 +610,7 @@ impl RunController {
                             "no harness adapter for lead harness id \"{harness_id}\" or fallback \"claude-code\""
                         ))
                     })?;
-                LlmLeadPlanner::specify(harness, &cfg.goal).await?
+                LlmLeadPlanner::specify_with_timeout(harness, &cfg.goal, turn_timeout).await?
             }
         };
         // present = crew_agents' roles (contracts-m7.md §E4) — the LLM path
@@ -739,6 +751,7 @@ impl RunController {
             None,
             cfg.max_rework,
             cfg.escalation_timeout_ms,
+            turn_timeout,
             cumulative.clone(),
             ts_tx.clone(),
         )
@@ -795,6 +808,7 @@ impl RunController {
                         Some(&l1),
                         max_rework,
                         escalation_timeout_ms,
+                        turn_timeout,
                         cumulative.clone(),
                         ts_tx.clone(),
                     )
@@ -1554,6 +1568,7 @@ mod live_controls_wiring_tests {
             roster: None,
             dev_cmd_checks: Vec::new(),
             project_root: None,
+            turn_timeout_secs: 900,
         }
     }
 

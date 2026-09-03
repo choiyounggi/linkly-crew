@@ -49,6 +49,11 @@ pub struct RunConfig {
     /// executes agent-authored code by design; the containment is this
     /// human-designated tree, not the argv allowlist.
     pub project_root: Option<PathBuf>,
+    /// Per-turn timeout (seconds) for every role worker's CLI turn and the
+    /// Lead's LLM `specify` call (M13 turn-recovery fix D3). Default 900 —
+    /// matches the task deadline (`deadline_ms` 900_000). `0` is rejected by
+    /// `start_run` as `RunError::ConfigInvalid` before any spawn.
+    pub turn_timeout_secs: u64,
 }
 
 /// Default Rust-domain dev cmd checks that satisfy `CmdPolicy`'s positional
@@ -148,6 +153,11 @@ pub enum RunError {
     /// fallback reproduces M10's exit-101 confusion (docs/SPIKE-M10.md §3).
     #[error("project_root invalid: {0}")]
     ProjectRootInvalid(String),
+    /// `RunConfig` failed startup validation before any spawn (M13
+    /// turn-recovery fix D4) — e.g. `turn_timeout_secs == 0`, which would
+    /// otherwise make every turn instantly time out.
+    #[error("invalid run config: {0}")]
+    ConfigInvalid(String),
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 //! wired to `AppState` and the `"run://event"` pump.
 
 mod core;
+mod logging;
 mod onboarding;
 mod project;
 mod pty;
@@ -191,6 +192,9 @@ async fn list_projects() -> Result<Vec<project::ProjectInfo>, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let log_guard = logging::init();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "crew-app started");
+
     tauri::Builder::default()
         // Native folder picker for the workspace path field — the frontend
         // calls this plugin's `open({directory: true})`, so the permission
@@ -199,6 +203,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .manage(pty::PtyRegistry::default())
+        .manage(log_guard)
         .invoke_handler(tauri::generate_handler![
             start_run,
             stop_run,

@@ -57,6 +57,7 @@ fn scripted_config(data_dir: PathBuf, roster: Option<Roster>) -> RunConfig {
         roster,
         dev_cmd_checks: Vec::new(),
         project_root: None,
+        turn_timeout_secs: 900,
     }
 }
 
@@ -260,6 +261,7 @@ async fn real_cli_three_person_team_completes_one_sprint() {
         roster: Some(three_person_roster()),
         dev_cmd_checks: Vec::new(),
         project_root: None,
+        turn_timeout_secs: 900,
     };
 
     let real_start_timeout = Duration::from_secs(300);
@@ -304,6 +306,7 @@ async fn real_cli_three_person_team_completes_one_sprint_with_cmd_exec_wired() {
         roster: Some(three_person_roster()),
         dev_cmd_checks: Vec::new(),
         project_root: None,
+        turn_timeout_secs: 900,
     };
 
     let real_start_timeout = Duration::from_secs(300);

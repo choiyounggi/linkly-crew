@@ -43,6 +43,7 @@ fn config(
         roster: None,
         dev_cmd_checks: Vec::new(),
         project_root: None,
+        turn_timeout_secs: 900,
     }
 }
 

@@ -8,6 +8,7 @@
 //! fallback to the deterministic template.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crew_agent::extract_json;
 use crew_harness::{AgentCfg, Harness, HarnessEvent, TurnOutcome, UserTurn, DEFAULT_TURN_TIMEOUT};
@@ -22,12 +23,19 @@ pub struct LlmLeadPlanner;
 
 impl LlmLeadPlanner {
     /// Same signature/output contract as `LeadPlanner::specify`
-    /// (contracts-m5.md §C3c verbatim), but spawns a fresh session on
-    /// `harness`, sends one turn asking for structured JSON, and parses the
-    /// reply into a [`SpecDoc`]. Real-CLI only — never called from
-    /// worker/CI tests (those use fake-CLI fixtures via `ClaudeCodeHarness::
-    /// with_binary`, see `crew-lead/tests/m5_plan_llm.rs`).
+    /// (contracts-m5.md §C3c verbatim) with `DEFAULT_TURN_TIMEOUT`. See
+    /// `specify_with_timeout` for the body and the run-configurable knob
+    /// (M13 turn-recovery fix D3).
     pub async fn specify(harness: Arc<dyn Harness>, request: &str) -> Result<SpecDoc, PlanError> {
+        Self::specify_with_timeout(harness, request, DEFAULT_TURN_TIMEOUT).await
+    }
+
+    /// Spawns a fresh session on `harness`, sends one turn asking for
+    /// structured JSON (bounded by `timeout`), and parses the reply into a
+    /// [`SpecDoc`]. Real-CLI only — never called from worker/CI tests (those
+    /// use fake-CLI fixtures via `ClaudeCodeHarness::with_binary`, see
+    /// `crew-lead/tests/m5_plan_llm.rs`).
+    pub async fn specify_with_timeout(harness: Arc<dyn Harness>, request: &str, timeout: Duration) -> Result<SpecDoc, PlanError> {
         let goal = request.trim();
         if goal.is_empty() {
             return Err(PlanError::EmptyRequest);
@@ -56,7 +64,7 @@ impl LlmLeadPlanner {
                 UserTurn {
                     text: build_prompt(goal),
                 },
-                DEFAULT_TURN_TIMEOUT,
+                timeout,
             )
             .await;
 

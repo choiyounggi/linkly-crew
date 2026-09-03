@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use crew_harness::{
@@ -50,6 +51,16 @@ impl DesignerHarnessBehavior {
             self.events = Some(events);
         }
         Ok(())
+    }
+
+    /// Drops the dead session after a failed turn (shutting it down) so the
+    /// next envelope's `ensure_session` respawns a fresh CLI process instead
+    /// of writing to a dead pipe (M13 turn-recovery fix, D1).
+    async fn discard_session(&mut self) {
+        if let Some(s) = self.session.take() {
+            let _ = self.harness.shutdown(s).await;
+        }
+        self.events = None;
     }
 
     fn build_prompt(&self, env: &Envelope) -> String {
@@ -274,9 +285,15 @@ impl RoleBehavior for DesignerHarnessBehavior {
                 None => self.blocked(&env, "designer turn produced no parseable JSON reply".to_string()),
             },
             Ok(TurnOutcome::Failed { error }) => {
+                self.discard_session().await;
+                tracing::warn!(reason = %error, "turn failed; session discarded — next turn respawns");
                 self.blocked(&env, format!("designer turn failed: {error}"))
             }
-            Err(e) => self.blocked(&env, format!("harness send error: {e}")),
+            Err(e) => {
+                self.discard_session().await;
+                tracing::warn!(reason = %e, "turn failed; session discarded — next turn respawns");
+                self.blocked(&env, format!("harness send error: {e}"))
+            }
         }
     }
 
@@ -311,6 +328,10 @@ pub struct RoleHarnessBehavior {
     /// once the harness's concurrency limit is exceeded).
     pool: Option<Arc<crew_harness::HarnessPool>>,
     pool_harness_id: Option<String>,
+    /// M13 turn-recovery fix (D3): the per-turn timeout passed to
+    /// `Harness::send`. Defaults to `DEFAULT_TURN_TIMEOUT`; a run's actual
+    /// value comes from `RunConfig.turn_timeout_secs` via `with_turn_timeout`.
+    turn_timeout: Duration,
 }
 
 impl RoleHarnessBehavior {
@@ -325,6 +346,7 @@ impl RoleHarnessBehavior {
             injected_context: None,
             pool: None,
             pool_harness_id: None,
+            turn_timeout: DEFAULT_TURN_TIMEOUT,
         }
     }
 
@@ -345,6 +367,14 @@ impl RoleHarnessBehavior {
         self
     }
 
+    /// Sets the per-turn timeout passed to `Harness::send` (M13 turn-
+    /// recovery fix D3) — the run's `RunConfig.turn_timeout_secs`.
+    pub fn with_turn_timeout(mut self, timeout: Duration) -> Self {
+        tracing::info!(secs = timeout.as_secs(), "turn timeout");
+        self.turn_timeout = timeout;
+        self
+    }
+
     async fn ensure_session(&mut self) -> Result<(), crew_harness::HarnessError> {
         if self.session.is_none() {
             let mut session = self.harness.spawn(&self.cfg).await?;
@@ -353,6 +383,16 @@ impl RoleHarnessBehavior {
             self.events = Some(events);
         }
         Ok(())
+    }
+
+    /// Drops the dead session after a failed turn (shutting it down) so the
+    /// next envelope's `ensure_session` respawns a fresh CLI process instead
+    /// of writing to a dead pipe (M13 turn-recovery fix, D1).
+    async fn discard_session(&mut self) {
+        if let Some(s) = self.session.take() {
+            let _ = self.harness.shutdown(s).await;
+        }
+        self.events = None;
     }
 
     /// Builds this turn's prompt, or an `Err(reason)` if `env` is a
@@ -497,7 +537,7 @@ impl RoleBehavior for RoleHarnessBehavior {
         let session = self.session.as_mut().expect("ensure_session set it");
         let outcome = self
             .harness
-            .send(session, UserTurn { text: prompt }, DEFAULT_TURN_TIMEOUT)
+            .send(session, UserTurn { text: prompt }, self.turn_timeout)
             .await;
         drop(permit);
 
@@ -523,9 +563,15 @@ impl RoleBehavior for RoleHarnessBehavior {
                         pool.report_rate_limit(harness_id);
                     }
                 }
+                self.discard_session().await;
+                tracing::warn!(role = ?self.role, reason = %error, "turn failed; session discarded — next turn respawns");
                 self.blocked(&env, format!("role turn failed: {error}"))
             }
-            Err(e) => self.blocked(&env, format!("harness send error: {e}")),
+            Err(e) => {
+                self.discard_session().await;
+                tracing::warn!(role = ?self.role, reason = %e, "turn failed; session discarded — next turn respawns");
+                self.blocked(&env, format!("harness send error: {e}"))
+            }
         }
     }
 
@@ -674,6 +720,516 @@ mod role_harness_behavior_tests {
             .build_prompt(&env)
             .expect_err("missing body[\"task\"] must not build a prompt");
         assert!(err.contains("task"));
+    }
+}
+
+/// M13 turn-recovery fix (D1/D2/D6/D9): a failed turn (`Ok(Failed{..})` or
+/// any `Err(HarnessError)`) must drop the dead session so the next envelope
+/// respawns, for both `RoleHarnessBehavior` and `DesignerHarnessBehavior`;
+/// a `Success` outcome must keep the session alive (no spurious respawn).
+/// `Session` has no public constructor outside crew-harness (see
+/// `crates/crew-agent/tests/control.rs`'s `FailingHarness` doc comment), so
+/// `ScriptedHarness` below wraps a real `ClaudeCodeHarness` driving the
+/// `fake-role-claude.sh` fixture (a real subprocess, real events, so
+/// `drain_until_terminal` never hangs) and only overrides the *value
+/// returned to the caller* per a scripted queue; `spawn`/`shutdown` counts
+/// are real `AtomicUsize`s, proving genuine respawn and cleanup.
+#[cfg(test)]
+mod turn_recovery_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use crew_harness::claude::ClaudeCodeHarness;
+    use crew_harness::HarnessError;
+    use crew_proto::{ArtifactContract, DodCheck, ReqId, Role, TaskSpec};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    fn fake_cli_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-role-claude.sh")
+    }
+
+    fn assistant_line(text: &str) -> String {
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }
+        })
+        .to_string()
+    }
+
+    fn agent_cfg() -> AgentCfg {
+        AgentCfg {
+            cwd: std::env::current_dir().expect("current dir"),
+            model: None,
+        }
+    }
+
+    fn make_task_spec() -> TaskSpec {
+        TaskSpec {
+            id: "t1".to_string(),
+            role: Role::Developer,
+            title: "Build the landing page".to_string(),
+            brief: "Build a simple landing page".to_string(),
+            dod: vec![DodCheck::ReqCover {
+                ids: vec![ReqId::new("REQ-1").unwrap()],
+            }],
+            deps: vec![],
+            artifacts_expected: vec![ArtifactContract {
+                name: "index.html".to_string(),
+                kind: "code".to_string(),
+                req_ids: vec![ReqId::new("REQ-1").unwrap()],
+            }],
+        }
+    }
+
+    fn task_assign(task: &TaskSpec) -> Envelope {
+        Envelope::new(
+            "sp-3".to_string(),
+            "th-1".to_string(),
+            "agent:lead".to_string(),
+            vec!["agent:developer".to_string()],
+            MessageKind::TaskAssign,
+            None,
+            "req_01".to_string(),
+            json!({ "task": task }),
+            vec![],
+            true,
+            900_000,
+        )
+    }
+
+    /// M2 designer envelope shape — no `task` key, just `req_ids`/`brief`.
+    fn designer_task_assign() -> Envelope {
+        Envelope::new(
+            "sp-3".to_string(),
+            "th-1".to_string(),
+            "agent:lead".to_string(),
+            vec!["agent:designer".to_string()],
+            MessageKind::TaskAssign,
+            None,
+            "req_01".to_string(),
+            json!({ "req_ids": ["REQ-1"], "brief": "Design the landing page" }),
+            vec![],
+            true,
+            900_000,
+        )
+    }
+
+    /// One scripted `send` outcome — decoupled from the real transport (the
+    /// fixture always completes a real, successful turn, so events keep
+    /// flowing); only the value returned to the caller is overridden.
+    enum ScriptedTurn {
+        Real,
+        Failed(&'static str),
+        WriteBrokenPipe,
+        ProcessExited,
+    }
+
+    struct ScriptedHarness {
+        inner: ClaudeCodeHarness,
+        script: AsyncMutex<VecDeque<ScriptedTurn>>,
+        spawn_count: AtomicUsize,
+        shutdown_count: AtomicUsize,
+    }
+
+    impl ScriptedHarness {
+        fn new(script: Vec<ScriptedTurn>) -> Self {
+            let text = r#"{"covered_req_ids": ["REQ-1"], "artifacts": []}"#;
+            Self {
+                inner: ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+                    .with_env("FAKE_MODE", "json")
+                    .with_env("FAKE_ASSISTANT_1", assistant_line(text)),
+                script: AsyncMutex::new(script.into_iter().collect()),
+                spawn_count: AtomicUsize::new(0),
+                shutdown_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn spawn_count(&self) -> usize {
+            self.spawn_count.load(Ordering::SeqCst)
+        }
+
+        fn shutdown_count(&self) -> usize {
+            self.shutdown_count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Harness for ScriptedHarness {
+        fn id(&self) -> crew_harness::HarnessId {
+            self.inner.id()
+        }
+
+        async fn spawn(&self, cfg: &AgentCfg) -> Result<Session, HarnessError> {
+            self.spawn_count.fetch_add(1, Ordering::SeqCst);
+            self.inner.spawn(cfg).await
+        }
+
+        async fn send(
+            &self,
+            session: &mut Session,
+            turn: UserTurn,
+            timeout: Duration,
+        ) -> Result<TurnOutcome, HarnessError> {
+            // Always run the real turn so the fixture's events actually flow
+            // (drain_until_terminal needs a terminal event or it hangs
+            // forever) — only the value handed back to the caller follows
+            // the script.
+            let real = self.inner.send(session, turn, timeout).await;
+            match self.script.lock().await.pop_front() {
+                None | Some(ScriptedTurn::Real) => real,
+                Some(ScriptedTurn::Failed(error)) => Ok(TurnOutcome::Failed {
+                    error: error.to_string(),
+                }),
+                Some(ScriptedTurn::WriteBrokenPipe) => Err(HarnessError::Write(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated broken pipe",
+                ))),
+                Some(ScriptedTurn::ProcessExited) => Err(HarnessError::ProcessExited),
+            }
+        }
+
+        fn take_events(&self, session: &mut Session) -> mpsc::Receiver<HarnessEvent> {
+            self.inner.take_events(session)
+        }
+
+        async fn snapshot(&self, session: &Session) -> Result<HandoffSnapshot, HarnessError> {
+            self.inner.snapshot(session).await
+        }
+
+        async fn shutdown(&self, session: Session) -> Result<(), HarnessError> {
+            self.shutdown_count.fetch_add(1, Ordering::SeqCst);
+            self.inner.shutdown(session).await
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // RoleHarnessBehavior
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn role_respawns_after_failed_timeout_then_succeeds() {
+        let harness = Arc::new(ScriptedHarness::new(vec![ScriptedTurn::Failed("timeout"), ScriptedTurn::Real]));
+        let mut behavior = RoleHarnessBehavior::new(
+            harness.clone(),
+            agent_cfg(),
+            Role::Developer,
+            "You are the Developer.".to_string(),
+        );
+        let task = make_task_spec();
+
+        let first = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].kind, MessageKind::Blocked);
+        assert!(
+            first[0].body["reason"].as_str().unwrap().starts_with("role turn failed: "),
+            "reason string must stay exactly `role turn failed: ...`: {:?}",
+            first[0].body["reason"]
+        );
+
+        let second = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(
+            second[1].kind,
+            MessageKind::TaskResult,
+            "second turn must succeed on a fresh session"
+        );
+
+        assert_eq!(harness.spawn_count(), 2, "the dead session must be discarded and a fresh one spawned");
+        assert_eq!(harness.shutdown_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn role_respawns_after_write_broken_pipe_err() {
+        let harness = Arc::new(ScriptedHarness::new(vec![ScriptedTurn::WriteBrokenPipe, ScriptedTurn::Real]));
+        let mut behavior = RoleHarnessBehavior::new(
+            harness.clone(),
+            agent_cfg(),
+            Role::Developer,
+            "You are the Developer.".to_string(),
+        );
+        let task = make_task_spec();
+
+        let first = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(first[0].kind, MessageKind::Blocked);
+        assert!(first[0].body["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("harness send error: failed to write turn to child stdin: "));
+
+        let second = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(second[1].kind, MessageKind::TaskResult);
+
+        assert_eq!(harness.spawn_count(), 2);
+        assert_eq!(harness.shutdown_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn role_respawns_after_process_exited_err() {
+        let harness = Arc::new(ScriptedHarness::new(vec![ScriptedTurn::ProcessExited, ScriptedTurn::Real]));
+        let mut behavior = RoleHarnessBehavior::new(
+            harness.clone(),
+            agent_cfg(),
+            Role::Developer,
+            "You are the Developer.".to_string(),
+        );
+        let task = make_task_spec();
+
+        let first = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(first[0].kind, MessageKind::Blocked);
+        assert_eq!(
+            first[0].body["reason"],
+            json!("harness send error: child process exited before a result event arrived")
+        );
+
+        let second = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(second[1].kind, MessageKind::TaskResult);
+
+        assert_eq!(harness.spawn_count(), 2);
+        assert_eq!(harness.shutdown_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn role_reuses_session_across_consecutive_successes() {
+        let harness = Arc::new(ScriptedHarness::new(vec![ScriptedTurn::Real, ScriptedTurn::Real]));
+        let mut behavior = RoleHarnessBehavior::new(
+            harness.clone(),
+            agent_cfg(),
+            Role::Developer,
+            "You are the Developer.".to_string(),
+        );
+        let task = make_task_spec();
+
+        let first = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(first[1].kind, MessageKind::TaskResult);
+        let second = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(second[1].kind, MessageKind::TaskResult);
+
+        assert_eq!(harness.spawn_count(), 1, "a successful turn must keep the session alive");
+        assert_eq!(harness.shutdown_count(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // DesignerHarnessBehavior (R2 — same recovery, M2 path)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn designer_respawns_after_failed_timeout_then_succeeds() {
+        let harness = Arc::new(ScriptedHarness::new(vec![ScriptedTurn::Failed("timeout"), ScriptedTurn::Real]));
+        let mut behavior = DesignerHarnessBehavior::new(harness.clone(), agent_cfg(), "You are the Designer.".to_string());
+
+        let first = behavior.on_envelope(designer_task_assign()).await;
+        assert_eq!(first[0].kind, MessageKind::Blocked);
+        assert!(first[0].body["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("designer turn failed: "));
+
+        let second = behavior.on_envelope(designer_task_assign()).await;
+        assert_eq!(second[1].kind, MessageKind::TaskResult);
+
+        assert_eq!(harness.spawn_count(), 2);
+        assert_eq!(harness.shutdown_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn designer_respawns_after_write_broken_pipe_err() {
+        let harness = Arc::new(ScriptedHarness::new(vec![ScriptedTurn::WriteBrokenPipe, ScriptedTurn::Real]));
+        let mut behavior = DesignerHarnessBehavior::new(harness.clone(), agent_cfg(), "You are the Designer.".to_string());
+
+        let first = behavior.on_envelope(designer_task_assign()).await;
+        assert_eq!(first[0].kind, MessageKind::Blocked);
+        assert!(first[0].body["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("harness send error: failed to write turn to child stdin: "));
+
+        let second = behavior.on_envelope(designer_task_assign()).await;
+        assert_eq!(second[1].kind, MessageKind::TaskResult);
+
+        assert_eq!(harness.spawn_count(), 2, "the dead session must be discarded and a fresh one spawned");
+        assert_eq!(harness.shutdown_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn designer_respawns_after_process_exited_err() {
+        let harness = Arc::new(ScriptedHarness::new(vec![ScriptedTurn::ProcessExited, ScriptedTurn::Real]));
+        let mut behavior = DesignerHarnessBehavior::new(harness.clone(), agent_cfg(), "You are the Designer.".to_string());
+
+        let first = behavior.on_envelope(designer_task_assign()).await;
+        assert_eq!(first[0].kind, MessageKind::Blocked);
+        assert_eq!(
+            first[0].body["reason"],
+            json!("harness send error: child process exited before a result event arrived")
+        );
+
+        let second = behavior.on_envelope(designer_task_assign()).await;
+        assert_eq!(second[1].kind, MessageKind::TaskResult);
+
+        assert_eq!(harness.spawn_count(), 2, "the dead session must be discarded and a fresh one spawned");
+        assert_eq!(harness.shutdown_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn designer_reuses_session_across_consecutive_successes() {
+        let harness = Arc::new(ScriptedHarness::new(vec![ScriptedTurn::Real, ScriptedTurn::Real]));
+        let mut behavior = DesignerHarnessBehavior::new(harness.clone(), agent_cfg(), "You are the Designer.".to_string());
+
+        let first = behavior.on_envelope(designer_task_assign()).await;
+        assert_eq!(first[1].kind, MessageKind::TaskResult);
+        let second = behavior.on_envelope(designer_task_assign()).await;
+        assert_eq!(second[1].kind, MessageKind::TaskResult);
+
+        assert_eq!(harness.spawn_count(), 1, "a successful turn must keep the session alive");
+        assert_eq!(harness.shutdown_count(), 0);
+    }
+}
+
+/// M13 turn-recovery fix (D3): `RoleHarnessBehavior::with_turn_timeout`
+/// controls the `timeout` argument `send` receives; unset, it defaults to
+/// `DEFAULT_TURN_TIMEOUT` (now 900s).
+#[cfg(test)]
+mod timeout_knob_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    use crew_harness::claude::ClaudeCodeHarness;
+    use crew_harness::HarnessError;
+    use crew_proto::Role;
+
+    fn fake_cli_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-role-claude.sh")
+    }
+
+    fn assistant_line(text: &str) -> String {
+        json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }
+        })
+        .to_string()
+    }
+
+    fn agent_cfg() -> AgentCfg {
+        AgentCfg {
+            cwd: std::env::current_dir().expect("current dir"),
+            model: None,
+        }
+    }
+
+    fn task_assign() -> Envelope {
+        let task = TaskSpec {
+            id: "t1".to_string(),
+            role: Role::Developer,
+            title: "Build the landing page".to_string(),
+            brief: "Build a simple landing page".to_string(),
+            dod: vec![],
+            deps: vec![],
+            artifacts_expected: vec![],
+        };
+        Envelope::new(
+            "sp-3".to_string(),
+            "th-1".to_string(),
+            "agent:lead".to_string(),
+            vec!["agent:developer".to_string()],
+            MessageKind::TaskAssign,
+            None,
+            "req_01".to_string(),
+            json!({ "task": task }),
+            vec![],
+            true,
+            900_000,
+        )
+    }
+
+    /// Records the `timeout` argument of every `send` call; otherwise a
+    /// thin real delegate to `ClaudeCodeHarness` (`Session` has no public
+    /// constructor outside crew-harness — see `tests/control.rs`).
+    struct TimeoutCapturingHarness {
+        inner: ClaudeCodeHarness,
+        recorded: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    #[async_trait]
+    impl Harness for TimeoutCapturingHarness {
+        fn id(&self) -> crew_harness::HarnessId {
+            self.inner.id()
+        }
+
+        async fn spawn(&self, cfg: &AgentCfg) -> Result<Session, HarnessError> {
+            self.inner.spawn(cfg).await
+        }
+
+        async fn send(&self, session: &mut Session, turn: UserTurn, timeout: Duration) -> Result<TurnOutcome, HarnessError> {
+            self.recorded.lock().unwrap().push(timeout);
+            // Record the caller's `timeout` for the assertion, but bound the
+            // real fixture subprocess call with a generous real deadline
+            // regardless of it — a genuinely-elapsing 7ms timeout against a
+            // real spawned process is a flaky test, not a pass-through proof.
+            self.inner.send(session, turn, Duration::from_secs(5)).await
+        }
+
+        fn take_events(&self, session: &mut Session) -> mpsc::Receiver<HarnessEvent> {
+            self.inner.take_events(session)
+        }
+
+        async fn snapshot(&self, session: &Session) -> Result<HandoffSnapshot, HarnessError> {
+            self.inner.snapshot(session).await
+        }
+
+        async fn shutdown(&self, session: Session) -> Result<(), HarnessError> {
+            self.inner.shutdown(session).await
+        }
+    }
+
+    fn timeout_capturing_harness() -> Arc<TimeoutCapturingHarness> {
+        let text = r#"{"covered_req_ids": ["REQ-1"], "artifacts": []}"#;
+        Arc::new(TimeoutCapturingHarness {
+            inner: ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+                .with_env("FAKE_MODE", "json")
+                .with_env("FAKE_ASSISTANT_1", assistant_line(text)),
+            recorded: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn with_turn_timeout_passes_its_duration_to_send() {
+        let harness = timeout_capturing_harness();
+        let mut behavior = RoleHarnessBehavior::new(
+            harness.clone(),
+            agent_cfg(),
+            Role::Developer,
+            "You are the Developer.".to_string(),
+        )
+        .with_turn_timeout(Duration::from_millis(7));
+
+        behavior.on_envelope(task_assign()).await;
+
+        assert_eq!(*harness.recorded.lock().unwrap(), vec![Duration::from_millis(7)]);
+    }
+
+    #[tokio::test]
+    async fn without_with_turn_timeout_send_receives_the_900s_default() {
+        let harness = timeout_capturing_harness();
+        let mut behavior = RoleHarnessBehavior::new(
+            harness.clone(),
+            agent_cfg(),
+            Role::Developer,
+            "You are the Developer.".to_string(),
+        );
+
+        behavior.on_envelope(task_assign()).await;
+
+        assert_eq!(*harness.recorded.lock().unwrap(), vec![DEFAULT_TURN_TIMEOUT]);
+        assert_eq!(DEFAULT_TURN_TIMEOUT, Duration::from_secs(900));
     }
 }
 

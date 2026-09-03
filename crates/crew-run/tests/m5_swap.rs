@@ -37,6 +37,7 @@ fn config(data_dir: PathBuf, max_per_sprint: usize) -> RunConfig {
         roster: None,
         dev_cmd_checks: Vec::new(),
         project_root: None,
+        turn_timeout_secs: 900,
     }
 }
 
@@ -469,6 +470,7 @@ async fn real_cli_mid_sprint_designer_swap_completes_two_sprints() {
         roster: None,
         dev_cmd_checks: Vec::new(),
         project_root: None,
+        turn_timeout_secs: 900,
     };
 
     // Real CLI turns measured 17-193s (m5a E2E) — far past the deterministic
