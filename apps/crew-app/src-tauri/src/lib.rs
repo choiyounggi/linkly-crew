@@ -23,23 +23,32 @@ fn app_runs_root() -> std::path::PathBuf {
 async fn start_run(
     goal: String,
     scripted: bool,
+    project_root: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<String, String> {
     let data_root = app_runs_root();
     let roster_path = core::roster_path();
-    core::start_run_core(&state, goal, scripted, &data_root, &roster_path, move |run_id, event| {
-        // Best-effort: a closed/gone window means there is nothing left to
-        // notify; the pump keeps draining so the run itself is unaffected.
-        // Still logged (plan D5) — a closed window is the only expected
-        // cause, and this was previously unobservable (`let _ =` swallowed
-        // every emit failure, including real ones). Payload wrapped as
-        // `{run_id, event}` (plan D3) so the frontend can route it to the
-        // right run's channel.
-        if let Err(err) = app.emit("run://event", &serde_json::json!({"run_id": run_id, "event": event})) {
-            tracing::warn!(error = %err, "run://event emit failed");
-        }
-    })
+    core::start_run_core(
+        &state,
+        goal,
+        scripted,
+        &data_root,
+        &roster_path,
+        move |run_id, event| {
+            // Best-effort: a closed/gone window means there is nothing left to
+            // notify; the pump keeps draining so the run itself is unaffected.
+            // Still logged (plan D5) — a closed window is the only expected
+            // cause, and this was previously unobservable (`let _ =` swallowed
+            // every emit failure, including real ones). Payload wrapped as
+            // `{run_id, event}` (plan D3) so the frontend can route it to the
+            // right run's channel.
+            if let Err(err) = app.emit("run://event", &serde_json::json!({"run_id": run_id, "event": event})) {
+                tracing::warn!(error = %err, "run://event emit failed");
+            }
+        },
+        project_root.as_deref(),
+    )
     .await
 }
 
@@ -167,6 +176,19 @@ async fn create_project(name: String) -> Result<project::ProjectInfo, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// `list_projects()` (issue #13, plan D5/D7, task 03): no arguments — the
+/// workspace root is read from settings, same as `create_project` above.
+/// Filesystem scan, so it runs off the async runtime via `spawn_blocking`
+/// too. Frontend consumer is `t2-fe-picker` (declared intent, not yet wired
+/// as of this task).
+#[tauri::command]
+async fn list_projects() -> Result<Vec<project::ProjectInfo>, String> {
+    let settings = onboarding::get_settings_core(&onboarding::settings_path());
+    tokio::task::spawn_blocking(move || project::list_projects_core(&settings.workspace_root))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -189,6 +211,7 @@ pub fn run() {
             set_settings,
             onboarding_status,
             create_project,
+            list_projects,
             pty::pty_open,
             pty::pty_write,
             pty::pty_resize,

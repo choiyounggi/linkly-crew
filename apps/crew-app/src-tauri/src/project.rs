@@ -158,6 +158,37 @@ where
     Ok(ProjectInfo { name: name.to_string(), path: project_path.to_string_lossy().into_owned() })
 }
 
+/// `list_projects` command body (plan D5/D6, task 03): the projects already
+/// cloned under `workspace_root` — entries directly beneath it (no
+/// recursion) whose own `.git` (directory or file, worktree form included)
+/// exists, sorted by `name` ascending. A missing/non-directory
+/// `workspace_root` is `Err("workspace_missing: <path>")`, distinct from a
+/// present-but-empty workspace (`Ok(vec![])`) — a glob/scan over a missing
+/// directory would otherwise return an empty result indistinguishable from
+/// "no projects yet" (plan D5, wiki/infrastructure/config/path-valued-config.md).
+pub fn list_projects_core(workspace_root: &Path) -> Result<Vec<ProjectInfo>, String> {
+    if !workspace_root.is_dir() {
+        return Err(format!("workspace_missing: {}", workspace_root.display()));
+    }
+
+    let mut projects = Vec::new();
+    let entries = std::fs::read_dir(workspace_root).map_err(|e| format!("workspace_missing: {}: {e}", workspace_root.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("workspace_missing: {}: {e}", workspace_root.display()))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if !path.join(".git").exists() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        projects.push(ProjectInfo { name, path: path.to_string_lossy().into_owned() });
+    }
+    projects.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(projects)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +368,64 @@ mod tests {
         let name = format!("linkly-crew-t3-test-{}", uuid::Uuid::new_v4());
         real_create_and_clone(&name, &dir.0).expect("a real gh repo create --clone should succeed when gh is installed and authenticated");
         assert!(dir.0.join(&name).is_dir());
+    }
+
+    // -- list_projects_core: normal (only git entries, sorted by name, R6) --
+
+    #[test]
+    fn list_projects_returns_only_git_entries_directly_under_the_root_sorted_by_name() {
+        let workspace = TestDir::new("list-normal");
+        // Created c before a, so a passing sort is the thing under test, not creation order.
+        std::fs::create_dir_all(workspace.0.join("c")).unwrap();
+        std::fs::write(workspace.0.join("c").join(".git"), "gitdir: /elsewhere\n").unwrap();
+        std::fs::create_dir_all(workspace.0.join("a").join(".git")).unwrap();
+        std::fs::create_dir_all(workspace.0.join("b")).unwrap(); // no `.git` — must be excluded
+
+        let projects = list_projects_core(&workspace.0).expect("a populated workspace must list its git projects");
+        assert_eq!(projects.len(), 2, "only a and c have .git; b must be excluded, got: {projects:?}");
+        assert_eq!(projects[0].name, "a", "expected name-ascending order");
+        assert_eq!(projects[1].name, "c", "a file-form .git (worktree) must still count as a project");
+        assert_eq!(projects[1].path, workspace.0.join("c").to_string_lossy().into_owned());
+    }
+
+    // -- list_projects_core: error (missing root, R7) ------------------------
+
+    #[test]
+    fn list_projects_errors_workspace_missing_for_a_nonexistent_root() {
+        let workspace = TestDir::new("list-missing-parent");
+        let missing = workspace.0.join("does-not-exist");
+        let err = list_projects_core(&missing).expect_err("a nonexistent workspace_root must error, not return an empty list");
+        assert!(err.starts_with("workspace_missing: "), "expected a workspace_missing-prefixed error, got: {err}");
+        assert!(err.contains(&missing.display().to_string()), "expected the missing path in the error, got: {err}");
+    }
+
+    // -- list_projects_core: error boundary (root exists but is a file, R7) --
+
+    #[test]
+    fn list_projects_errors_workspace_missing_when_the_root_is_a_file_not_a_directory() {
+        let workspace = TestDir::new("list-root-is-file");
+        let file_root = workspace.0.join("not-a-dir");
+        std::fs::write(&file_root, b"").unwrap();
+        let err = list_projects_core(&file_root).expect_err("a file at workspace_root must error the same as a missing one");
+        assert!(err.starts_with("workspace_missing: "), "expected a workspace_missing-prefixed error, got: {err}");
+    }
+
+    // -- list_projects_core: boundary (root exists but is empty, R8) ---------
+
+    #[test]
+    fn list_projects_returns_an_empty_list_for_an_existing_but_empty_workspace() {
+        let workspace = TestDir::new("list-empty");
+        let projects = list_projects_core(&workspace.0).expect("an existing empty workspace must not error");
+        assert!(projects.is_empty(), "expected no projects, got: {projects:?}");
+    }
+
+    // -- list_projects_core: boundary (root has only plain files, no .git dirs) --
+
+    #[test]
+    fn list_projects_returns_an_empty_list_when_the_root_only_contains_plain_files() {
+        let workspace = TestDir::new("list-only-files");
+        std::fs::write(workspace.0.join("README.md"), b"").unwrap();
+        let projects = list_projects_core(&workspace.0).expect("a workspace with only files must not error");
+        assert!(projects.is_empty(), "expected no projects (files aren't project dirs), got: {projects:?}");
     }
 }

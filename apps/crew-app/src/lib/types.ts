@@ -180,3 +180,44 @@ export interface ProjectInfo {
   path: string;
 }
 // ===== END ProjectApi/OnboardingStatusApi contract stub =====
+
+// ===== BEGIN StartRunProjectRootArg/ListProjectsCommand contract stub (2차 런, 이슈 #13) =====
+// contract: t1-be-projroot owns the Rust implementation (apps/crew-app/src-tauri/src/**);
+// t2-fe-picker owns the TypeScript wiring (this file's consumers, source/store/modal).
+// Both tasks build against the shapes declared here — neither redefines them.
+// Full rationale: .orchestration/plans/t1-be-projroot/design.md "계약 요약".
+
+/**
+ * `invoke("start_run", args)`'s payload.
+ *
+ * `projectRoot` is ALWAYS sent explicitly, `null` included — never omit the key.
+ * Tauri's docs do not state what an absent key does for an `Option<T>` argument
+ * (only that arguments are passed as a JSON object with camelCase keys), so the
+ * contract removes the dependency on that undocumented behavior instead of
+ * relying on it.
+ *
+ * `null` keeps the pre-#13 behavior: every role's CLI cwd stays the per-role
+ * scratch dir. A non-null value must be an absolute path (after `~` expansion)
+ * naming a git repository's own toplevel — the backend rejects anything else
+ * with an `Err` string rather than silently falling back to `null`.
+ */
+export interface StartRunArgs {
+  goal: string;
+  scripted: boolean;
+  projectRoot: string | null;
+}
+
+/**
+ * `invoke("list_projects")` — takes NO arguments; the backend reads the
+ * workspace root from settings itself.
+ *
+ * Resolves to `ProjectInfo[]` sorted by `name` ascending, holding only the
+ * directories directly under the workspace root that are git repositories.
+ *
+ * Rejects with `workspace_missing: <path>` when the workspace root is absent or
+ * is not a directory. That is deliberately distinct from resolving to `[]`,
+ * which means the root exists and simply holds no projects — a UI that collapses
+ * the two reports a healthy "no projects" state over a misconfigured workspace.
+ */
+export type ListProjectsResult = ProjectInfo[];
+// ===== END StartRunProjectRootArg/ListProjectsCommand contract stub =====

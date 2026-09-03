@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createRunStore } from "./store";
+import { createRunStore, emptyChannel } from "./store";
 import type { RunEventSource } from "./source";
 import type { RunEvent } from "./types";
 
@@ -61,7 +61,7 @@ describe("RunState.startChannel — creates the channel before delivering any ev
     });
     const store = createRunStore(source);
 
-    const runId = await store.getState().startChannel("landing page", false);
+    const runId = await store.getState().startChannel("landing page", false, null);
 
     expect(runId).toBe("run_1");
     expect(order).toEqual(["start", "resync:run_1"]);
@@ -82,8 +82,8 @@ describe("RunState.startChannel — creates the channel before delivering any ev
     });
     const store = createRunStore(source);
 
-    await store.getState().startChannel("first", false);
-    await store.getState().startChannel("second", true);
+    await store.getState().startChannel("first", false, null);
+    await store.getState().startChannel("second", true, null);
 
     const s = store.getState();
     expect(s.channelOrder).toEqual(["run_1", "run_2"]);
@@ -91,6 +91,39 @@ describe("RunState.startChannel — creates the channel before delivering any ev
     expect(s.channels["run_2"].goal).toBe("second");
     expect(s.channels["run_2"].scripted).toBe(true);
     expect(s.activeRunId).toBe("run_2");
+  });
+});
+
+describe("emptyChannel — projectRoot default (t2-fe-picker D2)", () => {
+  it("defaults projectRoot to null when called with only 3 args (out-of-ownership call sites rely on this)", () => {
+    const channel = emptyChannel("r", "g", false);
+
+    expect(channel.projectRoot).toBeNull();
+  });
+});
+
+describe("RunState.startChannel — projectRoot (t2-fe-picker R3)", () => {
+  it("passes projectRoot to source.start as the third argument and stores it on the channel (normal)", async () => {
+    const start = vi.fn(async () => "run_1");
+    const source = fakeSource({ start });
+    const store = createRunStore(source);
+
+    const runId = await store.getState().startChannel("goal", false, "/ws/demo");
+
+    expect(runId).toBe("run_1");
+    expect(start).toHaveBeenCalledWith("goal", false, "/ws/demo");
+    expect(store.getState().channels["run_1"].projectRoot).toBe("/ws/demo");
+  });
+
+  it("stores null when no project was designated (boundary — legacy scratch run)", async () => {
+    const start = vi.fn(async () => "run_1");
+    const source = fakeSource({ start });
+    const store = createRunStore(source);
+
+    await store.getState().startChannel("goal", false, null);
+
+    expect(start).toHaveBeenCalledWith("goal", false, null);
+    expect(store.getState().channels["run_1"].projectRoot).toBeNull();
   });
 });
 
@@ -105,8 +138,8 @@ describe("RunState.applyEvent — cross run_id isolation (normal, R4)", () => {
     });
     const store = createRunStore(source);
 
-    await store.getState().startChannel("goal a", false);
-    await store.getState().startChannel("goal b", false);
+    await store.getState().startChannel("goal a", false, null);
+    await store.getState().startChannel("goal b", false, null);
 
     store.getState().applyEvent("run_a", message(1, "task.assign"));
     store.getState().applyEvent("run_b", message(1, "task.result"));
@@ -129,8 +162,8 @@ describe("RunState.applyEvent — cross run_id isolation (normal, R4)", () => {
         .mockResolvedValueOnce("run_b"),
     });
     const store = createRunStore(source);
-    await store.getState().startChannel("goal a", false);
-    await store.getState().startChannel("goal b", false);
+    await store.getState().startChannel("goal a", false, null);
+    await store.getState().startChannel("goal b", false, null);
 
     store.getState().applyEvent("run_a", message(1));
     store.getState().applyEvent("run_b", message(1));
@@ -157,7 +190,7 @@ describe("RunState.applyEvent — unknown run_id is ignored, not auto-created (b
 describe("RunState.applyEvent — accumulation through a channel's lifecycle", () => {
   it("accumulates messages and updates spec/dag/sprint/taskStates for the right channel", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("landing page", false);
+    await store.getState().startChannel("landing page", false, null);
 
     store.getState().applyEvent("run_1", specReady);
     store.getState().applyEvent("run_1", message(1));
@@ -173,7 +206,7 @@ describe("RunState.applyEvent — accumulation through a channel's lifecycle", (
 
   it("sets finished on run_finished", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
 
     store.getState().applyEvent("run_1", { type: "run_finished", outcome: "completed", ts: "t9" });
 
@@ -182,7 +215,7 @@ describe("RunState.applyEvent — accumulation through a channel's lifecycle", (
 
   it("ignores a message whose seq was already applied for that channel (idempotent)", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
 
     store.getState().applyEvent("run_1", message(1));
     store.getState().applyEvent("run_1", message(1));
@@ -192,7 +225,7 @@ describe("RunState.applyEvent — accumulation through a channel's lifecycle", (
 
   it("resets the channel's fields (and its seen-seq set) on a re-applied run_started for that run_id", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
     store.getState().applyEvent("run_1", message(1));
 
     store.getState().applyEvent("run_1", runStarted);
@@ -202,9 +235,18 @@ describe("RunState.applyEvent — accumulation through a channel's lifecycle", (
     expect(store.getState().channels["run_1"].goal).toBe("landing page");
   });
 
+  it("carries projectRoot forward across a re-applied run_started reset, instead of silently dropping it back to null (t2-fe-picker R9 — regression guard)", async () => {
+    const store = createRunStore(fakeSource());
+    await store.getState().startChannel("goal", false, "/ws/demo");
+
+    store.getState().applyEvent("run_1", runStarted);
+
+    expect(store.getState().channels["run_1"].projectRoot).toBe("/ws/demo");
+  });
+
   it("replaces the roster wholesale on roster_changed, never merging with the previous value", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
 
     store.getState().applyEvent("run_1", {
       type: "roster_changed",
@@ -225,7 +267,7 @@ describe("RunState.applyEvent — accumulation through a channel's lifecycle", (
   it("warns and leaves the channel unchanged for an unrecognized event type", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
     const before = store.getState().channels["run_1"];
 
     store.getState().applyEvent("run_1", { type: "future_event", foo: "bar" } as unknown as RunEvent);
@@ -241,7 +283,7 @@ describe("RunState.selectChannel", () => {
     const resync = vi.fn(async () => {});
     const source = fakeSource({ resync });
     const store = createRunStore(source);
-    await store.getState().startChannel("a", false);
+    await store.getState().startChannel("a", false, null);
     resync.mockClear();
 
     store.getState().selectChannel("run_1");
@@ -273,7 +315,7 @@ describe("RunState.closeChannel — stop+remove (D1), local cleanup regardless o
     stop = vi.fn(async () => {});
     remove = vi.fn(async () => {});
     store = createRunStore(fakeSource({ stop, remove }));
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
   });
 
   it("calls stop_run then remove_run and drops the channel locally", async () => {
@@ -295,8 +337,8 @@ describe("RunState.closeChannel — stop+remove (D1), local cleanup regardless o
         .mockResolvedValueOnce("run_2"),
     });
     const s2 = createRunStore(source);
-    await s2.getState().startChannel("a", false);
-    await s2.getState().startChannel("b", false);
+    await s2.getState().startChannel("a", false, null);
+    await s2.getState().startChannel("b", false, null);
     expect(s2.getState().activeRunId).toBe("run_2");
 
     await s2.getState().closeChannel("run_2");
@@ -332,7 +374,7 @@ describe("RunState — empty store (boundary)", () => {
 describe("RunState.applyEvent — presence (D4/D5)", () => {
   it("records a read receipt for the target message, keyed by run (normal, R4/D4)", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
 
     store.getState().applyEvent("run_1", {
       type: "presence",
@@ -346,7 +388,7 @@ describe("RunState.applyEvent — presence (D4/D5)", () => {
 
   it("does not duplicate an agent that re-reads the same message (normal)", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
 
     store.getState().applyEvent("run_1", {
       type: "presence",
@@ -366,7 +408,7 @@ describe("RunState.applyEvent — presence (D4/D5)", () => {
 
   it("is a safe no-op for a read event with no target_msg_id (boundary — optional wire field)", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
     const before = store.getState().channels["run_1"];
 
     expect(() =>
@@ -378,7 +420,7 @@ describe("RunState.applyEvent — presence (D4/D5)", () => {
 
   it("reflects typing on and off for an agent (normal, R4/D5)", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
 
     store.getState().applyEvent("run_1", {
       type: "presence",
@@ -399,7 +441,7 @@ describe("RunState.applyEvent — presence (D4/D5)", () => {
 
   it("treats a typing event with no active field as off (boundary — optional wire field)", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
 
     store.getState().applyEvent("run_1", { type: "presence", agent_id: "agent:pm", kind: "typing" });
 
@@ -411,8 +453,8 @@ describe("RunState.applyEvent — presence (D4/D5)", () => {
       start: vi.fn().mockResolvedValueOnce("run_a").mockResolvedValueOnce("run_b"),
     });
     const store = createRunStore(source);
-    await store.getState().startChannel("goal a", false);
-    await store.getState().startChannel("goal b", false);
+    await store.getState().startChannel("goal a", false, null);
+    await store.getState().startChannel("goal b", false, null);
 
     store.getState().applyEvent("run_a", {
       type: "presence",
@@ -436,7 +478,7 @@ describe("RunState.applyEvent — presence (D4/D5)", () => {
 
   it("resets readReceipts/typing on a re-applied run_started for that run (resync reset, boundary)", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
     store.getState().applyEvent("run_1", {
       type: "presence",
       agent_id: "agent:pm",
@@ -457,7 +499,7 @@ describe("RunState.applyEvent — presence (D4/D5)", () => {
 describe("ChannelState.selectedThread — field default and isolation (normal/boundary, D1)", () => {
   it("defaults to null for a freshly started channel", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
 
     expect(store.getState().channels["run_1"].selectedThread).toBeNull();
   });
@@ -467,8 +509,8 @@ describe("ChannelState.selectedThread — field default and isolation (normal/bo
       start: vi.fn().mockResolvedValueOnce("run_a").mockResolvedValueOnce("run_b"),
     });
     const store = createRunStore(source);
-    await store.getState().startChannel("goal a", false);
-    await store.getState().startChannel("goal b", false);
+    await store.getState().startChannel("goal a", false, null);
+    await store.getState().startChannel("goal b", false, null);
 
     store.setState((s) => ({
       channels: { ...s.channels, run_a: { ...s.channels["run_a"], selectedThread: "t-pm" } },
@@ -480,7 +522,7 @@ describe("ChannelState.selectedThread — field default and isolation (normal/bo
 
   it("resets to null on a re-applied run_started for that run (resync reset, boundary)", async () => {
     const store = createRunStore(fakeSource());
-    await store.getState().startChannel("goal", false);
+    await store.getState().startChannel("goal", false, null);
     store.setState((s) => ({
       channels: { ...s.channels, run_1: { ...s.channels["run_1"], selectedThread: "t-pm" } },
     }));

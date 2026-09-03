@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::onboarding;
 use crew_lead::accept::AcceptanceLoop;
 use crew_proto::{Role, Roster, RosterAgent};
 use crew_run::{validate_roster, GateDecision, RunConfig, RunController, RunEvent, RunHandle, RunMode, StoredMessageDto};
@@ -70,11 +71,60 @@ fn evict_oldest_finished_if_needed(runs: &mut HashMap<String, ActiveRun>) {
     }
 }
 
+/// Turns the frontend's raw `project_root` string into a validated absolute
+/// path (plan D3/D4, task 01): `None` = no project picked, the pre-#13
+/// scratch-cwd behavior. `Some(raw)` is expanded via `onboarding::expand_tilde`
+/// and then must be absolute — a relative path or an empty string is rejected
+/// with an explicit `Err` (the raw value quoted verbatim, not the expanded
+/// one) rather than silently downgraded to `None`. Whether the path is an
+/// actual git repository is `crew-run`'s `RunController::start` concern
+/// (`RunError::ProjectRootInvalid`), not checked here.
+pub(crate) fn resolve_project_root(input: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let Some(raw) = input else {
+        return Ok(None);
+    };
+    let expanded = onboarding::expand_tilde(raw);
+    if !expanded.is_absolute() {
+        return Err(format!("project_root must be an absolute path (after ~ expansion), got \"{raw}\""));
+    }
+    Ok(Some(expanded))
+}
+
 /// `scripted=true`'s `RunMode` (contracts-m4.md §C6 verbatim): a designer
 /// rework round trip is planted so the demo run shows the rework loop.
 fn scripted_mode() -> RunMode {
     RunMode::Scripted {
         planted_violations: vec![(Role::Designer, vec!["REQ-2".to_string()])],
+    }
+}
+
+/// Builds the `RunConfig` literal `start_run_core` passes to
+/// `RunController::start` (plan D9, task 02): extracted out of
+/// `start_run_core` so a dedicated regression test can construct the shipped
+/// defaults and assert `dev_cmd_checks` is still the empty vector (함정 29 /
+/// issue #5 — must stay unarmed) from the same place `project_root` is now
+/// threaded through.
+pub(crate) fn build_run_config(
+    goal: String,
+    mode: RunMode,
+    data_dir: PathBuf,
+    roster: Roster,
+    project_root: Option<PathBuf>,
+) -> RunConfig {
+    RunConfig {
+        goal,
+        mode,
+        data_dir,
+        max_rework: AcceptanceLoop::default_budget(),
+        // contracts-m5.md §C5a defaults: single sprint, escalation cascade
+        // off — current bridge behavior unchanged.
+        max_per_sprint: 0,
+        escalation_timeout_ms: 0,
+        roster: Some(roster),
+        // contracts-m10.md §H1g / D8: cmd DoD emission is off by default.
+        // To turn it on, pass crew_run::default_dev_cmd_checks_rust() etc.
+        dev_cmd_checks: Vec::new(),
+        project_root,
     }
 }
 
@@ -89,7 +139,10 @@ fn scripted_mode() -> RunMode {
 /// (`get_roster` surfaces that corruption separately). `emit` receives every
 /// `RunEvent` from the pump alongside the run's own `run_id` (plan D3) —
 /// production wires it to a `{run_id, event}`-wrapped `AppHandle::emit`,
-/// tests inject a channel/closure.
+/// tests inject a channel/closure. `project_root` is the frontend's raw,
+/// unvalidated string (issue #13, plan D1/D3/D4, task 02) — `resolve_project_root`
+/// validates it *before* the run is created; a rejected value returns `Err`
+/// and never reaches `RunController::start` or `state.runs`.
 pub async fn start_run_core<F>(
     state: &AppState,
     goal: String,
@@ -97,10 +150,12 @@ pub async fn start_run_core<F>(
     data_root: &Path,
     roster_path: &Path,
     emit: F,
+    project_root: Option<&str>,
 ) -> Result<String, String>
 where
     F: Fn(String, RunEvent) + Send + 'static,
 {
+    let project_root = resolve_project_root(project_root)?;
     let mode = if scripted {
         scripted_mode()
     } else {
@@ -115,24 +170,7 @@ where
         }
     };
     let goal_for_meta = goal.clone();
-    let cfg = RunConfig {
-        goal,
-        mode,
-        data_dir: data_root.join(launch_id),
-        max_rework: AcceptanceLoop::default_budget(),
-        // contracts-m5.md §C5a defaults: single sprint, escalation cascade
-        // off — current bridge behavior unchanged.
-        max_per_sprint: 0,
-        escalation_timeout_ms: 0,
-        roster: Some(roster),
-        // contracts-m10.md §H1g / D8: cmd DoD emission is off by default.
-        // To turn it on, pass crew_run::default_dev_cmd_checks_rust() etc.
-        dev_cmd_checks: Vec::new(),
-        // contracts-m11.md §I1/D12: no GUI project_root picker yet (out of
-        // scope) — every role's CLI cwd and the Cmd DoD exec cwd stay the
-        // per-role scratch dir, unchanged from pre-M11 behavior.
-        project_root: None,
-    };
+    let cfg = build_run_config(goal, mode, data_root.join(launch_id), roster, project_root);
 
     let handle = RunController::start(cfg).await.map_err(|e| e.to_string())?;
     let run_id = handle.run_id().to_string();
@@ -472,6 +510,7 @@ pub async fn search_messages_core(state: &AppState, run_id: &str, query: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::sync::{Arc, Mutex as StdMutex};
 
     /// A fresh directory under `target/` (never `/tmp`/`$TMPDIR` — workspace
@@ -538,6 +577,7 @@ mod tests {
             &root.0,
             &root.0.join("roster.json"),
             emit,
+            None,
         )
         .await
         .expect("scripted run should start");
@@ -584,6 +624,7 @@ mod tests {
             &root.0,
             &root.0.join("roster.json"),
             emit,
+            None,
         )
         .await
         .expect("scripted run should start");
@@ -635,10 +676,10 @@ mod tests {
         let (emit1, _c1) = collecting_emit();
         let (emit2, _c2) = collecting_emit();
 
-        let first_id = start_run_core(&state, "goal A".to_string(), true, &root.0, &root.0.join("roster.json"), emit1)
+        let first_id = start_run_core(&state, "goal A".to_string(), true, &root.0, &root.0.join("roster.json"), emit1, None)
             .await
             .expect("first run should start");
-        let second_id = start_run_core(&state, "goal B".to_string(), true, &root.0, &root.0.join("roster.json"), emit2)
+        let second_id = start_run_core(&state, "goal B".to_string(), true, &root.0, &root.0.join("roster.json"), emit2, None)
             .await
             .expect("second run should start concurrently, not error with run_in_progress");
 
@@ -662,10 +703,10 @@ mod tests {
         let state = AppState::default();
         let (emit_a, _ca) = collecting_emit();
         let (emit_b, _cb) = collecting_emit();
-        let a_id = start_run_core(&state, "goal A".to_string(), true, &root.0, &root.0.join("roster.json"), emit_a)
+        let a_id = start_run_core(&state, "goal A".to_string(), true, &root.0, &root.0.join("roster.json"), emit_a, None)
             .await
             .expect("A should start");
-        let b_id = start_run_core(&state, "goal B".to_string(), true, &root.0, &root.0.join("roster.json"), emit_b)
+        let b_id = start_run_core(&state, "goal B".to_string(), true, &root.0, &root.0.join("roster.json"), emit_b, None)
             .await
             .expect("B should start");
 
@@ -694,7 +735,7 @@ mod tests {
             sink.lock().unwrap().push(serde_json::json!({"run_id": run_id, "event": event}));
         };
 
-        let run_id = start_run_core(&state, "goal".to_string(), true, &root.0, &root.0.join("roster.json"), emit)
+        let run_id = start_run_core(&state, "goal".to_string(), true, &root.0, &root.0.join("roster.json"), emit, None)
             .await
             .expect("scripted run should start");
 
@@ -742,7 +783,7 @@ mod tests {
         let root = TestDataRoot::new("remove-run");
         let state = AppState::default();
         let (emit, _c) = collecting_emit();
-        let run_id = start_run_core(&state, "goal".to_string(), true, &root.0, &root.0.join("roster.json"), emit)
+        let run_id = start_run_core(&state, "goal".to_string(), true, &root.0, &root.0.join("roster.json"), emit, None)
             .await
             .expect("run should start");
 
@@ -765,10 +806,10 @@ mod tests {
         let state = AppState::default();
         let (emit_a, _ca) = collecting_emit();
         let (emit_b, _cb) = collecting_emit();
-        let a_id = start_run_core(&state, "goal A".to_string(), true, &root.0, &root.0.join("roster.json"), emit_a)
+        let a_id = start_run_core(&state, "goal A".to_string(), true, &root.0, &root.0.join("roster.json"), emit_a, None)
             .await
             .expect("A should start");
-        let b_id = start_run_core(&state, "goal B".to_string(), true, &root.0, &root.0.join("roster.json"), emit_b)
+        let b_id = start_run_core(&state, "goal B".to_string(), true, &root.0, &root.0.join("roster.json"), emit_b, None)
             .await
             .expect("B should start");
         stop_run_core(&state, &a_id).await.expect("stop A should succeed");
@@ -800,7 +841,7 @@ mod tests {
         let mut finished_ids = Vec::new();
         for i in 0..21 {
             let (emit, _c) = collecting_emit();
-            let id = start_run_core(&state, format!("goal {i}"), true, &root.0, &root.0.join("roster.json"), emit)
+            let id = start_run_core(&state, format!("goal {i}"), true, &root.0, &root.0.join("roster.json"), emit, None)
                 .await
                 .expect("run should start");
             stop_run_core(&state, &id).await.expect("stop should succeed");
@@ -823,6 +864,7 @@ mod tests {
             &root.0,
             &root.0.join("roster.json"),
             emit_running,
+            None,
         )
         .await
         .expect("22nd run should start and trigger the eviction sweep");
@@ -854,6 +896,7 @@ mod tests {
             &root.0,
             &root.0.join("roster.json"),
             emit1,
+            None,
         )
         .await
         .expect("first run should start");
@@ -873,6 +916,7 @@ mod tests {
             &root.0,
             &root.0.join("roster.json"),
             emit2,
+            None,
         )
         .await
         .expect("a new run must be startable after stop");
@@ -1086,6 +1130,7 @@ mod tests {
             &root.0,
             &root.0.join("roster.json"),
             emit,
+            None,
         )
         .await
         .expect("scripted run should start");
@@ -1125,7 +1170,7 @@ mod tests {
 
         let state = AppState::default();
         let (emit, collected) = collecting_emit();
-        let run_id = start_run_core(&state, "goal".to_string(), true, &root.0, &roster_path, emit)
+        let run_id = start_run_core(&state, "goal".to_string(), true, &root.0, &roster_path, emit, None)
             .await
             .expect("scripted run should start");
 
@@ -1149,5 +1194,162 @@ mod tests {
         );
 
         stop_run_core(&state, &run_id).await.expect("stop should succeed");
+    }
+
+    // -- resolve_project_root: normal (already-absolute, ~ expansion, R1/R4) --
+
+    #[test]
+    fn resolve_project_root_accepts_an_already_absolute_path() {
+        assert_eq!(resolve_project_root(Some("/already/absolute")), Ok(Some(PathBuf::from("/already/absolute"))));
+    }
+
+    #[test]
+    fn resolve_project_root_expands_a_leading_tilde_slash_path() {
+        let home = std::env::var("HOME").expect("HOME must be set for this test");
+        let expected = Path::new(&home).join("linkly-crew").join("workspace").join("demo");
+        assert_eq!(resolve_project_root(Some("~/linkly-crew/workspace/demo")), Ok(Some(expected)));
+    }
+
+    // -- resolve_project_root: boundary (None, bare tilde, R2) ----------------
+
+    #[test]
+    fn resolve_project_root_passes_none_through_as_none() {
+        assert_eq!(resolve_project_root(None), Ok(None));
+    }
+
+    #[test]
+    fn resolve_project_root_expands_a_bare_tilde_to_home() {
+        let home = std::env::var("HOME").expect("HOME must be set for this test");
+        assert_eq!(resolve_project_root(Some("~")), Ok(Some(PathBuf::from(home))));
+    }
+
+    // -- resolve_project_root: error (relative/empty rejected, R3/D4) ---------
+
+    #[test]
+    fn resolve_project_root_rejects_an_empty_string_with_the_raw_value_in_the_message() {
+        let err = resolve_project_root(Some("")).expect_err("empty string must be rejected, not downgraded to None");
+        assert!(err.contains("got \"\""), "expected the raw empty value quoted in the error, got: {err}");
+    }
+
+    #[test]
+    fn resolve_project_root_rejects_a_dot_slash_relative_path() {
+        let err = resolve_project_root(Some("./demo")).expect_err("a relative path must be rejected");
+        assert!(err.contains("got \"./demo\""), "expected the raw relative value quoted in the error, got: {err}");
+    }
+
+    #[test]
+    fn resolve_project_root_rejects_a_bare_relative_path() {
+        let err = resolve_project_root(Some("demo")).expect_err("a bare relative path must be rejected");
+        assert!(err.contains("got \"demo\""), "expected the raw relative value quoted in the error, got: {err}");
+    }
+
+    // -- build_run_config: boundary/regression (R9, D9 — dev_cmd_checks guard) --
+
+    #[test]
+    fn building_a_run_config_keeps_dev_cmd_checks_empty_and_carries_project_root_through() {
+        let project_root = Some(PathBuf::from("/abs/project"));
+        let cfg = build_run_config("goal".to_string(), RunMode::RealCli, PathBuf::from("/abs/data"), claude_five_team(), project_root.clone());
+        assert!(cfg.dev_cmd_checks.is_empty(), "dev_cmd_checks must stay unarmed (함정 29 / issue #5)");
+        assert_eq!(cfg.project_root, project_root, "build_run_config must forward project_root unchanged");
+    }
+
+    /// A real, minimal git repo (`git init` + one commit so `HEAD` resolves)
+    /// under `target/` (never `/tmp`/`$TMPDIR`) — `RunController::start`'s
+    /// role-worktree setup needs a valid `HEAD` to branch each role's
+    /// worktree from.
+    fn init_real_git_repo(dir: &Path) {
+        let init = Command::new("git").arg("init").arg("-q").current_dir(dir).status().expect("git init must run");
+        assert!(init.success(), "git init failed");
+        for (key, value) in [("user.email", "test@example.invalid"), ("user.name", "Test")] {
+            let cfg = Command::new("git").args(["config", key, value]).current_dir(dir).status().expect("git config must run");
+            assert!(cfg.success(), "git config {key} failed");
+        }
+        std::fs::write(dir.join("README.md"), "test\n").unwrap();
+        let add = Command::new("git").args(["add", "-A"]).current_dir(dir).status().expect("git add must run");
+        assert!(add.success(), "git add failed");
+        let commit = Command::new("git").args(["commit", "-q", "-m", "init"]).current_dir(dir).status().expect("git commit must run");
+        assert!(commit.success(), "git commit failed");
+    }
+
+    // -- start_run_core: normal (project_root threads into the run, R1) -------
+
+    #[tokio::test]
+    async fn starting_a_run_threads_a_real_git_project_root_into_the_run() {
+        let root = TestDataRoot::new("project-root-real");
+        let project_dir = root.0.join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        init_real_git_repo(&project_dir);
+
+        let state = AppState::default();
+        let (emit, _collected) = collecting_emit();
+        let run_id = start_run_core(
+            &state,
+            "goal".to_string(),
+            true,
+            &root.0,
+            &root.0.join("roster.json"),
+            emit,
+            Some(project_dir.to_str().unwrap()),
+        )
+        .await
+        .expect("a real git repo project_root must let the run start");
+        assert!(!run_id.is_empty());
+
+        stop_run_core(&state, &run_id).await.expect("stop should succeed");
+    }
+
+    // -- start_run_core: normal (None keeps the pre-#13 scratch behavior, R2) -
+
+    #[tokio::test]
+    async fn starting_a_run_keeps_the_pre_issue13_scratch_behavior_when_project_root_is_none() {
+        let root = TestDataRoot::new("project-root-none");
+        let state = AppState::default();
+        let (emit, _collected) = collecting_emit();
+        let run_id = start_run_core(&state, "goal".to_string(), true, &root.0, &root.0.join("roster.json"), emit, None)
+            .await
+            .expect("None project_root must keep starting a scratch-cwd run");
+        assert!(!run_id.is_empty());
+        stop_run_core(&state, &run_id).await.expect("stop should succeed");
+    }
+
+    // -- start_run_core: error (relative project_root rejected before the run starts, R3/D4) --
+
+    #[tokio::test]
+    async fn starting_a_run_rejects_a_relative_project_root_without_creating_a_run() {
+        let root = TestDataRoot::new("project-root-relative");
+        let state = AppState::default();
+        let (emit, _collected) = collecting_emit();
+
+        let err = start_run_core(&state, "goal".to_string(), true, &root.0, &root.0.join("roster.json"), emit, Some("./demo"))
+            .await
+            .expect_err("a relative project_root must be rejected before the run starts");
+        assert!(err.contains("got \"./demo\""), "expected resolve_project_root's error message, got: {err}");
+        assert!(state.runs.lock().await.is_empty(), "a rejected project_root must not create any run");
+    }
+
+    // -- start_run_core: error (crew-run's ProjectRootInvalid forwarded verbatim, R5) --
+
+    #[tokio::test]
+    async fn starting_a_run_forwards_crew_runs_project_root_invalid_error_verbatim() {
+        let root = TestDataRoot::new("project-root-not-git");
+        let not_a_repo = root.0.join("not-a-repo");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+
+        let state = AppState::default();
+        let (emit, _collected) = collecting_emit();
+        let err = start_run_core(
+            &state,
+            "goal".to_string(),
+            true,
+            &root.0,
+            &root.0.join("roster.json"),
+            emit,
+            Some(not_a_repo.to_str().unwrap()),
+        )
+        .await
+        .expect_err("a non-git absolute directory must be rejected by crew-run's own validation, not silently accepted");
+        assert!(err.starts_with("project_root invalid:"), "the bridge must forward crew-run's ProjectRootInvalid error verbatim, got: {err}");
+        assert!(err.contains("project_root_not_a_git_repo"), "expected crew-run's own not-a-git-repo detail, got: {err}");
+        assert!(state.runs.lock().await.is_empty(), "a rejected project_root must not create any run");
     }
 }

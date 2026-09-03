@@ -103,10 +103,10 @@ export class TauriEventSource implements RunEventSource {
     });
   }
 
-  /** Allocates the run and returns its id — no snapshot work (call `resync` once the caller has a channel to deliver into). */
-  async start(goal: string, scripted: boolean): Promise<string> {
+  /** Allocates the run and returns its id — no snapshot work (call `resync` once the caller has a channel to deliver into). `projectRoot` is always sent as an explicit key, `null` for the legacy scratch run — the backend contract does not define key-omission behavior (plan D6). */
+  async start(goal: string, scripted: boolean, projectRoot: string | null): Promise<string> {
     await this.ensureListening();
-    return this.invoke<string>("start_run", { goal, scripted });
+    return this.invoke<string>("start_run", { goal, scripted, projectRoot });
   }
 
   /** Fetches `run_snapshot(runId)`, replays it as synthesized events, then flushes any live event that arrived during the replay (plan D3/D6). Also ensures the shared listener is active — a channel can be resynced (e.g. after reload, via `listRuns`) without `start` ever having run this session. */
@@ -171,6 +171,11 @@ export class TauriEventSource implements RunEventSource {
 
   async createProject(name: string): Promise<ProjectInfo> {
     return this.invoke<ProjectInfo>("create_project", { name });
+  }
+
+  /** Rejects with the backend's error as-is (e.g. `workspace_missing: <path>`) — not wrapped, so callers can branch on it. */
+  async listProjects(): Promise<ProjectInfo[]> {
+    return this.invoke<ProjectInfo[]>("list_projects");
   }
 
   /** Command names verbatim per contracts-m5.md §C6; D8 adds `runId` first. Errors reject, not swallowed. */

@@ -42,7 +42,7 @@ pub fn settings_path() -> PathBuf {
 /// Expands a leading `~` (or `~/...`) to `$HOME` (plan D2). Any other input
 /// (including other tilde forms like `~user`) is returned unchanged — the
 /// absolute-path check right after this is what actually rejects it.
-fn expand_tilde(input: &str) -> PathBuf {
+pub(crate) fn expand_tilde(input: &str) -> PathBuf {
     if input == "~" {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home);

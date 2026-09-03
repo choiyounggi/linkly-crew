@@ -17,7 +17,7 @@ describe("MockEventSource", () => {
 
   it("returns the fixed demo run id from start()", async () => {
     const source = new MockEventSource(0);
-    await expect(source.start("goal", false)).resolves.toBe(MOCK_RUN_ID);
+    await expect(source.start("goal", false, null)).resolves.toBe(MOCK_RUN_ID);
   });
 
   it("replays the full 3-sprint scenario (5 roles, one designer rework, one harness swap) in order, all tagged with the fixed demo run id", async () => {
@@ -25,7 +25,7 @@ describe("MockEventSource", () => {
     const received: { runId: string; ev: RunEvent }[] = [];
     source.onEvent((runId, ev) => received.push({ runId, ev }));
 
-    await source.start("간단한 랜딩 페이지", false);
+    await source.start("간단한 랜딩 페이지", false, null);
     await vi.runAllTimersAsync();
 
     expect(received.every((r) => r.runId === MOCK_RUN_ID)).toBe(true);
@@ -104,7 +104,7 @@ describe("MockEventSource", () => {
     const received: RunEvent[] = [];
     source.onEvent((_runId, ev) => received.push(ev));
 
-    await source.start("간단한 랜딩 페이지", false);
+    await source.start("간단한 랜딩 페이지", false, null);
     await vi.runAllTimersAsync();
 
     const messages = received.filter((ev): ev is Extract<RunEvent, { type: "message" }> => ev.type === "message");
@@ -127,7 +127,7 @@ describe("MockEventSource", () => {
     const received: RunEvent[] = [];
     source.onEvent((_runId, ev) => received.push(ev));
 
-    await source.start("goal", false);
+    await source.start("goal", false, null);
     await source.stop(MOCK_RUN_ID);
     await vi.runAllTimersAsync();
 
@@ -147,7 +147,7 @@ describe("MockEventSource", () => {
     const source = new MockEventSource(0);
     await expect(source.listRuns()).resolves.toEqual([]);
 
-    await source.start("goal", false);
+    await source.start("goal", false, null);
     await expect(source.listRuns()).resolves.toEqual([{ run_id: MOCK_RUN_ID, goal: "goal", finished: null }]);
 
     await source.remove(MOCK_RUN_ID);
@@ -159,7 +159,7 @@ describe("MockEventSource", () => {
     const received: RunEvent[] = [];
     source.onEvent((_runId, ev) => received.push(ev));
 
-    await source.start("간단한 랜딩 페이지", false);
+    await source.start("간단한 랜딩 페이지", false, null);
     await vi.runAllTimersAsync();
 
     const runStarted = received[0] as Extract<RunEvent, { type: "run_started" }>;
@@ -181,7 +181,7 @@ describe("MockEventSource", () => {
     const unsubscribe = source.onEvent((_runId, ev) => received.push(ev));
     unsubscribe();
 
-    await source.start("goal", false);
+    await source.start("goal", false, null);
     await vi.runAllTimersAsync();
 
     expect(received).toHaveLength(0);
@@ -311,7 +311,7 @@ describe("MockEventSource — gate/search methods (plan D4, D8: runId first)", (
 
   it("searchMessages filters delivered messages by kind/from/body, case-insensitively", async () => {
     const source = new MockEventSource(0);
-    await source.start("간단한 랜딩 페이지", false);
+    await source.start("간단한 랜딩 페이지", false, null);
     await vi.runAllTimersAsync();
 
     const byKind = await source.searchMessages(MOCK_RUN_ID, "HANDOFF");
@@ -328,7 +328,7 @@ describe("MockEventSource — gate/search methods (plan D4, D8: runId first)", (
     expect(await emptySource.searchMessages(MOCK_RUN_ID, "anything")).toEqual([]);
 
     const source = new MockEventSource(0);
-    await source.start("간단한 랜딩 페이지", false);
+    await source.start("간단한 랜딩 페이지", false, null);
     await vi.runAllTimersAsync();
     expect(await source.searchMessages(MOCK_RUN_ID, "no-such-token-xyz")).toEqual([]);
   });
@@ -348,6 +348,40 @@ describe("MockEventSource.createProject", () => {
   });
 });
 
+describe("MockEventSource.listProjects", () => {
+  it("resolves a name-ascending list, each item with name and path", async () => {
+    const source = new MockEventSource();
+    const projects = await source.listProjects!();
+    expect(projects.map((p) => p.name)).toEqual(["alpha", "beta"]);
+    for (const p of projects) {
+      expect(p).toEqual(expect.objectContaining({ name: expect.any(String), path: expect.any(String) }));
+    }
+  });
+
+  it("is deterministic across repeated calls (boundary — guards against non-deterministic/random data)", async () => {
+    const source = new MockEventSource();
+    const first = await source.listProjects!();
+    const second = await source.listProjects!();
+    expect(second).toEqual(first);
+  });
+
+  // listProjects cannot error by construction (no invoke, no filesystem access) — no error case.
+
+  it("does not change start()'s scenario replay when a projectRoot is passed (boundary — third arg is a no-op here)", async () => {
+    vi.useFakeTimers();
+    const source = new MockEventSource(0);
+    const received: RunEvent[] = [];
+    source.onEvent((_runId, ev) => received.push(ev));
+
+    const runId = await source.start("goal", false, "/mock/demo");
+    await vi.runAllTimersAsync();
+
+    expect(runId).toBe(MOCK_RUN_ID);
+    expect(received[0]).toMatchObject({ type: "run_started", goal: "goal" });
+    vi.useRealTimers();
+  });
+});
+
 describe("MockEventSource + RunState integration", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -362,7 +396,7 @@ describe("MockEventSource + RunState integration", () => {
     const store = createRunStore(source);
     source.onEvent(store.getState().applyEvent);
 
-    const runId = await store.getState().startChannel("간단한 랜딩 페이지", false);
+    const runId = await store.getState().startChannel("간단한 랜딩 페이지", false, null);
     await vi.runAllTimersAsync();
 
     const s = store.getState().channels[runId];
