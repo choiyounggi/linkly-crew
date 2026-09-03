@@ -442,8 +442,8 @@ export class MockEventSource implements RunEventSource {
     this.roster = roster;
   }
 
-  /** `scripted` is unused: this source IS the scripted demo regardless of the toggle (it only ever runs outside Tauri). */
-  async start(goal: string, _scripted: boolean): Promise<string> {
+  /** `scripted`/`projectRoot` are unused: this source IS the scripted demo regardless of the toggle (it only ever runs outside Tauri), and its scenario replay doesn't vary by project. */
+  async start(goal: string, _scripted: boolean, _projectRoot: string | null): Promise<string> {
     this.clearTimers();
     this.nextSeq = 1;
     this.deliveredMessages = [];
@@ -499,6 +499,14 @@ export class MockEventSource implements RunEventSource {
       throw new Error("invalid_name");
     }
     return { name, path: `/mock/${name}` };
+  }
+
+  /** Deterministic, fixed two-project list (name-ascending) matching `createProject`'s `/mock/<name>` path convention — this mock can't fail by construction. */
+  async listProjects(): Promise<ProjectInfo[]> {
+    return [
+      { name: "alpha", path: "/mock/alpha" },
+      { name: "beta", path: "/mock/beta" },
+    ];
   }
 
   private clearTimers(): void {
