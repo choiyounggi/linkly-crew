@@ -389,8 +389,9 @@ kill하지만 `RoleHarnessBehavior`/`DesignerHarnessBehavior`가 죽은 `Session
 (D3) `RunConfig.turn_timeout_secs`(기본 900=deadline_ms/1000) 노브를
 `with_turn_timeout`/`specify_with_timeout`로 threading, `DEFAULT_TURN_TIMEOUT` 120→900s.
 (D4) `turn_timeout_secs: 0` → `RunError::ConfigInvalid`, 스폰 전 거부.
-(D5) Tauri에 tracing-subscriber+tracing-appender 로그 싱크(`~/.linkly-crew/logs/crew-app.log`,
-daily-rolling, non-blocking, `WorkerGuard`는 `app.manage` 보관).
+(D5) Tauri에 tracing-subscriber+tracing-appender 로그 싱크
+(`~/.linkly-crew/logs/crew-app.log.<YYYY-MM-DD>` — `rolling::daily`가 붙이는 날짜 접미사 포함,
+non-blocking, `WorkerGuard`는 `app.manage` 보관).
 
 **검증(실측)**: `cargo test --workspace` passed=439 failed=0,
 `(cd apps/crew-app/src-tauri && cargo test)` passed=70 failed=0(1 ignored), `cargo check` OK.
