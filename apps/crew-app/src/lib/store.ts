@@ -31,6 +31,8 @@ export interface ChannelState {
   typing: Record<string, boolean>;
   /** t7 plan D1 (Task 03): thread id open in the right-panel ThreadPanel, or null when none. Set directly via `useRunStore.setState` from chat/index.tsx — no dedicated action, per this task's field-only store scope. */
   selectedThread: string | null;
+  /** The project root designated when this run was started (t2-fe-picker plan D4, 2차 런 이슈 #13). Not server-owned — run_snapshot doesn't return it — so it must be carried forward explicitly on every reset, or it's lost with no recovery path. */
+  projectRoot: string | null;
 }
 
 /** Multi-run store root (plan D1): `channels` keyed by `run_id`, `channelOrder` for sidebar ordering, `activeRunId` for the selected channel. */
@@ -38,8 +40,8 @@ export interface RunState {
   channels: Record<string, ChannelState>;
   activeRunId: string | null;
   channelOrder: string[];
-  /** create_project→start_run flow's last step (plan D4) — resolves once the run exists, selects it, returns its run_id. */
-  startChannel(goal: string, scripted: boolean): Promise<string>;
+  /** create_project→start_run flow's last step (plan D4) — resolves once the run exists, selects it, returns its run_id. `projectRoot` is required (t2-fe-picker plan D1) — `null` for the legacy scratch run. */
+  startChannel(goal: string, scripted: boolean, projectRoot: string | null): Promise<string>;
   /** Selects a channel and re-syncs its state from the backend (plan D3). */
   selectChannel(runId: string): void;
   /** stop_run + remove_run (plan Task01 step1), then drops the channel locally regardless of either call's outcome. */
@@ -49,7 +51,12 @@ export interface RunState {
 }
 
 /** Exported for tests that need a fully-shaped `ChannelState` (e.g. features/chat's). */
-export function emptyChannel(runId: string, goal: string, scripted: boolean): ChannelState {
+export function emptyChannel(
+  runId: string,
+  goal: string,
+  scripted: boolean,
+  projectRoot: string | null = null,
+): ChannelState {
   return {
     runId,
     goal,
@@ -67,6 +74,7 @@ export function emptyChannel(runId: string, goal: string, scripted: boolean): Ch
     readReceipts: {},
     typing: {},
     selectedThread: null,
+    projectRoot,
   };
 }
 
@@ -79,7 +87,7 @@ function applyEventToChannel(
   switch (ev.type) {
     case "run_started":
       seenSeqs.clear();
-      return emptyChannel(channel.runId, ev.goal, channel.scripted);
+      return emptyChannel(channel.runId, ev.goal, channel.scripted, channel.projectRoot);
 
     case "spec_ready":
       return { ...channel, spec: ev.spec, dag: ev.dag, sprint: ev.sprint };
@@ -173,15 +181,15 @@ export function createRunStore(source: RunEventSource) {
     activeRunId: null,
     channelOrder: [],
 
-    async startChannel(goal, scripted) {
+    async startChannel(goal, scripted, projectRoot) {
       // source.start() only allocates the run and returns its id (no
       // snapshot work) — the channel entry below must exist before
       // source.resync() below can deliver any event for it, or those
       // events would be dropped as "unknown run_id" (plan D3).
-      const runId = await source.start(goal, scripted);
+      const runId = await source.start(goal, scripted, projectRoot);
       seenSeqsByRun.set(runId, new Set());
       set((s) => ({
-        channels: { ...s.channels, [runId]: emptyChannel(runId, goal, scripted) },
+        channels: { ...s.channels, [runId]: emptyChannel(runId, goal, scripted, projectRoot) },
         channelOrder: [...s.channelOrder, runId],
         activeRunId: runId,
       }));

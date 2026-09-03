@@ -55,20 +55,38 @@ function snapshotFor(runId: string, over: Record<string, unknown> = {}) {
 }
 
 describe("TauriEventSource.start — allocates the run only, no snapshot work", () => {
-  it("invokes start_run with {goal, scripted} and returns the run_id, without calling run_snapshot", async () => {
+  it("invokes start_run with {goal, scripted, projectRoot} and returns the run_id, without calling run_snapshot", async () => {
     const { listen } = fakeListen();
     const invoke: Invoke = vi.fn(async (cmd, args) => {
       if (cmd === "start_run") {
-        expect(args).toEqual({ goal: "landing page", scripted: true });
+        expect(args).toEqual({ goal: "landing page", scripted: true, projectRoot: "/ws/demo" });
         return "run-42" as never;
       }
       throw new Error(`unexpected invoke ${String(cmd)}`);
     });
     const source = new TauriEventSource(invoke, listen);
 
-    const runId = await source.start("landing page", true);
+    const runId = await source.start("landing page", true, "/ws/demo");
 
     expect(runId).toBe("run-42");
+  });
+
+  it("still sends the projectRoot key when null, instead of omitting it (plan D6 — undocumented Tauri key-omission behavior)", async () => {
+    const { listen } = fakeListen();
+    const invoke: Invoke = vi.fn(async (cmd, args) => {
+      if (cmd === "start_run") {
+        expect(args).toBeDefined();
+        expect("projectRoot" in (args as Record<string, unknown>)).toBe(true);
+        expect((args as Record<string, unknown>).projectRoot).toBeNull();
+        return "run-43" as never;
+      }
+      throw new Error(`unexpected invoke ${String(cmd)}`);
+    });
+    const source = new TauriEventSource(invoke, listen);
+
+    const runId = await source.start("goal", false, null);
+
+    expect(runId).toBe("run-43");
   });
 });
 
@@ -264,7 +282,7 @@ describe("TauriEventSource — stop/remove/listRuns (multi-run commands)", () =>
     const unsubscribeA = source.onEvent((_r, ev) => receivedA.push(ev));
     source.onEvent((_r, ev) => receivedB.push(ev));
 
-    await source.start("goal", false);
+    await source.start("goal", false, null);
     unsubscribeA();
     push("run-x", { type: "message", seq: 1, envelope: envelope() });
 
@@ -361,5 +379,45 @@ describe("TauriEventSource.createProject", () => {
     const source = new TauriEventSource(invoke, listen);
 
     await expect(source.createProject("my-app")).rejects.toThrow("gh_missing");
+  });
+});
+
+describe("TauriEventSource.listProjects", () => {
+  it("invokes list_projects with no args and forwards the resolved ProjectInfo[]", async () => {
+    const { listen } = fakeListen();
+    const invoke = vi.fn(async (cmd: string, args?: Record<string, unknown>) => {
+      if (cmd === "list_projects") {
+        expect(args).toBeUndefined();
+        return [
+          { name: "alpha", path: "/ws/alpha" },
+          { name: "beta", path: "/ws/beta" },
+        ];
+      }
+      throw new Error(`unexpected invoke ${cmd}`);
+    }) as unknown as Invoke;
+    const source = new TauriEventSource(invoke, listen);
+
+    await expect(source.listProjects!()).resolves.toEqual([
+      { name: "alpha", path: "/ws/alpha" },
+      { name: "beta", path: "/ws/beta" },
+    ]);
+  });
+
+  it("propagates a rejected list_projects (e.g. workspace_missing) instead of swallowing it", async () => {
+    const { listen } = fakeListen();
+    const invoke: Invoke = vi.fn(async () => {
+      throw new Error("workspace_missing: /ws");
+    });
+    const source = new TauriEventSource(invoke, listen);
+
+    await expect(source.listProjects!()).rejects.toThrow("workspace_missing: /ws");
+  });
+
+  it("resolves an empty array when the workspace root exists but has zero projects (boundary)", async () => {
+    const { listen } = fakeListen();
+    const invoke: Invoke = vi.fn(async () => [] as never);
+    const source = new TauriEventSource(invoke, listen);
+
+    await expect(source.listProjects!()).resolves.toEqual([]);
   });
 });

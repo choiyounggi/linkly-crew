@@ -13,8 +13,8 @@ import { TauriEventSource } from "./tauri-source";
  * still compiles.
  */
 export interface RunEventSource {
-  /** start_run(goal, scripted) -> run_id. Only allocates the run; no snapshot work (call `resync` after inserting the channel). */
-  start(goal: string, scripted: boolean): Promise<string>;
+  /** start_run(goal, scripted, projectRoot) -> run_id. Only allocates the run; no snapshot work (call `resync` after inserting the channel). `projectRoot` is `null` for the legacy scratch run (plan D1/D6, 2차 런 이슈 #13). */
+  start(goal: string, scripted: boolean, projectRoot: string | null): Promise<string>;
   /** Returns an unsubscribe function. Every event is tagged with its run_id (plan D3) so a caller can route/ignore per channel. */
   onEvent(cb: (runId: string, ev: RunEvent) => void): () => void;
   stop(runId: string): Promise<void>;
@@ -24,6 +24,13 @@ export interface RunEventSource {
   listRuns(): Promise<RunSummary[]>;
   /** t3-be-project's ProjectApi (decisions.md) — the new-task flow's first step (plan D4), ahead of `start`. */
   createProject(name: string): Promise<ProjectInfo>;
+  /**
+   * list_projects() -> ProjectInfo[], name-ascending (plan D5, 2차 런 이슈 #13). Optional so
+   * sources without the "기존 선택" flow still compile (t2-fe-picker's `fakeSource` fan-out
+   * guard). Rejects `workspace_missing: <path>` if the workspace root is missing/not a
+   * directory; resolves `[]` if the root exists with zero projects.
+   */
+  listProjects?(): Promise<ProjectInfo[]>;
   /** D8: run_id-first, per t1's MultiRunApi contract (decisions.md). */
   swapHarness?(runId: string, agentId: string, harness: string): Promise<void>;
   getRoster?(): Promise<Roster>;
