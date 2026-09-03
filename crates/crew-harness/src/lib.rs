@@ -24,8 +24,13 @@ pub use pool::{HarnessPool, PoolPermit};
 pub use registry::{AdapterStatus, HarnessInfo, HarnessRegistry};
 
 /// Default turn timeout for [`Harness::send`] callers that don't need a
-/// shorter one (tests inject a short duration explicitly — see D6).
-pub const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(120);
+/// shorter one (tests inject a short duration explicitly — see D6). 900s
+/// matches the task deadline (`deadline_ms` 900_000, M13 turn-recovery fix
+/// D3) — a role worker's turn budget should not be shorter than the task's
+/// own deadline. Callers that need a run-configurable value use
+/// `RoleHarnessBehavior::with_turn_timeout` / `LlmLeadPlanner::
+/// specify_with_timeout` instead of this constant directly.
+pub const DEFAULT_TURN_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// Identifies which harness implementation produced a [`Session`]
 /// (`claude-code`, `codex`, ... — DESIGN.md §2.3).
@@ -166,5 +171,16 @@ mod handoff_snapshot_tests {
         let json = r#"{"harness":"claude-code","session_id":"11111111-1111-4111-8111-111111111111"}"#;
         let err = serde_json::from_str::<HandoffSnapshot>(json).unwrap_err();
         assert!(err.to_string().contains("notes"));
+    }
+}
+
+/// M13 turn-recovery fix (D3): the default matches the task deadline.
+#[cfg(test)]
+mod default_turn_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn default_turn_timeout_is_900_seconds() {
+        assert_eq!(DEFAULT_TURN_TIMEOUT, Duration::from_secs(900));
     }
 }

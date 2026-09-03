@@ -125,6 +125,8 @@ pub(crate) fn build_run_config(
         // To turn it on, pass crew_run::default_dev_cmd_checks_rust() etc.
         dev_cmd_checks: Vec::new(),
         project_root,
+        // M13 turn-recovery fix D3: = task deadline_ms / 1000.
+        turn_timeout_secs: 900,
     }
 }
 
@@ -1251,6 +1253,7 @@ mod tests {
         let cfg = build_run_config("goal".to_string(), RunMode::RealCli, PathBuf::from("/abs/data"), claude_five_team(), project_root.clone());
         assert!(cfg.dev_cmd_checks.is_empty(), "dev_cmd_checks must stay unarmed (함정 29 / issue #5)");
         assert_eq!(cfg.project_root, project_root, "build_run_config must forward project_root unchanged");
+        assert_eq!(cfg.turn_timeout_secs, 900, "M13 turn-recovery fix D3: default must match the task deadline");
     }
 
     /// A real, minimal git repo (`git init` + one commit so `HEAD` resolves)

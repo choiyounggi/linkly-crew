@@ -43,6 +43,7 @@ fn scripted_config(data_dir: PathBuf, planted_violations: Vec<(Role, Vec<String>
         roster: None,
         dev_cmd_checks: Vec::new(),
         project_root: None,
+        turn_timeout_secs: 900,
     }
 }
 
@@ -206,6 +207,33 @@ async fn empty_goal_propagates_spec_failed_run_error() {
         Err(other) => panic!("expected RunError::SpecFailed, got a different RunError: {other}"),
         Ok(_) => panic!("an empty/whitespace-only goal must not succeed"),
     }
+}
+
+/// M13 turn-recovery fix (D4): `turn_timeout_secs == 0` is rejected before
+/// any spawn — no run directory / bus connection side effects beyond what
+/// the other early-error tests in this file already tolerate.
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_turn_timeout_secs_is_rejected_before_any_spawn() {
+    let data_dir = test_data_dir("zero-turn-timeout");
+    let cfg = RunConfig {
+        turn_timeout_secs: 0,
+        ..scripted_config(data_dir.clone(), vec![])
+    };
+
+    let result = RunController::start(cfg).await;
+
+    match result {
+        Err(RunError::ConfigInvalid(m)) => {
+            assert!(m.contains("turn_timeout_secs"), "message must name the field: {m}");
+        }
+        Err(other) => panic!("expected RunError::ConfigInvalid, got a different RunError: {other}"),
+        Ok(_) => panic!("turn_timeout_secs: 0 must not succeed"),
+    }
+    assert!(
+        !data_dir.exists(),
+        "rejected before any spawn means no ledger/data_dir side effect either: {data_dir:?}"
+    );
+    cleanup(&data_dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]

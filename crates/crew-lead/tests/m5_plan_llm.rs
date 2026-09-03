@@ -201,6 +201,98 @@ async fn specify_rejects_whitespace_only_request_without_spawning_a_session() {
     assert_eq!(err, PlanError::EmptyRequest);
 }
 
+// --- turn timeout knob (M13 turn-recovery fix D3) ------------------------
+
+/// Wraps a real `ClaudeCodeHarness` (driving `fake-lead-claude.sh`) so
+/// `send`'s real behavior is unchanged but the `timeout` argument it
+/// receives on each call is recorded — `Session` has no public constructor
+/// outside crew-harness (see this file's module doc), so a genuine
+/// `ClaudeCodeHarness` must still do the real spawn/send/shutdown work.
+struct TimeoutCapturingHarness {
+    inner: ClaudeCodeHarness,
+    recorded: std::sync::Mutex<Vec<std::time::Duration>>,
+}
+
+#[async_trait::async_trait]
+impl crew_harness::Harness for TimeoutCapturingHarness {
+    fn id(&self) -> crew_harness::HarnessId {
+        self.inner.id()
+    }
+
+    async fn spawn(&self, cfg: &crew_harness::AgentCfg) -> Result<crew_harness::Session, crew_harness::HarnessError> {
+        self.inner.spawn(cfg).await
+    }
+
+    async fn send(
+        &self,
+        session: &mut crew_harness::Session,
+        turn: crew_harness::UserTurn,
+        timeout: std::time::Duration,
+    ) -> Result<crew_harness::TurnOutcome, crew_harness::HarnessError> {
+        self.recorded.lock().unwrap().push(timeout);
+        // Record the caller's `timeout` value for the assertion, but bound
+        // the real fixture subprocess call with a generous real deadline
+        // regardless of it — a genuinely-elapsing 5ms timeout against a real
+        // spawned process is a flaky test, not a proof of pass-through.
+        self.inner.send(session, turn, std::time::Duration::from_secs(5)).await
+    }
+
+    fn take_events(&self, session: &mut crew_harness::Session) -> tokio::sync::mpsc::Receiver<crew_harness::HarnessEvent> {
+        self.inner.take_events(session)
+    }
+
+    async fn snapshot(&self, session: &crew_harness::Session) -> Result<crew_harness::HandoffSnapshot, crew_harness::HarnessError> {
+        self.inner.snapshot(session).await
+    }
+
+    async fn shutdown(&self, session: crew_harness::Session) -> Result<(), crew_harness::HarnessError> {
+        self.inner.shutdown(session).await
+    }
+}
+
+fn timeout_capturing_harness(mode: &str, assistant_1: &str) -> Arc<TimeoutCapturingHarness> {
+    Arc::new(TimeoutCapturingHarness {
+        inner: ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+            .with_env("FAKE_MODE", mode)
+            .with_env("FAKE_ASSISTANT_1", assistant_1),
+        recorded: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
+fn valid_spec_body() -> String {
+    json!({
+        "goal": "shopping cart",
+        "non_goals": [],
+        "constraints": [],
+        "requirements": [{"id": "REQ-1", "text": "cart page"}],
+        "acceptance": []
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn specify_with_timeout_passes_its_duration_through_to_send() {
+    let h = timeout_capturing_harness("json", &assistant_line(&valid_spec_body()));
+
+    LlmLeadPlanner::specify_with_timeout(h.clone(), "shopping cart request", std::time::Duration::from_millis(5))
+        .await
+        .expect("valid JSON reply must produce a SpecDoc");
+
+    assert_eq!(*h.recorded.lock().unwrap(), vec![std::time::Duration::from_millis(5)]);
+}
+
+#[tokio::test]
+async fn specify_without_with_timeout_uses_the_900s_default() {
+    let h = timeout_capturing_harness("json", &assistant_line(&valid_spec_body()));
+
+    LlmLeadPlanner::specify(h.clone(), "shopping cart request")
+        .await
+        .expect("valid JSON reply must produce a SpecDoc");
+
+    assert_eq!(*h.recorded.lock().unwrap(), vec![crew_harness::DEFAULT_TURN_TIMEOUT]);
+    assert_eq!(crew_harness::DEFAULT_TURN_TIMEOUT, std::time::Duration::from_secs(900));
+}
+
 // --- real CLI (contract §C8 — add only, never run here) -----------------
 
 #[tokio::test]

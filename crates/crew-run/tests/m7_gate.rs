@@ -46,6 +46,7 @@ fn config(data_dir: PathBuf) -> RunConfig {
         roster: None,
         dev_cmd_checks: Vec::new(),
         project_root: None,
+        turn_timeout_secs: 900,
     }
 }
 
@@ -190,6 +191,7 @@ async fn resolve_gate_after_the_run_has_finished_is_gate_unavailable() {
         roster: None,
         dev_cmd_checks: Vec::new(),
         project_root: None,
+        turn_timeout_secs: 900,
     })
     .await;
 
