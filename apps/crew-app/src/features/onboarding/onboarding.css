@@ -1,23 +1,8 @@
-/* design_spec: 슬랙형 토큰 체계(다크 사이드바, styles/tokens.css) 위에서
- * 온보딩·설정은 밝은 중앙 카드 위저드. tokens.css는 dark-only(D19)이므로,
- * 같은 토큰 이름을 .onboarding-light 스코프 안에서 밝은 값으로 재정의한다 —
- * Button/Field/Badge(components/primitives.tsx)가 var(--ink-text) 등을 그대로
- * 참조하므로 컴포넌트 코드를 건드리지 않고 밝은 톤이 적용된다. */
+/* design_spec: the wizard shares the app's dark tokens (D19/dark-only,
+ * 2026-09-03) — .onboarding-light stays as a plain wrapper class (tsx keeps
+ * referencing it) but no longer redefines any custom property; the light
+ * theme itself was removed. */
 .onboarding-light {
-  color-scheme: light;
-  --surface-paper: #ffffff;
-  --surface-panel: #f6f7f9;
-  --surface-raised: #ececef;
-  --surface-overlay: #e2e4e9;
-  --border-hairline: #dde1e7;
-  --ink-text: #1a1d23;
-  --ink-dim: #5b6270;
-  --ink-faint: #8a909c;
-  --color-accent: oklch(55% 0.16 var(--surface-hue, 215));
-  --color-accent-ink: #ffffff;
-  --status-danger: oklch(52% 0.19 25);
-  --status-warning: oklch(58% 0.15 80);
-  --status-success: oklch(50% 0.16 150);
   background: var(--surface-panel);
   color: var(--ink-text);
 }
@@ -36,10 +21,9 @@
   width: min(640px, 100%);
   max-height: min(760px, 90vh);
   overflow-y: auto;
-  background: var(--surface-paper);
+  background: var(--surface-panel);
   border: 1px solid var(--border-hairline);
-  border-radius: var(--radius-xl);
-  box-shadow: 0 20px 60px -24px rgba(20, 24, 32, 0.28);
+  border-radius: var(--radius-2xl);
 }
 
 .onboarding-panels {
@@ -125,8 +109,8 @@
   gap: var(--space-2);
   padding: var(--space-3);
   border: 1px solid var(--border-hairline);
-  border-radius: var(--radius-md);
-  background: var(--surface-panel);
+  border-radius: var(--radius-lg);
+  background: var(--surface-raised);
 }
 
 .onboarding-tool__row {
@@ -157,7 +141,7 @@
   margin: 0;
   padding: var(--space-2) var(--space-3);
   background: var(--surface-overlay);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   overflow-x: auto;

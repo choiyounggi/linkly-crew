@@ -3,8 +3,8 @@
 .modal {
   background: var(--surface-panel);
   border: 1px solid var(--border-hairline);
-  border-radius: var(--radius-lg);
-  box-shadow: 0 var(--space-4) var(--space-8) oklch(5% 0.01 215 / 0.5);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-floating);
 }
 
 .new-task-modal {
@@ -56,6 +56,7 @@
 
 .new-task-modal__mode-btn {
   flex: 1;
+  min-height: var(--control-h-md);
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-md);
@@ -65,10 +66,15 @@
   cursor: pointer;
 }
 
+.new-task-modal__mode-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
 .new-task-modal__mode-btn.is-active {
-  border-color: var(--accent);
-  color: var(--ink-text);
-  background: var(--surface-raised);
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+  border-color: var(--color-accent);
 }
 
 .new-task-modal__existing {

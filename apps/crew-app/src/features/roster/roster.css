@@ -38,7 +38,7 @@
   align-items: center;
   gap: var(--space-2);
   border: 1px solid var(--border-hairline);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   padding: var(--space-2) var(--space-2);
 }
 
@@ -46,8 +46,8 @@
 .roster__add select:focus-visible,
 .roster__slot select:focus-visible,
 .roster__slot input:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 .roster__add select:disabled,
