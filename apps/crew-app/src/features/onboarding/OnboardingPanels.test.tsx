@@ -71,6 +71,108 @@ describe("OnboardingPanels", () => {
     expect(await screen.findByText("저장됨")).toBeInTheDocument();
   });
 
+  // -- normal: folder picker fills the field -----------------------------
+
+  it("fills the workspace field with the picked directory and passes the current value to the picker", async () => {
+    const pickWorkspaceDirectory = vi.fn(async () => "/home/dev/picked-workspace");
+    const setSettings = vi.fn(async (workspaceRoot: string) => ({ workspace_root: workspaceRoot }));
+    const api = createFakeApi({ pickWorkspaceDirectory, setSettings });
+
+    render(<OnboardingPanels api={api} variant="onboarding" onComplete={vi.fn()} />);
+
+    const input = await screen.findByLabelText("워크스페이스 경로");
+    await waitFor(() => expect(input).toHaveValue("/home/dev/workspace"));
+
+    fireEvent.click(screen.getByRole("button", { name: "찾아보기…" }));
+
+    await waitFor(() => expect(input).toHaveValue("/home/dev/picked-workspace"));
+    expect(pickWorkspaceDirectory).toHaveBeenCalledWith("/home/dev/workspace");
+
+    // Picking only fills the field — the value reaches the backend on 저장.
+    expect(setSettings).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "저장" }));
+    await waitFor(() => expect(setSettings).toHaveBeenCalledWith("/home/dev/picked-workspace"));
+  });
+
+  // -- boundary: cancel leaves the field untouched ------------------------
+
+  it("leaves the workspace field unchanged and shows no error when the picker is cancelled", async () => {
+    const pickWorkspaceDirectory = vi.fn(async () => null);
+    const api = createFakeApi({ pickWorkspaceDirectory });
+
+    render(<OnboardingPanels api={api} variant="onboarding" onComplete={vi.fn()} />);
+
+    const input = await screen.findByLabelText("워크스페이스 경로");
+    await waitFor(() => expect(input).toHaveValue("/home/dev/workspace"));
+
+    fireEvent.click(screen.getByRole("button", { name: "찾아보기…" }));
+
+    await waitFor(() => expect(pickWorkspaceDirectory).toHaveBeenCalled());
+    expect(input).toHaveValue("/home/dev/workspace");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  // -- boundary: no picker on the api means no button --------------------
+
+  it("does not render 찾아보기 when the api has no directory picker (browser demo)", async () => {
+    const api = createFakeApi();
+    expect(api.pickWorkspaceDirectory).toBeUndefined();
+
+    render(<OnboardingPanels api={api} variant="onboarding" onComplete={vi.fn()} />);
+
+    await screen.findByLabelText("워크스페이스 경로");
+    expect(screen.queryByRole("button", { name: "찾아보기…" })).not.toBeInTheDocument();
+  });
+
+  // -- boundary: 저장/찾아보기 are mutually exclusive while either is pending --
+
+  it("disables 저장 while the picker is open and 찾아보기 while a save is in flight", async () => {
+    let releasePick: (path: string | null) => void = () => {};
+    let releaseSave: (settings: { workspace_root: string }) => void = () => {};
+    const api = createFakeApi({
+      pickWorkspaceDirectory: vi.fn(() => new Promise<string | null>((resolve) => (releasePick = resolve))),
+      setSettings: vi.fn(() => new Promise<{ workspace_root: string }>((resolve) => (releaseSave = resolve))),
+    });
+
+    render(<OnboardingPanels api={api} variant="onboarding" onComplete={vi.fn()} />);
+    await screen.findByLabelText("워크스페이스 경로");
+
+    // Picker pending -> 저장 must be unclickable.
+    fireEvent.click(screen.getByRole("button", { name: "찾아보기…" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "저장" })).toBeDisabled());
+
+    await act(async () => {
+      releasePick(null);
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "저장" })).toBeEnabled());
+
+    // Save pending -> 찾아보기 must be unclickable.
+    fireEvent.click(screen.getByRole("button", { name: "저장" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "찾아보기…" })).toBeDisabled());
+
+    await act(async () => {
+      releaseSave({ workspace_root: "/home/dev/workspace" });
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "찾아보기…" })).toBeEnabled());
+  });
+
+  // -- error: picker rejection surfaces under the field -------------------
+
+  it("surfaces a picker rejection under the workspace field instead of failing silently", async () => {
+    const api = createFakeApi({
+      pickWorkspaceDirectory: vi.fn(async () => {
+        throw new Error("dialog.open not allowed");
+      }),
+    });
+
+    render(<OnboardingPanels api={api} variant="onboarding" onComplete={vi.fn()} />);
+
+    await screen.findByLabelText("워크스페이스 경로");
+    fireEvent.click(screen.getByRole("button", { name: "찾아보기…" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/dialog\.open not allowed/);
+  });
+
   // -- error: workspace save surfaces the rejection ----------------------
 
   it("surfaces a setSettings rejection (relative-path Err) under the workspace field", async () => {

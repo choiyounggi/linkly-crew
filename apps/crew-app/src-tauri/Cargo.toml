@@ -13,6 +13,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+# Native folder picker for the workspace path field (onboarding/settings).
+# The JS side calls the plugin's own `open` API rather than an ad hoc
+# command, so the supported surface is what we depend on.
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

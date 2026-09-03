@@ -192,6 +192,11 @@ async fn list_projects() -> Result<Vec<project::ProjectInfo>, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Native folder picker for the workspace path field — the frontend
+        // calls this plugin's `open({directory: true})`, so the permission
+        // it needs (`dialog:allow-open`) is declared in
+        // `capabilities/default.json`.
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .manage(pty::PtyRegistry::default())
         .invoke_handler(tauri::generate_handler![

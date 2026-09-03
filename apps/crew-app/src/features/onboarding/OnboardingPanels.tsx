@@ -78,6 +78,30 @@ export default function OnboardingPanels({ api = defaultOnboardingApi, variant, 
     };
   }, [api]);
 
+  // 찾아보기: OS 폴더 선택창. `pickWorkspaceDirectory`가 없는 api(브라우저 데모)에서는
+  // 버튼 자체를 렌더하지 않는다 — 동작할 수 없는 버튼을 보여주지 않기 위해서다.
+  const supportsDirectoryPicker = typeof api.pickWorkspaceDirectory === "function";
+  const [pickState, setPickState] = useState<LoadState>("idle");
+
+  const handlePickWorkspace = async () => {
+    if (!api.pickWorkspaceDirectory) return;
+    setPickState("loading");
+    setWorkspaceError(null);
+    try {
+      const picked = await api.pickWorkspaceDirectory(workspaceRoot);
+      // 취소는 null — 입력값을 건드리지 않고 조용히 돌아간다(에러가 아니다).
+      if (picked !== null) {
+        setWorkspaceRoot(picked);
+        // 경로가 바뀌었으므로 이전 "저장됨" 표시는 더 이상 참이 아니다.
+        setWorkspaceSaveState("idle");
+      }
+      setPickState("idle");
+    } catch (err) {
+      setWorkspaceError(errorMessage(err));
+      setPickState("error");
+    }
+  };
+
   const handleSaveWorkspace = async () => {
     setWorkspaceSaveState("loading");
     setWorkspaceError(null);
@@ -129,19 +153,38 @@ export default function OnboardingPanels({ api = defaultOnboardingApi, variant, 
     <div className="onboarding-panels">
       <section className="onboarding-panels__section">
         <h2 className="onboarding-panels__section-title">워크스페이스</h2>
-        <Field label="워크스페이스 경로" error={workspaceError ?? undefined}>
-          <input
-            type="text"
-            value={workspaceRoot}
-            disabled={workspaceLoadState === "loading"}
-            onChange={(e) => setWorkspaceRoot(e.target.value)}
-          />
-        </Field>
+        {/* 찾아보기 버튼은 Field 안이 아니라 형제로 둔다 — Field는 자식 하나를 cloneElement로
+            복제해 라벨의 htmlFor와 이어줄 id를 주입하므로, input을 래퍼로 감싸면 그 id가
+            래퍼에 붙어 라벨 연결이 끊긴다. */}
+        <div className="onboarding-panels__path-row">
+          <Field label="워크스페이스 경로" error={workspaceError ?? undefined}>
+            <input
+              type="text"
+              value={workspaceRoot}
+              disabled={workspaceLoadState === "loading"}
+              onChange={(e) => setWorkspaceRoot(e.target.value)}
+            />
+          </Field>
+          {supportsDirectoryPicker && (
+            <Button
+              variant="ghost"
+              loading={pickState === "loading"}
+              // 저장이 진행 중이면 폴더 선택을 막는다 — 뒤늦게 끝난 저장이
+              // 방금 고른 경로를 예전 값으로 되돌리는 경합을 없앤다.
+              disabled={workspaceLoadState === "loading" || workspaceSaveState === "loading"}
+              onClick={() => void handlePickWorkspace()}
+            >
+              찾아보기…
+            </Button>
+          )}
+        </div>
         <div className="onboarding-panels__footer">
           <Button
             variant="primary"
             loading={workspaceSaveState === "loading"}
-            disabled={workspaceLoadState === "loading"}
+            // 반대 방향도 막는다: 폴더 선택창이 열려 있는 동안 저장하면
+            // 사용자가 아직 고르는 중인 경로가 아니라 예전 값이 저장된다.
+            disabled={workspaceLoadState === "loading" || pickState === "loading"}
             onClick={() => void handleSaveWorkspace()}
           >
             {workspaceSaveState === "loading" ? "저장 중…" : "저장"}

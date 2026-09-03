@@ -81,6 +81,20 @@
   font-size: var(--font-size-xs);
 }
 
+/* 경로 입력 + 찾아보기 버튼. Field는 라벨/입력/에러가 쌓인 세로 열이므로 flex-end로
+   맞춰 버튼이 (라벨이 아니라) 입력 줄과 나란히 서게 한다. 에러가 표시되는 동안에는
+   열이 한 줄 길어져 버튼이 그만큼 내려간다 — 일시적 상태라 허용한다. */
+.onboarding-panels__path-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+
+.onboarding-panels__path-row .field {
+  flex: 1;
+  min-width: 0;
+}
+
 .onboarding-panels__footer {
   display: flex;
   align-items: center;

@@ -62,4 +62,79 @@ describe("onboarding-api", () => {
 
     expect(invoke).not.toHaveBeenCalled();
   });
+
+  // -- normal: folder picker returns the chosen path -----------------------
+
+  it("resolves the picked directory and passes an absolute current path as defaultPath", async () => {
+    const openDialog = vi.fn(async () => "/home/dev/picked-workspace");
+    const api = createOnboardingApi(vi.fn() as Invoke, ALWAYS_TAURI, openDialog);
+
+    await expect(api.pickWorkspaceDirectory!("/home/dev/workspace")).resolves.toBe("/home/dev/picked-workspace");
+    expect(openDialog).toHaveBeenCalledWith({ directory: true, multiple: false, defaultPath: "/home/dev/workspace" });
+  });
+
+  // -- boundary: cancel resolves null, not an error -------------------------
+
+  it("resolves null when the user cancels the picker", async () => {
+    const openDialog = vi.fn(async () => null);
+    const api = createOnboardingApi(vi.fn() as Invoke, ALWAYS_TAURI, openDialog);
+
+    await expect(api.pickWorkspaceDirectory!("/home/dev/workspace")).resolves.toBeNull();
+  });
+
+  // -- boundary: a tilde/empty current path must not become defaultPath -----
+
+  it("omits defaultPath when the current value is not an absolute path (the OS dialog does not expand ~)", async () => {
+    const openDialog = vi.fn(async () => "/home/dev/picked");
+    const api = createOnboardingApi(vi.fn() as Invoke, ALWAYS_TAURI, openDialog);
+
+    await api.pickWorkspaceDirectory!("~/linkly-crew/workspace");
+    expect(openDialog).toHaveBeenCalledWith({ directory: true, multiple: false });
+
+    await api.pickWorkspaceDirectory!("");
+    expect(openDialog).toHaveBeenLastCalledWith({ directory: true, multiple: false });
+
+    await api.pickWorkspaceDirectory!();
+    expect(openDialog).toHaveBeenLastCalledWith({ directory: true, multiple: false });
+  });
+
+  // -- boundary: the union return type is narrowed, not asserted ------------
+
+  it("narrows an array result to its first entry and an empty array to null", async () => {
+    const arrayOpen = vi.fn(async () => ["/home/dev/first", "/home/dev/second"]);
+    await expect(createOnboardingApi(vi.fn() as Invoke, ALWAYS_TAURI, arrayOpen).pickWorkspaceDirectory!()).resolves.toBe("/home/dev/first");
+
+    const emptyOpen = vi.fn(async () => [] as string[]);
+    await expect(createOnboardingApi(vi.fn() as Invoke, ALWAYS_TAURI, emptyOpen).pickWorkspaceDirectory!()).resolves.toBeNull();
+  });
+
+  // -- boundary: no native dialog outside Tauri -----------------------------
+
+  it("omits pickWorkspaceDirectory entirely outside Tauri so the UI hides 찾아보기", async () => {
+    const openDialog = vi.fn(async () => "/should/not/be/reached");
+    const api = createOnboardingApi(vi.fn() as Invoke, NEVER_TAURI, openDialog);
+
+    // The key must be ABSENT, not a method that resolves null: OnboardingPanels
+    // renders the button on `typeof api.pickWorkspaceDirectory === "function"`,
+    // so an inert method would produce a button that does nothing when clicked.
+    expect(api.pickWorkspaceDirectory).toBeUndefined();
+    expect("pickWorkspaceDirectory" in api).toBe(false);
+    expect(openDialog).not.toHaveBeenCalled();
+  });
+
+  it("defines pickWorkspaceDirectory under Tauri", async () => {
+    const api = createOnboardingApi(vi.fn() as Invoke, ALWAYS_TAURI, vi.fn(async () => null));
+    expect(typeof api.pickWorkspaceDirectory).toBe("function");
+  });
+
+  // -- error: a dialog rejection propagates ---------------------------------
+
+  it("propagates a picker rejection instead of swallowing it into a silent cancel", async () => {
+    const openDialog = vi.fn(async () => {
+      throw new Error("dialog.open not allowed");
+    });
+    const api = createOnboardingApi(vi.fn() as Invoke, ALWAYS_TAURI, openDialog);
+
+    await expect(api.pickWorkspaceDirectory!()).rejects.toThrow("dialog.open not allowed");
+  });
 });
