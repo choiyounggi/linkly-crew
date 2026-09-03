@@ -213,7 +213,7 @@ describe("findLiteralShadowColors (detector fixtures)", () => {
   });
 
   it("does not flag a box-shadow that references a --shadow token", () => {
-    expect(findLiteralShadowColors(".x {\n  box-shadow: var(--shadow-sm);\n}\n")).toEqual([]);
+    expect(findLiteralShadowColors(".x {\n  box-shadow: var(--shadow-floating);\n}\n")).toEqual([]);
   });
 
   it("does not flag a box-shadow whose only color-looking segment is var(--x)", () => {
