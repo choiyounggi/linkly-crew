@@ -315,10 +315,12 @@ pub struct RoleHarnessBehavior {
     system_hint: String,
     session: Option<Session>,
     events: Option<mpsc::Receiver<HarnessEvent>>,
-    /// Text to prepend to the first turn's prompt (handoff pack JSON,
-    /// sprint summary, ...) — contracts-m5.md C4a. `Option::take()` in
-    /// `build_prompt` guarantees it is consumed exactly once, so later
-    /// turns are unaffected without any extra bookkeeping.
+    /// Text to prepend to the first *successful* turn's prompt (handoff
+    /// pack JSON, sprint summary, ...) — contracts-m5.md C4a. Cleared only
+    /// in `on_envelope`'s `Ok(Success)` arm (M13 turn-recovery fix, review
+    /// r1 finding 1) — NOT in `build_prompt` — so a turn that fails and is
+    /// retried (session discarded, respawned) still gets it prepended;
+    /// only a genuinely successful turn consumes it.
     injected_context: Option<String>,
     /// contracts-m6.md §D2d: when set, the actual CLI-interaction span of
     /// each turn (`ensure_session`'s spawn + the send call) runs under a
@@ -350,9 +352,10 @@ impl RoleHarnessBehavior {
         }
     }
 
-    /// Prepends `text` to the very first turn's prompt only (contracts-m5.md
-    /// C4a) — e.g. a handoff pack JSON or a sprint summary assembled by the
-    /// caller.
+    /// Prepends `text` to every attempt's prompt until one turn genuinely
+    /// succeeds (contracts-m5.md C4a; M13 turn-recovery fix, review r1
+    /// finding 1 — a failed-and-retried attempt must not lose it) — e.g. a
+    /// handoff pack JSON or a sprint summary assembled by the caller.
     pub fn with_injected_context(mut self, text: String) -> Self {
         self.injected_context = Some(text);
         self
@@ -398,8 +401,11 @@ impl RoleHarnessBehavior {
     /// Builds this turn's prompt, or an `Err(reason)` if `env` is a
     /// `TaskAssign` whose `body["task"]` does not parse as a `TaskSpec`
     /// (M3 contract, `.orchestration/contracts-m3.md`) — the caller maps
-    /// that to `Blocked` (D3). `&mut self` so a successful build can
-    /// consume `injected_context` exactly once (M5 C4a).
+    /// that to `Blocked` (D3). Reads (does not consume) `injected_context`
+    /// (M5 C4a) — a failed turn must still have it available for the
+    /// retry's prompt (M13 turn-recovery fix, review r1 finding 1); the
+    /// caller clears it once a turn actually succeeds, in `on_envelope`'s
+    /// `Ok(Success)` arm.
     fn build_prompt(&mut self, env: &Envelope) -> Result<String, String> {
         let task_desc = match env.kind {
             MessageKind::TaskAssign => {
@@ -456,7 +462,7 @@ impl RoleHarnessBehavior {
             self.system_hint, task_desc
         );
 
-        Ok(match self.injected_context.take() {
+        Ok(match self.injected_context.as_deref() {
             Some(injected) => format!("{injected}\n\n{prompt}"),
             None => prompt,
         })
@@ -547,10 +553,19 @@ impl RoleBehavior for RoleHarnessBehavior {
         self.events = Some(events_rx);
 
         match outcome {
-            Ok(TurnOutcome::Success) => match extract_json(&text) {
-                Some(result_body) => self.ack_and_result(&env, coerce_result_body(result_body)),
-                None => self.blocked(&env, "role turn produced no parseable JSON reply".to_string()),
-            },
+            Ok(TurnOutcome::Success) => {
+                // The turn actually reached the model — whatever was
+                // injected is now part of that live session's history, so
+                // it must not be re-prepended to a later turn (M13
+                // turn-recovery fix, review r1 finding 1: only a genuine
+                // success consumes it — a Failed/Err turn below leaves it
+                // in place for the retry).
+                self.injected_context = None;
+                match extract_json(&text) {
+                    Some(result_body) => self.ack_and_result(&env, coerce_result_body(result_body)),
+                    None => self.blocked(&env, "role turn produced no parseable JSON reply".to_string()),
+                }
+            }
             Ok(TurnOutcome::Failed { error }) => {
                 // contracts-m8.md §F2: report a rate-limit-shaped failure to
                 // the pool this turn actually ran under, so the next
@@ -836,6 +851,9 @@ mod turn_recovery_tests {
         script: AsyncMutex<VecDeque<ScriptedTurn>>,
         spawn_count: AtomicUsize,
         shutdown_count: AtomicUsize,
+        /// Every turn's prompt text, in send order (review r1 finding 1:
+        /// proves whether `injected_context` actually reached a given turn).
+        prompts: std::sync::Mutex<Vec<String>>,
     }
 
     impl ScriptedHarness {
@@ -848,6 +866,7 @@ mod turn_recovery_tests {
                 script: AsyncMutex::new(script.into_iter().collect()),
                 spawn_count: AtomicUsize::new(0),
                 shutdown_count: AtomicUsize::new(0),
+                prompts: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -857,6 +876,10 @@ mod turn_recovery_tests {
 
         fn shutdown_count(&self) -> usize {
             self.shutdown_count.load(Ordering::SeqCst)
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
         }
     }
 
@@ -877,6 +900,7 @@ mod turn_recovery_tests {
             turn: UserTurn,
             timeout: Duration,
         ) -> Result<TurnOutcome, HarnessError> {
+            self.prompts.lock().unwrap().push(turn.text.clone());
             // Always run the real turn so the fixture's events actually flow
             // (drain_until_terminal needs a terminal event or it hangs
             // forever) — only the value handed back to the caller follows
@@ -1012,6 +1036,72 @@ mod turn_recovery_tests {
 
         assert_eq!(harness.spawn_count(), 1, "a successful turn must keep the session alive");
         assert_eq!(harness.shutdown_count(), 0);
+    }
+
+    /// Review r1 finding 1: `with_injected_context`'s L1 text must not be
+    /// lost when the very first turn it was meant for fails and is retried
+    /// (the exact ledger defect this task fixes) — `build_prompt` must not
+    /// consume it before the turn is known to have succeeded.
+    #[tokio::test]
+    async fn injected_context_survives_a_failed_first_turn_and_reaches_the_retry() {
+        let harness = Arc::new(ScriptedHarness::new(vec![ScriptedTurn::Failed("timeout"), ScriptedTurn::Real]));
+        let mut behavior = RoleHarnessBehavior::new(
+            harness.clone(),
+            agent_cfg(),
+            Role::Developer,
+            "You are the Developer.".to_string(),
+        )
+        .with_injected_context("L1-MARKER".to_string());
+        let task = make_task_spec();
+
+        let first = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(first[0].kind, MessageKind::Blocked, "the first turn must fail as scripted");
+
+        let second = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(second[1].kind, MessageKind::TaskResult, "the retry must succeed on a fresh session");
+
+        let prompts = harness.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[0].starts_with("L1-MARKER\n\n"),
+            "the failed first attempt's prompt must also carry the marker: {:?}",
+            prompts[0]
+        );
+        assert!(
+            prompts[1].starts_with("L1-MARKER\n\n"),
+            "the retry's prompt must still carry the L1 marker: {:?}",
+            prompts[1]
+        );
+    }
+
+    /// Same scenario without a failure: `injected_context` is genuinely
+    /// single-shot once a turn actually succeeds — the second (unrelated)
+    /// turn must not re-prepend it.
+    #[tokio::test]
+    async fn injected_context_is_cleared_only_after_a_turn_succeeds() {
+        let harness = Arc::new(ScriptedHarness::new(vec![ScriptedTurn::Real, ScriptedTurn::Real]));
+        let mut behavior = RoleHarnessBehavior::new(
+            harness.clone(),
+            agent_cfg(),
+            Role::Developer,
+            "You are the Developer.".to_string(),
+        )
+        .with_injected_context("L1-MARKER".to_string());
+        let task = make_task_spec();
+
+        let first = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(first[1].kind, MessageKind::TaskResult);
+        let second = behavior.on_envelope(task_assign(&task)).await;
+        assert_eq!(second[1].kind, MessageKind::TaskResult);
+
+        let prompts = harness.prompts();
+        assert_eq!(prompts.len(), 2);
+        assert!(prompts[0].starts_with("L1-MARKER\n\n"), "the first prompt must carry the marker: {:?}", prompts[0]);
+        assert!(
+            !prompts[1].contains("L1-MARKER"),
+            "a turn after a genuine success must not re-carry the marker: {:?}",
+            prompts[1]
+        );
     }
 
     // -----------------------------------------------------------------
