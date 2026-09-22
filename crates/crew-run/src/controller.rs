@@ -625,6 +625,7 @@ impl RunController {
         let role_worktrees: Option<Vec<(Role, std::path::PathBuf)>> = match &project_root {
             None => None,
             Some(root) => {
+                worktree::check_artifacts_not_ignored(root).map_err(RunError::ProjectRootInvalid)?;
                 let worktrees_base = worktree::project_worktrees_base(root);
                 Some(resolve_role_worktrees(root, &worktrees_base).map_err(RunError::ProjectRootInvalid)?)
             }
@@ -1889,6 +1890,7 @@ mod resolve_role_worktrees_tests {
     //! tools_guidance forbids touching `$HOME` from a test.
 
     use super::*;
+    use crew_lead::accept::AcceptanceLoop;
     use std::process::Command;
 
     fn test_dir(label: &str) -> std::path::PathBuf {
@@ -1949,6 +1951,55 @@ mod resolve_role_worktrees_tests {
         assert!(result.is_err(), "a non-git project_root must fail resolution");
 
         let _ = std::fs::remove_dir_all(&non_repo);
+    }
+
+    /// R1 (issue #16), plan-reviewer advisory (b): a `project_root` whose
+    /// `.crew/artifacts` is git-ignored is rejected by `start()` before
+    /// `resolve_role_worktrees` ever runs -- proven by asserting the derived
+    /// worktree-base directory does not exist, both before and after the
+    /// rejected call. Non-collision relies on `init_test_repo`'s uuid'd repo
+    /// path: `project_worktrees_base`'s output is a pure function of the
+    /// project_root's absolute path (basename + fnv1a hash of that path), so
+    /// a freshly uuid'd, never-reused project_root guarantees this exact
+    /// derived path was never created by any other test or run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_an_ignored_artifacts_root_and_creates_no_worktree() {
+        let repo = init_test_repo("artifacts-ignore-reject-e2e");
+        std::fs::write(repo.join(".gitignore"), b".crew/\n").expect("test setup: write the issue's exact ignore rule");
+        run_git_ok(&repo, &["add", ".gitignore"]);
+        run_git_ok(&repo, &["commit", "-q", "-m", "add crew ignore rule"]);
+        let expected_worktree_base = worktree::project_worktrees_base(&repo);
+        assert!(!expected_worktree_base.exists(), "test setup: must not pre-exist");
+
+        let cfg = RunConfig {
+            goal: "간단한 랜딩 페이지".to_string(),
+            mode: RunMode::Scripted { planted_violations: vec![] },
+            data_dir: test_dir("artifacts-ignore-reject-e2e-data"),
+            max_rework: AcceptanceLoop::default_budget(),
+            max_per_sprint: 0,
+            escalation_timeout_ms: 0,
+            roster: None,
+            dev_cmd_checks: Vec::new(),
+            project_root: Some(repo.clone()),
+            turn_timeout_secs: 900,
+        };
+
+        let result = RunController::start(cfg).await;
+
+        match result {
+            Err(RunError::ProjectRootInvalid(msg)) => {
+                assert!(msg.contains(".crew/artifacts"), "message must name the ignored path: {msg}");
+                assert!(msg.contains("remove the ignore rule"), "message must name the fix: {msg}");
+            }
+            Err(other) => panic!("expected ProjectRootInvalid, got a different RunError: {other}"),
+            Ok(_) => panic!("expected ProjectRootInvalid, start must not succeed"),
+        }
+        assert!(
+            !expected_worktree_base.exists(),
+            "no role worktree may be created on the rejected path: {expected_worktree_base:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
 
