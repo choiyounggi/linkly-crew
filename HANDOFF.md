@@ -397,6 +397,18 @@ non-blocking, `WorkerGuard`는 `app.manage` 보관).
 `(cd apps/crew-app/src-tauri && cargo test)` passed=70 failed=0(1 ignored), `cargo check` OK.
 (`runner::tests::presence_read_...`는 이 태스크가 건드리지 않은 `runner.rs`의 기존 WS 레이스로
 단독 실행에도 간헐 실패(원인 불명, 이 diff와 무관) — 재실행으로 그린 확보)
+**원인 확정·수정(2026-09-22, #18, t1-flaky-18)**: 제품 코드가 아니라 테스트 가짜 버스의 순서 결함이었다.
+가짜 버스 루프가 받은 envelope마다 `Receipt`를 먼저 쓰고 나서야 `sent_tx`로 넘겼는데, presence 3건은
+fire-and-forget `send_best_effort`로 나가고 `AgentRunner::run`은 마지막 건 직후 `is_done()`으로 반환하며
+`BusConn`을 drop한다(`Drop` = `reader_task.abort()`, Close 핸드셰이크 없음). 이 teardown이 먼저 끝나면
+`Receipt` 쓰기가 EPIPE로 실패해 `.unwrap()`이 서버 태스크를 panic시키고(`runner.rs:615:26` BrokenPipe),
+그 envelope는 전달되지 못한 채 `sent_tx`가 떨어져 `recv()`가 `None`을 언랩했다(`:627:82`/`:628:81`).
+수정: 먼저 전달하고, 실 crew-bus(`crew-bus/src/routing.rs` — `requires_ack` pending 항목에만 `Receipt`)처럼
+`requires_ack` envelope에만 응답 — presence는 `requires_ack=false`라 teardown과 경합하는 쓰기가 없다
+(쓰기 오류 무시·sleep·재시도 없음, `bus.rs` 무변경). 실측: `cargo test -p crew-agent --lib runner::`
+수정 전 9/20·`--test-threads=1` 1/10·CPU 부하 2/10 실패 → 수정 후 0/20·0/10·0/10, 강제 순서 회귀 테스트
+`presence_third_envelope_is_forwarded_even_when_the_receipt_reply_write_races_client_teardown` 추가(수정 전 루프
+형태로 29/30 실패 → 30/30 통과).
 
 **남은 것**: 자동 재시도·GUI 타임아웃 노브 노출 둘 다 안 함(요청 범위 밖). 실제 `tauri dev` 기동
 스모크는 무인 세션 GUI 팝업을 피해 생략 — `log_dir()` 단위 테스트로 대체.
@@ -572,6 +584,9 @@ PlanOptions}`, `LeadPlanner::plan_dag_with`, `RunConfig.dev_cmd_checks`,
     스위트 3/3 clean, `cargo test --workspace` 2연속 clean(357 passed). M9는 `crates/crew-bus`를
     **한 줄도 건드리지 않았다**(`git diff 8e331e7..crew-m9-integration -- crates/crew-bus`가 빈
     출력) — M9 회귀가 아니다.
+    (교차참조, 2026-09-22) `crew-agent`의 `runner::tests::presence_read_...` BrokenPipe→`None` 언랩
+    플레이크는 이 항목과 **다른 원인**으로 확정·수정됐다(테스트 가짜 버스의 `Receipt` 쓰기가 클라이언트
+    `BusConn` teardown과 경합, #18) — broken-pipe 계열 실패를 보면 이 항목이 아니라 §3.6 M13을 볼 것.
 21. **워커가 `impl_done` 보고 후 커밋 전에 죽으면 구현이 워크트리 dirty로만 존재한다**
     (M7 오케스트레이션 운영 실측, m7a 재진입): 4개 태스크(t-artifacts/t-inbox/
     t-rosterrun/t-search)가 이 상태로 발견됐고, 코디네이터가 스냅샷 커밋으로 회수했다

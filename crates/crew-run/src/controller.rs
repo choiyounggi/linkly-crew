@@ -1664,6 +1664,8 @@ mod live_controls_wiring_tests {
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
+    const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// (b) Genuine use, not a coincidental fallback: with a sender
     /// *present* in `controls` but its receiver already dropped (simulating
     /// a stale registration — distinct from the D6 "absent" case, where the
@@ -1675,9 +1677,17 @@ mod live_controls_wiring_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn swap_harness_uses_a_present_sender_and_reports_incomplete_when_it_is_dead() {
         let data_dir = test_data_dir("live-controls-dead-sender");
-        let handle = RunController::start(scripted_config(data_dir.clone()))
+        let mut handle = RunController::start(scripted_config(data_dir.clone()))
             .await
             .expect("start must succeed");
+
+        // The finisher clears `controls` at every sprint boundary; waiting
+        // for it to finish first keeps that clear from wiping the dead
+        // sender inserted below (issue #19).
+        tokio::time::timeout(JOIN_TIMEOUT, handle.join())
+            .await
+            .expect("join must finish within the deterministic budget")
+            .expect("lead runner must complete cleanly");
 
         {
             let (dead_tx, dead_rx) = mpsc::channel::<AgentControl>(4);

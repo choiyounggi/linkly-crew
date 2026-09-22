@@ -604,16 +604,34 @@ mod tests {
                 .unwrap();
             let _ = ws.next().await; // drain the auto-Receipt for msg_1
 
-            // Ack every envelope the agent sends back, forwarding each for
-            // inspection — the agent should send exactly 3 (no real reply,
-            // CountingBehavior returns none).
+            // Forward every envelope the agent sends back for inspection —
+            // the agent should send exactly 3 (no real reply, CountingBehavior
+            // returns none).
+            //
+            // #18 (confirmed 2026-09-22): this loop used to write a Receipt
+            // for every envelope BEFORE forwarding it. The 3 presence
+            // envelopes go out via fire-and-forget `send_best_effort`, and
+            // `AgentRunner::run` returns on `is_done()` right after the last
+            // one, dropping `BusConn` (`Drop` = abrupt `reader_task.abort()`,
+            // no Close handshake). When that teardown won the race, the
+            // Receipt write hit EPIPE, its `.unwrap()` panicked this task
+            // (`runner.rs:615:26` BrokenPipe) before `sent_tx.send`, and the
+            // test's `recv()` unwrapped a closed channel (`:627:82`/`:628:81`
+            // None). Fix: forward first, and — like real crew-bus
+            // (`crew-bus/src/routing.rs`, Receipts only for `requires_ack`)
+            // — reply only to `requires_ack` envelopes; presence is
+            // `requires_ack=false`, so no write races the teardown at all.
             while let Some(Ok(Message::Text(text))) = ws.next().await {
                 if let Ok(ClientFrame::Envelope(env)) = serde_json::from_str::<ClientFrame>(&text) {
-                    let receipt = ServerFrame::Receipt { id: env.id.clone() };
-                    ws.send(Message::Text(serde_json::to_string(&receipt).unwrap().into()))
-                        .await
-                        .unwrap();
+                    let requires_ack = env.requires_ack;
+                    let id = env.id.clone();
                     let _ = sent_tx.send(env);
+                    if requires_ack {
+                        let receipt = ServerFrame::Receipt { id };
+                        ws.send(Message::Text(serde_json::to_string(&receipt).unwrap().into()))
+                            .await
+                            .unwrap();
+                    }
                 }
             }
         });
@@ -644,6 +662,75 @@ mod tests {
         // (still open) or `sent_tx` was already dropped because `is_done()`
         // ended the runner and closed the connection right after the 3rd
         // send; both mean "no 4th envelope", so only an actual `Some` fails.
+        if let Ok(Some(extra)) = tokio::time::timeout(Duration::from_millis(200), sent_rx.recv()).await {
+            panic!("exactly 3 presence envelopes expected, got a 4th: {:?}", extra.kind);
+        }
+    }
+
+    /// #18 regression (worst-case ordering, forced): the fake bus handles
+    /// the 3rd presence envelope only after the client has already dropped
+    /// its `BusConn` (`gone` fires after `drop(conn)`), which is the
+    /// interleaving that used to lose the envelope to a panicking Receipt
+    /// write. All 3 must still be forwarded, in order.
+    #[tokio::test]
+    async fn presence_third_envelope_is_forwarded_even_when_the_receipt_reply_write_races_client_teardown() {
+        let (url, listener) = start_fake_bus().await;
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel::<Envelope>();
+        let (gone_tx, gone_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            send_welcome(&mut ws).await;
+
+            let mut gone_rx = Some(gone_rx);
+            let mut received = 0u32;
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                if let Ok(ClientFrame::Envelope(env)) = serde_json::from_str::<ClientFrame>(&text) {
+                    received += 1;
+                    let requires_ack = env.requires_ack;
+                    let id = env.id.clone();
+                    let _ = sent_tx.send(env);
+                    if received == 3 {
+                        if let Some(gone_rx) = gone_rx.take() {
+                            let _ = gone_rx.await;
+                        }
+                    }
+                    if requires_ack {
+                        let receipt = ServerFrame::Receipt { id };
+                        ws.send(Message::Text(serde_json::to_string(&receipt).unwrap().into()))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+        });
+
+        let conn = BusConn::connect(&url, "tok", "agent:pm").await.unwrap();
+        let env = wire_envelope("msg_1");
+        emit_presence_start(&conn, &env).await;
+        emit_presence_end(&conn, &env).await;
+        drop(conn);
+        let _ = gone_tx.send(());
+
+        let budget = Duration::from_secs(5);
+        let first = tokio::time::timeout(budget, sent_rx.recv()).await.unwrap().unwrap();
+        let second = tokio::time::timeout(budget, sent_rx.recv()).await.unwrap().unwrap();
+        let third = tokio::time::timeout(budget, sent_rx.recv()).await.unwrap().unwrap();
+
+        assert_eq!(first.kind, MessageKind::PresenceRead);
+        assert_eq!(second.kind, MessageKind::PresenceTyping);
+        assert_eq!(third.kind, MessageKind::PresenceTyping);
+
+        let read_body = crew_proto::presence_read_from_body(&first.body).expect("read body must parse");
+        assert_eq!(read_body.target_msg_id, "msg_1");
+        assert_eq!(read_body.agent_id, "agent:designer");
+
+        let typing_on = crew_proto::presence_typing_from_body(&second.body).expect("typing body must parse");
+        assert!(typing_on.active, "typing must be true first");
+        let typing_off = crew_proto::presence_typing_from_body(&third.body).expect("typing body must parse");
+        assert!(!typing_off.active, "typing must be false last");
+
         if let Ok(Some(extra)) = tokio::time::timeout(Duration::from_millis(200), sent_rx.recv()).await {
             panic!("exactly 3 presence envelopes expected, got a 4th: {:?}", extra.kind);
         }
