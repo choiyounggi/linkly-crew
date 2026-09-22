@@ -52,6 +52,14 @@ function projectErrorMessage(err: unknown): string {
   return `프로젝트 생성 중 오류가 발생했습니다: ${raw}`;
 }
 
+/** startChannel failing AFTER createProject already succeeded is a
+ * distinct failure from create_project's own vocabulary (issue #15): the
+ * project exists, only the run failed to start. */
+function runStartErrorMessage(err: unknown, project: ProjectInfo): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  return `프로젝트 "${project.name}"(${project.path})는 생성되었지만 실행 시작에 실패했습니다: ${raw}`;
+}
+
 /** `list_projects`의 `workspace_missing: <path>` reject를 빈 상태(R7)와 구분되는 문구로 매핑한다 (R6/D7). */
 function projectListErrorMessage(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
@@ -74,6 +82,7 @@ export default function NewTaskModal({ onClose, source = defaultSource }: NewTas
   const [projectNameError, setProjectNameError] = useState<string | null>(null);
   const [submitState, setSubmitState] = useState<SubmitState>("idle");
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [createdProject, setCreatedProject] = useState<ProjectInfo | null>(null);
 
   // 새로 만들기/기존 선택 토글 (t2-fe-picker D5/D7/D8/D10). `listProjects`가 없는 소스에서는
   // supportsExistingMode가 false라 토글 자체가 렌더되지 않고, 이하 모드 관련 상태는 전부 미사용.
@@ -138,6 +147,7 @@ export default function NewTaskModal({ onClose, source = defaultSource }: NewTas
     setMode(next);
     setProjectNameError(null);
     setSelectedError(null);
+    setCreatedProject(null);
     if (next === "existing" && listState === "idle") {
       void fetchProjects();
     }
@@ -156,13 +166,26 @@ export default function NewTaskModal({ onClose, source = defaultSource }: NewTas
 
       setSubmitState("loading");
       setSubmitError(null);
+
+      let project = createdProject;
+      if (!project) {
+        try {
+          project = await source.createProject(trimmedName);
+        } catch (err) {
+          setSubmitError(projectErrorMessage(err));
+          setSubmitState("error");
+          return;
+        }
+        setCreatedProject(project);
+      }
+
       try {
-        const info = await source.createProject(trimmedName);
-        await startChannel(trimmedGoal, scripted, info.path);
+        await startChannel(trimmedGoal, scripted, project.path);
+        setCreatedProject(null);
         setSubmitState("idle");
         onClose();
       } catch (err) {
-        setSubmitError(projectErrorMessage(err));
+        setSubmitError(runStartErrorMessage(err, project));
         setSubmitState("error");
       }
       return;

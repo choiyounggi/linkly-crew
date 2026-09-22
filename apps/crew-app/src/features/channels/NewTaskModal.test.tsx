@@ -91,6 +91,106 @@ describe("NewTaskModal — error: gh_missing surfaces a Korean message and keeps
   });
 });
 
+describe("NewTaskModal — issue #15: startChannel failure after createProject success", () => {
+  it("#15 run-start failure after createProject success shows a distinct Korean message, not 프로젝트 생성 (R2)", async () => {
+    const createProject = vi.fn(async () => ({ name: "my-app", path: "/ws/my-app" }));
+    const source = fakeSource({ createProject });
+    const startChannel = vi
+      .spyOn(useRunStore.getState(), "startChannel")
+      .mockRejectedValueOnce(new Error("project_root invalid: not a git repo"));
+    const onClose = vi.fn();
+
+    render(<NewTaskModal onClose={onClose} source={source} />);
+
+    fireEvent.change(screen.getByLabelText("작업 내용"), { target: { value: "goal" } });
+    fireEvent.change(screen.getByLabelText("프로젝트명"), { target: { value: "my-app" } });
+    fireEvent.click(screen.getByRole("button", { name: "시작" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      '프로젝트 "my-app"(/ws/my-app)는 생성되었지만 실행 시작에 실패했습니다: project_root invalid: not a git repo',
+    );
+    expect(createProject).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+
+    startChannel.mockRestore();
+  });
+
+  it("#15 retry after a run-start failure calls startChannel only, not createProject again (R3)", async () => {
+    const createProject = vi.fn(async () => ({ name: "my-app", path: "/ws/my-app" }));
+    const source = fakeSource({ createProject });
+    const startChannel = vi
+      .spyOn(useRunStore.getState(), "startChannel")
+      .mockRejectedValueOnce(new Error("project_root invalid: not a git repo"))
+      .mockResolvedValueOnce("run-1");
+    const onClose = vi.fn();
+
+    render(<NewTaskModal onClose={onClose} source={source} />);
+
+    fireEvent.change(screen.getByLabelText("작업 내용"), { target: { value: "goal" } });
+    fireEvent.change(screen.getByLabelText("프로젝트명"), { target: { value: "my-app" } });
+    fireEvent.click(screen.getByRole("button", { name: "시작" }));
+    await screen.findByRole("alert");
+
+    fireEvent.click(screen.getByRole("button", { name: "시작" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+
+    expect(createProject).toHaveBeenCalledTimes(1);
+    expect(startChannel).toHaveBeenCalledTimes(2);
+    expect(startChannel).toHaveBeenNthCalledWith(2, "goal", false, "/ws/my-app");
+
+    startChannel.mockRestore();
+  });
+
+  it("#15 switching mode after a run-start failure resets the retry, back to create re-calls createProject (R4)", async () => {
+    const createProject = vi.fn(async () => ({ name: "my-app", path: "/ws/my-app" }));
+    const source = fakeSource({ createProject, listProjects: vi.fn(async () => []) });
+    const startChannel = vi
+      .spyOn(useRunStore.getState(), "startChannel")
+      .mockRejectedValueOnce(new Error("project_root invalid: not a git repo"))
+      .mockResolvedValueOnce("run-1");
+
+    render(<NewTaskModal onClose={() => {}} source={source} />);
+
+    fireEvent.change(screen.getByLabelText("작업 내용"), { target: { value: "goal" } });
+    fireEvent.change(screen.getByLabelText("프로젝트명"), { target: { value: "my-app" } });
+    fireEvent.click(screen.getByRole("button", { name: "시작" }));
+    await screen.findByRole("alert");
+
+    fireEvent.click(screen.getByRole("button", { name: "기존 선택" }));
+    fireEvent.click(screen.getByRole("button", { name: "새로 만들기" }));
+
+    fireEvent.change(screen.getByLabelText("프로젝트명"), { target: { value: "my-app" } });
+    fireEvent.click(screen.getByRole("button", { name: "시작" }));
+
+    await waitFor(() => expect(createProject).toHaveBeenCalledTimes(2));
+
+    startChannel.mockRestore();
+  });
+
+  it("#15 existing-mode raw message: startChannel failure in existing mode still shows the raw error text (R5)", async () => {
+    const createProject = vi.fn();
+    const listProjects = vi.fn(async () => [{ name: "demo", path: "/ws/demo" }]);
+    const source = fakeSource({ createProject, listProjects });
+    const startChannel = vi
+      .spyOn(useRunStore.getState(), "startChannel")
+      .mockRejectedValueOnce(new Error("boom"));
+
+    render(<NewTaskModal onClose={() => {}} source={source} />);
+    fireEvent.click(screen.getByRole("button", { name: "기존 선택" }));
+    await screen.findByText("demo");
+    fireEvent.click(screen.getByLabelText("demo"));
+    fireEvent.change(screen.getByLabelText("작업 내용"), { target: { value: "goal" } });
+    fireEvent.click(screen.getByRole("button", { name: "시작" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe("boom");
+    expect(createProject).not.toHaveBeenCalled();
+
+    startChannel.mockRestore();
+  });
+});
+
 describe("NewTaskModal — boundary: blank required fields block submission (D4/validation-timing)", () => {
   it("shows inline field errors and never calls createProject for blank goal/projectName", () => {
     const createProject = vi.fn();
