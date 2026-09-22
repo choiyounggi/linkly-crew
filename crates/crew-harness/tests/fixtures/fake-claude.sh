@@ -12,6 +12,10 @@ if [ -n "${FAKE_ARGV_LOG:-}" ]; then
   for a in "$@"; do printf '%s\n' "$a"; done > "$FAKE_ARGV_LOG"
 fi
 
+if [ -n "${FAKE_ENV_LOG:-}" ]; then
+  env > "$FAKE_ENV_LOG"
+fi
+
 mode="${FAKE_MODE:-normal}"
 
 # Mirrors the real CLI: with no override, the init line reports back the

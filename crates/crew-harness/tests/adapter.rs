@@ -42,6 +42,35 @@ fn read_and_clear_argv(path: &std::path::Path) -> Vec<String> {
     argv
 }
 
+/// Path for a test's recorded env dump (D4), mirroring `argv_log_path`.
+fn env_log_path(test_name: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".crew-test");
+    std::fs::create_dir_all(&dir).expect("create env log dir");
+    dir.join(format!("{test_name}.env.log"))
+}
+
+/// Reads back the child's environment recorded via `FAKE_ENV_LOG`
+/// (`KEY=VALUE` lines from `env`), then removes the log file.
+fn read_and_clear_env(path: &std::path::Path) -> Vec<String> {
+    let env = std::fs::read_to_string(path)
+        .expect("read env log")
+        .lines()
+        .map(|s| s.to_string())
+        .collect();
+    let _ = std::fs::remove_file(path);
+    env
+}
+
+/// Value of `CLAUDE_CODE_DISABLE_AUTO_MEMORY` in a captured `env` dump,
+/// or `None` if the key is absent (D4 — reads the whole captured call,
+/// not a single grepped line).
+fn auto_memory_env_value(env_lines: &[String]) -> Option<String> {
+    env_lines.iter().find_map(|line| {
+        line.strip_prefix("CLAUDE_CODE_DISABLE_AUTO_MEMORY=")
+            .map(|v| v.to_string())
+    })
+}
+
 /// Position of `--setting-sources` in `argv`, plus the value that follows
 /// it (structural, not a stub-string match — trap 18).
 fn setting_sources_value(argv: &[String]) -> Option<&str> {
@@ -346,6 +375,69 @@ async fn custom_setting_sources_overrides_the_default() {
     assert!(
         !argv.iter().any(|a| a == "project,local"),
         "default value must not leak through, got: {argv:?}"
+    );
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D1/D2 — the default env-var mechanism reaches `spawn`'s child.
+#[tokio::test]
+async fn spawn_passes_default_auto_memory_disable() {
+    let env_log_path = env_log_path("spawn_passes_default_auto_memory_disable");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ENV_LOG", env_log_path.to_str().unwrap());
+    let cfg = agent_cfg();
+
+    let mut session = harness.spawn(&cfg).await.expect("spawn should succeed");
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let env_lines = read_and_clear_env(&env_log_path);
+    assert_eq!(auto_memory_env_value(&env_lines), Some("1".to_string()));
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D2/D4 boundary — resume must carry the same default as `spawn`, or
+/// a resumed session silently regains auto-memory.
+#[tokio::test]
+async fn spawn_resumed_passes_default_auto_memory_disable() {
+    let env_log_path = env_log_path("spawn_resumed_passes_default_auto_memory_disable");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ENV_LOG", env_log_path.to_str().unwrap());
+    let cfg = agent_cfg();
+
+    let mut session = harness
+        .spawn_resumed(&cfg, uuid::Uuid::new_v4())
+        .await
+        .expect("spawn_resumed should succeed");
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let env_lines = read_and_clear_env(&env_log_path);
+    assert_eq!(auto_memory_env_value(&env_lines), Some("1".to_string()));
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D3 negative — `false` must omit the env var entirely, never set it
+/// to "0" or "".
+#[tokio::test]
+async fn auto_memory_disabled_false_omits_the_env_var() {
+    let env_log_path = env_log_path("auto_memory_disabled_false_omits_the_env_var");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ENV_LOG", env_log_path.to_str().unwrap())
+        .with_auto_memory_disabled(false);
+    let cfg = agent_cfg();
+
+    let mut session = harness.spawn(&cfg).await.expect("spawn should succeed");
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let env_lines = read_and_clear_env(&env_log_path);
+    assert_eq!(auto_memory_env_value(&env_lines), None);
+    assert!(
+        !env_lines
+            .iter()
+            .any(|l| l.starts_with("CLAUDE_CODE_DISABLE_AUTO_MEMORY")),
+        "env var key must be entirely absent, got: {env_lines:?}"
     );
 
     harness.shutdown(session).await.expect("shutdown");
