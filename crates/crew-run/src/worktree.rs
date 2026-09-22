@@ -50,13 +50,18 @@ fn fnv1a_hex8(bytes: &[u8]) -> String {
     format!("{hash:08x}")
 }
 
-/// Ensures `role`'s worktree exists under `worktrees_base` for the git repo
-/// at `project_root`, creating it (`git worktree add -B crew/<role>`, base =
-/// `project_root`'s current `HEAD`) if it isn't already there, or reusing it
-/// idempotently if `git worktree list` already registers it. `project_root`
-/// not being a git repository, or the `git worktree add` invocation itself
-/// failing, is returned as `Err` — no fallback to a shared cwd (design D5).
-pub(crate) fn ensure_role_worktree(project_root: &Path, worktrees_base: &Path, role: Role) -> Result<PathBuf, String> {
+/// Confirms `project_root` is itself the toplevel of a git working tree --
+/// shared by `ensure_role_worktree` (every role's worktree needs a real
+/// repo) and `check_artifacts_not_ignored` (issue #16): `git check-ignore`
+/// walks upward through parent directories exactly like `rev-parse` does,
+/// so without this guard a `project_root` merely nested inside someone
+/// else's repo would have its `.crew/artifacts` query silently answered by
+/// that ancestor repo's ignore rules instead of erroring (reproduced
+/// against this monorepo's own `.crew/` rule: a `.crew/artifacts` path
+/// nested under `crates/crew-run/.crew-test/...` was reported ignored by
+/// the ancestor repo's rule, not by an error). Returns the canonicalized
+/// root on success.
+fn confirm_git_toplevel(project_root: &Path) -> Result<PathBuf, String> {
     let canonical_root = std::fs::canonicalize(project_root)
         .map_err(|e| format!("project_root_not_a_git_repo: {}: {e}", project_root.display()))?;
     // `rev-parse --show-toplevel`, not `--git-dir`: git commands search
@@ -90,6 +95,68 @@ pub(crate) fn ensure_role_worktree(project_root: &Path, worktrees_base: &Path, r
             toplevel.display()
         ));
     }
+    Ok(canonical_root)
+}
+
+/// Maps a `git check-ignore -q .crew/artifacts` subprocess result to this
+/// module's `Result` shape -- pure (no I/O) so the three outcomes are
+/// directly unit-testable with synthetic exit codes, since no real git
+/// fixture reliably reaches the `_` branch once `confirm_git_toplevel`
+/// has already confirmed a real toplevel (issue #16 spike: a bare repo
+/// fails the toplevel check itself before check-ignore ever runs, and
+/// `check_artifacts_not_ignored` only ever queries the fixed literal
+/// `.crew/artifacts`, which cannot be "outside the repository").
+fn interpret_check_ignore_status(project_root: &Path, code: Option<i32>, stderr: &str) -> Result<(), String> {
+    match code {
+        Some(0) => Err(format!(
+            "{}/.crew/artifacts is ignored by git. Shared artifacts written there will never be committed. \
+             Fix: remove the ignore rule, or replace a whole-directory rule like \".crew/\" with \".crew/*\" \
+             plus a \"!.crew/artifacts\" negation (a negation cannot re-include a path whose parent directory \
+             is itself excluded; see git-gitignore(5)).",
+            project_root.display()
+        )),
+        Some(1) => Ok(()),
+        _ => Err(format!(
+            "could not determine whether {}/.crew/artifacts is git-ignored: {stderr}",
+            project_root.display()
+        )),
+    }
+}
+
+/// Fails when `<project_root>/.crew/artifacts` is ignored by git -- the
+/// artifacts convention (`role_system_hint`) silently produces uncommitted
+/// work otherwise (issue #16). Never parses `.gitignore` by hand, and
+/// works whether or not `.crew/artifacts` exists on disk yet. Confirms
+/// `project_root` is itself a git toplevel first (`confirm_git_toplevel`)
+/// -- see that function's doc comment for why.
+pub(crate) fn check_artifacts_not_ignored(project_root: &Path) -> Result<(), String> {
+    let canonical_root = confirm_git_toplevel(project_root)?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&canonical_root)
+        .args(["check-ignore", "-q", ".crew/artifacts"])
+        .output()
+        .map_err(|e| {
+            format!(
+                "could not check whether {}/.crew/artifacts is git-ignored: failed to run git: {e}",
+                project_root.display()
+            )
+        })?;
+    interpret_check_ignore_status(
+        project_root,
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim(),
+    )
+}
+
+/// Ensures `role`'s worktree exists under `worktrees_base` for the git repo
+/// at `project_root`, creating it (`git worktree add -B crew/<role>`, base =
+/// `project_root`'s current `HEAD`) if it isn't already there, or reusing it
+/// idempotently if `git worktree list` already registers it. `project_root`
+/// not being a git repository, or the `git worktree add` invocation itself
+/// failing, is returned as `Err` — no fallback to a shared cwd (design D5).
+pub(crate) fn ensure_role_worktree(project_root: &Path, worktrees_base: &Path, role: Role) -> Result<PathBuf, String> {
+    let canonical_root = confirm_git_toplevel(project_root)?;
 
     std::fs::create_dir_all(worktrees_base)
         .map_err(|e| format!("failed to create worktrees_base {worktrees_base:?}: {e}"))?;
@@ -316,5 +383,80 @@ mod tests {
             !base_a1.starts_with(std::env::temp_dir()),
             "must not live under the system temp dir: {base_a1:?}"
         );
+    }
+
+    /// Normal (R2(i)): a repo with no `.gitignore` at all leaves
+    /// `.crew/artifacts` un-ignored.
+    #[test]
+    fn check_artifacts_not_ignored_accepts_a_repo_with_no_gitignore() {
+        let repo = init_test_repo("artifacts-ignore-accept");
+
+        let result = check_artifacts_not_ignored(&repo);
+
+        assert!(result.is_ok(), "no .gitignore means .crew/artifacts is not ignored: {result:?}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Error (R1 shape): issue #16's exact `.crew/` ignore rule is rejected,
+    /// naming the path and the fix.
+    #[test]
+    fn check_artifacts_not_ignored_rejects_the_issue_16_rule() {
+        let repo = init_test_repo("artifacts-ignore-reject");
+        std::fs::write(repo.join(".gitignore"), b".crew/\n").expect("test setup: write the issue's exact ignore rule");
+        run_git_ok(&repo, &["add", ".gitignore"]);
+        run_git_ok(&repo, &["commit", "-q", "-m", "add crew ignore rule"]);
+
+        let result = check_artifacts_not_ignored(&repo);
+
+        match result {
+            Err(msg) => {
+                assert!(msg.contains(".crew/artifacts"), "message must name the ignored path: {msg}");
+                assert!(msg.contains("remove the ignore rule"), "message must name the fix: {msg}");
+            }
+            Ok(()) => panic!("a repo whose .gitignore excludes .crew/ must be rejected"),
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Boundary (R1/D2): the ignored branch of the pure status interpreter
+    /// names both the path and the suggested negation fix.
+    #[test]
+    fn interpret_check_ignore_status_ignored_names_path_and_fix() {
+        let result = interpret_check_ignore_status(Path::new("/fake/root"), Some(0), "");
+
+        match result {
+            Err(msg) => {
+                assert!(msg.contains("/fake/root/.crew/artifacts"), "message must name the exact path: {msg}");
+                assert!(msg.contains("!.crew/artifacts"), "message must name the negation fix: {msg}");
+            }
+            Ok(()) => panic!("exit code 0 (ignored) must be Err"),
+        }
+    }
+
+    /// Normal: exit code 1 (not ignored) is `Ok`.
+    #[test]
+    fn interpret_check_ignore_status_not_ignored_is_ok() {
+        let result = interpret_check_ignore_status(Path::new("/fake/root"), Some(1), "");
+        assert!(result.is_ok(), "exit code 1 (not ignored) must be Ok: {result:?}");
+    }
+
+    /// Error (R3): any exit code other than 0/1 is an `Err`, not a panic,
+    /// and surfaces git's stderr.
+    #[test]
+    fn interpret_check_ignore_status_other_exit_code_is_err_not_panic() {
+        let result = interpret_check_ignore_status(Path::new("/fake/root"), Some(128), "fatal: something");
+
+        match result {
+            Err(msg) => assert!(msg.contains("fatal: something"), "message must surface git's stderr: {msg}"),
+            Ok(()) => panic!("exit code 128 must be Err, not treated as not-ignored"),
+        }
+    }
+
+    /// Boundary (R3): a `None` exit code (Unix signal termination) is also
+    /// an `Err`, not a panic.
+    #[test]
+    fn interpret_check_ignore_status_signal_killed_is_err_not_panic() {
+        let result = interpret_check_ignore_status(Path::new("/fake/root"), None, "");
+        assert!(result.is_err(), "a None exit code (signal-killed) must be Err, not panic: {result:?}");
     }
 }

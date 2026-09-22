@@ -46,6 +46,23 @@ fn config(data_dir: PathBuf, project_root: Option<PathBuf>) -> RunConfig {
     }
 }
 
+fn run_git_ok(cwd: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git").arg("-C").arg(cwd).args(args).status().expect("test setup: git must be on PATH");
+    assert!(status.success(), "test setup: `git {args:?}` failed in {cwd:?}");
+}
+
+fn init_test_repo(label: &str) -> PathBuf {
+    let root = test_root(label);
+    std::fs::create_dir_all(&root).expect("test setup: repo root");
+    run_git_ok(&root, &["init", "-q"]);
+    run_git_ok(&root, &["config", "user.email", "test@example.com"]);
+    run_git_ok(&root, &["config", "user.name", "Test"]);
+    std::fs::write(root.join("README.md"), b"init").expect("test setup: seed file");
+    run_git_ok(&root, &["add", "."]);
+    run_git_ok(&root, &["commit", "-q", "-m", "init"]);
+    root
+}
+
 async fn assert_rejected(project_root: PathBuf, needle: &str) {
     let data_dir = test_root("project-root-reject");
     let cfg = config(data_dir.clone(), Some(project_root));
@@ -232,4 +249,53 @@ async fn none_project_root_leaves_start_unchanged() {
 
     handle.shutdown().await;
     cleanup(&data_dir);
+}
+
+/// R2(ii)/R5, plan-reviewer call-1 FAIL fix: proves the `ProjectRootInvalid`
+/// message's suggested fix actually works, not just that it reads
+/// plausibly -- reject on issue #16's exact `.crew/` rule, then apply the
+/// message's own suggested `.crew/*` + `!.crew/artifacts` form and assert
+/// `start` now succeeds. This is the ONE test in this file allowed to let
+/// `start` reach `resolve_role_worktrees` on a successful path -- doing so
+/// creates real out-of-repo worktrees under `$HOME`
+/// (`worktree::project_worktrees_base` has no test-injection seam
+/// reachable from `start`'s public API, and it is not `pub` from this
+/// external integration-test crate to compute/clean up directly) -- this
+/// is a documented, singular, deliberate exception (plan D8): these
+/// worktrees are persistent-by-design and idempotent (`worktree.rs`'s own
+/// module doc, `docs/DESIGN.md`'s M12 "실행 cwd" bullet), not test
+/// pollution requiring teardown. `handle.shutdown().await` still cleans
+/// up this run's in-process state.
+#[tokio::test(flavor = "multi_thread")]
+async fn suggested_fix_in_the_rejection_message_actually_un_ignores_the_path() {
+    let repo = init_test_repo("artifacts-ignore-fix-proof");
+    std::fs::write(repo.join(".gitignore"), b".crew/\n").expect("test setup: write the issue's exact ignore rule");
+    run_git_ok(&repo, &["add", ".gitignore"]);
+    run_git_ok(&repo, &["commit", "-q", "-m", "add crew ignore rule"]);
+
+    let reject_data_dir = test_root("artifacts-ignore-fix-proof-reject-data");
+    let reject_result = RunController::start(config(reject_data_dir.clone(), Some(repo.clone()))).await;
+    match reject_result {
+        Err(RunError::ProjectRootInvalid(msg)) => {
+            assert!(msg.contains(".crew/artifacts"), "message must name the ignored path: {msg}");
+            assert!(msg.contains("remove the ignore rule"), "message must name the fix: {msg}");
+        }
+        Err(other) => panic!("expected ProjectRootInvalid before the fix is applied, got a different RunError: {other}"),
+        Ok(_) => panic!("start must reject before the fix is applied, not succeed"),
+    }
+    assert!(!reject_data_dir.exists(), "a rejected project_root must leave zero partial run state: {reject_data_dir:?}");
+
+    // Apply the message's own suggested fix, verbatim -- this is the
+    // assertion that actually proves the advice, not the substring checks
+    // above.
+    std::fs::write(repo.join(".gitignore"), b".crew/*\n!.crew/artifacts\n").expect("test: apply the suggested fix");
+
+    let accept_data_dir = test_root("artifacts-ignore-fix-proof-accept-data");
+    let accept_result = RunController::start(config(accept_data_dir.clone(), Some(repo.clone()))).await;
+    let handle = accept_result.expect("start must succeed once the suggested fix is applied -- this is the proof the message's advice actually works");
+    handle.shutdown().await;
+
+    let _ = std::fs::remove_dir_all(&repo);
+    cleanup(&reject_data_dir);
+    cleanup(&accept_data_dir);
 }

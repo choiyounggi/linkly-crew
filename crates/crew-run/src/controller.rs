@@ -46,6 +46,15 @@ const CHANNEL_CAPACITY: usize = 256;
 /// value.
 pub(crate) const SWAP_ACK_TIMEOUT_MS: u64 = 120_000;
 
+/// Bound on the human proxy's disconnect-to-broadcast latency
+/// (t4-test-m5-flaky D10): the bus server detects `agent:human`'s dropped
+/// connection and broadcasts its `Unregistered` `BusLifecycle` on a separate,
+/// unsynchronized task (see the run-finish block's own comment), which is
+/// genuine async TCP I/O — not a guess — sized generously relative to a
+/// loopback, local-only, scripted-run disconnect signal; named so a future
+/// measurement can retune it without re-deriving the mechanism.
+const HUMAN_UNREGISTER_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// L1 assembly budget for `summarize_sprint` (contracts-m5.md §C5a plan
 /// D6) — ≈4k tokens, per backend/common/llm/context-window-budget.md's
 /// "derive the cap from the serving model" guidance applied to a fixed L1
@@ -444,6 +453,37 @@ async fn drain_subscription_backlog(drain_tx: &mpsc::UnboundedSender<oneshot::Se
     }
 }
 
+/// Waits (bounded by `timeout`, logged and never a silent skip nor an
+/// unbounded hang) for a `RunEvent::BusLifecycle` on `rx` whose `kind` and
+/// embedded `agent_id` match (t4-test-m5-flaky D10) — every non-matching
+/// event and every `Lagged` gap is ignored and looped past, since this
+/// freshly-subscribed receiver's correctness never depends on not lagging,
+/// only the wait's timing does.
+async fn wait_for_bus_lifecycle(rx: &mut broadcast::Receiver<RunEvent>, kind: &str, agent_id: &str, timeout: Duration) {
+    let wait = async {
+        loop {
+            match rx.recv().await {
+                Ok(RunEvent::BusLifecycle { kind: ev_kind, payload, .. }) if ev_kind == kind => {
+                    let matched = payload
+                        .get(kind)
+                        .and_then(|v| v.get("agent_id"))
+                        .and_then(|v| v.as_str())
+                        == Some(agent_id);
+                    if matched {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    };
+    if tokio::time::timeout(timeout, wait).await.is_err() {
+        tracing::warn!(kind, agent_id, ?timeout, "bus lifecycle event not observed within bound; proceeding anyway");
+    }
+}
+
 /// Capacity for the `RunHandle::resolve_gate` -> human proxy command
 /// channel (plan D2) — gate decisions are rare, human-paced events, not a
 /// throughput path.
@@ -585,6 +625,7 @@ impl RunController {
         let role_worktrees: Option<Vec<(Role, std::path::PathBuf)>> = match &project_root {
             None => None,
             Some(root) => {
+                worktree::check_artifacts_not_ignored(root).map_err(RunError::ProjectRootInvalid)?;
                 let worktrees_base = worktree::project_worktrees_base(root);
                 Some(resolve_role_worktrees(root, &worktrees_base).map_err(RunError::ProjectRootInvalid)?)
             }
@@ -895,6 +936,7 @@ impl RunController {
             // stop before `join()` can return, so a `resolve_gate` call
             // arriving right after `join()` deterministically observes a
             // closed `gate_tx` receiver rather than racing a live proxy.
+            let mut human_unregister_rx = finisher_run_tx.subscribe();
             let _ = human_shutdown_tx.send(());
             let _ = human_task.await;
             // The human proxy's own disconnect is detected by the bus
@@ -905,6 +947,12 @@ impl RunController {
             // broadcast its `Unregistered` before `RunFinished` so the
             // latter stays the true last event.
             drain_subscription_backlog(&drain_tx).await;
+            // The drain above is only a non-blocking check of whatever the
+            // bus has *already* broadcast — under scheduling contention the
+            // disconnect-detection task can still be in flight, so bound-wait
+            // (t4-test-m5-flaky D10) for the actual `Unregistered` instead of
+            // trusting the drain alone.
+            wait_for_bus_lifecycle(&mut human_unregister_rx, "Unregistered", "agent:human", HUMAN_UNREGISTER_TIMEOUT).await;
 
             let _ = finisher_run_tx.send(RunEvent::RunFinished {
                 outcome,
@@ -1842,6 +1890,7 @@ mod resolve_role_worktrees_tests {
     //! tools_guidance forbids touching `$HOME` from a test.
 
     use super::*;
+    use crew_lead::accept::AcceptanceLoop;
     use std::process::Command;
 
     fn test_dir(label: &str) -> std::path::PathBuf {
@@ -1902,6 +1951,55 @@ mod resolve_role_worktrees_tests {
         assert!(result.is_err(), "a non-git project_root must fail resolution");
 
         let _ = std::fs::remove_dir_all(&non_repo);
+    }
+
+    /// R1 (issue #16), plan-reviewer advisory (b): a `project_root` whose
+    /// `.crew/artifacts` is git-ignored is rejected by `start()` before
+    /// `resolve_role_worktrees` ever runs -- proven by asserting the derived
+    /// worktree-base directory does not exist, both before and after the
+    /// rejected call. Non-collision relies on `init_test_repo`'s uuid'd repo
+    /// path: `project_worktrees_base`'s output is a pure function of the
+    /// project_root's absolute path (basename + fnv1a hash of that path), so
+    /// a freshly uuid'd, never-reused project_root guarantees this exact
+    /// derived path was never created by any other test or run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rejects_an_ignored_artifacts_root_and_creates_no_worktree() {
+        let repo = init_test_repo("artifacts-ignore-reject-e2e");
+        std::fs::write(repo.join(".gitignore"), b".crew/\n").expect("test setup: write the issue's exact ignore rule");
+        run_git_ok(&repo, &["add", ".gitignore"]);
+        run_git_ok(&repo, &["commit", "-q", "-m", "add crew ignore rule"]);
+        let expected_worktree_base = worktree::project_worktrees_base(&repo);
+        assert!(!expected_worktree_base.exists(), "test setup: must not pre-exist");
+
+        let cfg = RunConfig {
+            goal: "간단한 랜딩 페이지".to_string(),
+            mode: RunMode::Scripted { planted_violations: vec![] },
+            data_dir: test_dir("artifacts-ignore-reject-e2e-data"),
+            max_rework: AcceptanceLoop::default_budget(),
+            max_per_sprint: 0,
+            escalation_timeout_ms: 0,
+            roster: None,
+            dev_cmd_checks: Vec::new(),
+            project_root: Some(repo.clone()),
+            turn_timeout_secs: 900,
+        };
+
+        let result = RunController::start(cfg).await;
+
+        match result {
+            Err(RunError::ProjectRootInvalid(msg)) => {
+                assert!(msg.contains(".crew/artifacts"), "message must name the ignored path: {msg}");
+                assert!(msg.contains("remove the ignore rule"), "message must name the fix: {msg}");
+            }
+            Err(other) => panic!("expected ProjectRootInvalid, got a different RunError: {other}"),
+            Ok(_) => panic!("expected ProjectRootInvalid, start must not succeed"),
+        }
+        assert!(
+            !expected_worktree_base.exists(),
+            "no role worktree may be created on the rejected path: {expected_worktree_base:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
 
@@ -2237,5 +2335,86 @@ mod presence_guard_tests {
         let (last_seq, messages) = snapshot_messages_and_last_seq(&ledger);
         assert_eq!(last_seq, 1, "non-presence kinds must still be ledgered");
         assert_eq!(messages.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod human_unregister_ordering_tests {
+    //! t4-test-m5-flaky D10/D11: `wait_for_bus_lifecycle`'s bound-wait
+    //! mechanism, proven structurally (Barrier-forced interleave, no sleep)
+    //! rather than by chasing the real end-to-end race Task 01 measured at
+    //! only 1/40 — not reliably on-demand even pre-fix. "Red" is the old
+    //! code's exact shape (a single non-blocking `try_recv`, which misses an
+    //! event not yet sent); "green" is the new bounded wait observing the
+    //! same event once it lands.
+
+    use super::*;
+    use tokio::sync::broadcast::error::TryRecvError;
+    use tokio::sync::Barrier;
+
+    fn human_unregistered(seq: i64) -> RunEvent {
+        RunEvent::BusLifecycle {
+            seq,
+            kind: "Unregistered".to_string(),
+            payload: serde_json::json!({"Unregistered": {"agent_id": "agent:human"}}),
+        }
+    }
+
+    /// Red (old shape) then green (new mechanism) on the same receiver: a
+    /// bare `try_recv()` right after subscribing — before the event is ever
+    /// sent — must miss it (`Err(Empty)`, the old code's exact single
+    /// non-blocking check); `wait_for_bus_lifecycle` on that same receiver,
+    /// once the event is actually sent, must observe it.
+    #[tokio::test]
+    async fn wait_for_bus_lifecycle_observes_an_event_a_bare_try_recv_would_have_missed() {
+        let (tx, mut rx) = broadcast::channel::<RunEvent>(CHANNEL_CAPACITY);
+        let barrier = Arc::new(Barrier::new(2));
+
+        let sender = {
+            let tx = tx.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let _ = tx.send(human_unregistered(1));
+            })
+        };
+
+        // Red: the sender is parked at the barrier, nothing has been sent
+        // yet — the old code's exact shape, a single non-blocking check,
+        // misses it.
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "test setup: the event must not exist yet at this point"
+        );
+
+        // Green: release the sender, then bound-wait for the same event.
+        barrier.wait().await;
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_for_bus_lifecycle(&mut rx, "Unregistered", "agent:human", Duration::from_millis(200)),
+        )
+        .await
+        .expect("wait_for_bus_lifecycle must observe the event well within its own bound");
+
+        sender.await.expect("sender task must not panic");
+    }
+
+    /// Boundary: no matching event ever arrives on a receiver that stays
+    /// open — the wait must still return (never hang) once its own bound
+    /// elapses, well inside a longer outer margin.
+    #[tokio::test]
+    async fn wait_for_bus_lifecycle_returns_on_timeout_when_nothing_is_ever_sent() {
+        let (_tx, mut rx) = broadcast::channel::<RunEvent>(CHANNEL_CAPACITY);
+
+        let outer = tokio::time::timeout(
+            Duration::from_millis(500),
+            wait_for_bus_lifecycle(&mut rx, "Unregistered", "agent:human", Duration::from_millis(50)),
+        )
+        .await;
+
+        assert!(
+            outer.is_ok(),
+            "wait_for_bus_lifecycle must return within its own 50ms bound, not hang until the outer 500ms timeout"
+        );
     }
 }

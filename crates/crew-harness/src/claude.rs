@@ -22,6 +22,8 @@ const HARNESS_ID: HarnessId = HarnessId("claude-code");
 const EVENTS_CHANNEL_CAPACITY: usize = 64;
 const TURN_CHANNEL_CAPACITY: usize = 8;
 const DEFAULT_SETTING_SOURCES: &str = "project,local";
+const AUTO_MEMORY_DISABLE_ENV: &str = "CLAUDE_CODE_DISABLE_AUTO_MEMORY";
+const AUTO_MEMORY_DISABLE_VALUE: &str = "1";
 
 /// Adapter for a `claude` CLI on `$PATH` (or another binary of the same
 /// stream-json protocol, for fake-CLI-driven tests — see `with_binary`).
@@ -35,6 +37,16 @@ pub struct ClaudeCodeHarness {
     /// omits the flag, falling back to the CLI's default (load everything).
     /// Evidence: `docs/SPIKE-M9.md`. Requires `claude` >= 2.1.236.
     setting_sources: Option<String>,
+    /// Whether to set `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` on the spawned
+    /// child. Default `true` — auto-memory is a separate mechanism from
+    /// `--setting-sources` and is not affected by it (`docs/SPIKE-M9.md`
+    /// §4); left on, a spawned role session can receive another
+    /// session's auto-memory content. `false` omits the env var
+    /// entirely (never sets it to "0" or ""). Evidence:
+    /// `docs/SPIKE-M13-automemory.md`. Requires `claude` >= 2.1.278
+    /// (documented at docs.claude.com/en/docs/claude-code/memory;
+    /// absent from `--help`).
+    disable_auto_memory: bool,
 }
 
 impl ClaudeCodeHarness {
@@ -43,6 +55,7 @@ impl ClaudeCodeHarness {
             claude_bin: "claude".to_string(),
             extra_env: Vec::new(),
             setting_sources: Some(DEFAULT_SETTING_SOURCES.to_string()),
+            disable_auto_memory: true,
         }
     }
 
@@ -53,6 +66,7 @@ impl ClaudeCodeHarness {
             claude_bin: claude_bin.into(),
             extra_env: Vec::new(),
             setting_sources: Some(DEFAULT_SETTING_SOURCES.to_string()),
+            disable_auto_memory: true,
         }
     }
 
@@ -71,11 +85,31 @@ impl ClaudeCodeHarness {
         self
     }
 
+    /// Toggle the `CLAUDE_CODE_DISABLE_AUTO_MEMORY` env var on the
+    /// spawned child. `false` omits the env var entirely rather than
+    /// passing an empty or "0" value (D3).
+    pub fn with_auto_memory_disabled(mut self, disabled: bool) -> Self {
+        self.disable_auto_memory = disabled;
+        self
+    }
+
     /// `["--setting-sources", "<value>"]` if set, else empty.
     fn setting_sources_args(&self) -> Vec<String> {
         match &self.setting_sources {
             Some(value) => vec!["--setting-sources".to_string(), value.clone()],
             None => Vec::new(),
+        }
+    }
+
+    /// `[(CLAUDE_CODE_DISABLE_AUTO_MEMORY, "1")]` if enabled, else empty.
+    fn auto_memory_env(&self) -> Vec<(String, String)> {
+        if self.disable_auto_memory {
+            vec![(
+                AUTO_MEMORY_DISABLE_ENV.to_string(),
+                AUTO_MEMORY_DISABLE_VALUE.to_string(),
+            )]
+        } else {
+            Vec::new()
         }
     }
 
@@ -106,11 +140,13 @@ impl ClaudeCodeHarness {
         args: &[String],
         session_id: Uuid,
     ) -> Result<Session, HarnessError> {
+        let auto_memory_env = self.auto_memory_env();
         let mut command = Command::new(&self.claude_bin);
         command
             .args(args)
             .current_dir(&cfg.cwd)
             .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .envs(auto_memory_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

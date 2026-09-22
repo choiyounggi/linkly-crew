@@ -277,6 +277,21 @@ Lead는 `task.result`를 받으면 위 예시의 `kind:"cmd"` 체크를 셸을 �
   공유하던 **함정 30의 봉쇄책**이다(M12 t4, HANDOFF §5 함정 30 — M11까지는 실제로
   "둘 다 `root`"였다). `project_root: None`(기본)이면 M10까지의 동작 그대로 스크래치
   `<data_dir>/cli-cwd/<role>`.
+- **`.crew/artifacts` 무시 여부 사전 검사** (이슈 #16, `crew-run`의
+  `worktree::check_artifacts_not_ignored`): `project_root: Some(root)`일 때
+  위 worktree 준비보다 **먼저** `git -C root check-ignore -q .crew/artifacts`를
+  실행해 `root/.crew/artifacts`가 `.gitignore` 규칙에 걸려 있으면 그 자리에서
+  `RunError::ProjectRootInvalid`로 실패한다(무시된 경로와 고치는 법을 담은
+  메시지, `.crew/artifacts`가 아직 존재하지 않아도 검사는 동작한다) —
+  경고만 하고 진행하는 옵션은 없다. 이 검사가 worktree 준비보다 앞서는 것은
+  우연이 아니라 설계다: 뒤에 두면 거부되는 요청에서도 역할별 worktree가
+  먼저 만들어져 "거부는 상태를 하나도 남기지 않는다"는 이 함수의 다른
+  모든 검사와 같은 전제가 깨진다. `project_root`가 그 자체로 git 저장소의
+  최상위가 아니면(예: 다른 저장소 안에 중첩된 디렉터리) 이 검사보다 먼저
+  `worktree::confirm_git_toplevel`이 걸러낸다 — 그렇지 않으면 `check-ignore`가
+  상위 저장소의 무관한 규칙에 걸려 잘못된 사유("ignored")로 거부될 수 있다.
+  관찰 근거: 이 저장소 자신의 `.gitignore`가 `.crew/`를 무시해,
+  `project_root`로 자신을 도그푸딩하면 이 검사가 실제로 발동한다(이슈 #16 본문).
 - `kind:"browser"`는 **M10에서도 아직 미실행**이다 — 항상 `skipped`로만 기록된다(스코프
   아웃).
 - 실행 결과 중 하나라도 `Refused`/`TimedOut`/`SpawnFailed`이거나 exit code가 `expect`와
