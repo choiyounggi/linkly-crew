@@ -1,4 +1,5 @@
 pub mod accept;
+pub mod browser_exec;
 pub mod cmd_exec;
 pub mod compress;
 pub mod dispatch;
