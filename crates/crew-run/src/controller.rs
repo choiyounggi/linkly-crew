@@ -15,6 +15,7 @@ use std::time::Duration;
 use crew_agent::{AgentControl, AgentRunner, BusConn, RoleHarnessBehavior, RunnerError, ScriptedCrewMember};
 use crew_bus::{BusConfig, BusEvent as BusLifecycleEvent, BusHandle, BusServer};
 use crew_harness::{AgentCfg as HarnessAgentCfg, HandoffSnapshot, Harness, HarnessPool, HarnessRegistry};
+use crew_lead::browser_exec::BrowserPolicy;
 use crew_lead::compress::summarize_sprint;
 use crew_lead::dispatch::{LeadBehavior, TaskState};
 use crew_lead::plan::{LeadPlanner, PlanError, PlanOptions, SprintSlicer};
@@ -140,6 +141,22 @@ fn role_cli_cwd(role_worktrees: Option<&[(Role, PathBuf)]>, data_dir: &Path, rol
     let cwd = data_dir.join("cli-cwd").join(role_dir_name(role));
     let _ = std::fs::create_dir_all(&cwd);
     cwd
+}
+
+/// Whether `spawn_sprint` should wire the Browser DoD executor at all.
+///
+/// BOTH conditions are required. `project_root` is required by settled user
+/// decision D3: the browser executor runs in the same per-role worktree the
+/// Cmd DoD uses, and those worktrees only exist when a `project_root` was
+/// designated. `browser_binary` is required because there is nothing to
+/// spawn without it.
+///
+/// When this is false, nothing is wired and every `DodCheck::Browser` stays
+/// `skipped` — which is the shipped default and a normal path, not an error.
+/// The two causes stay distinguishable on purpose: "no project_root" and
+/// "no binary configured" are different diagnoses for the same silence.
+fn browser_wiring_enabled(project_root: Option<&Path>, browser_binary: Option<&str>) -> bool {
+    project_root.is_some() && browser_binary.is_some()
 }
 
 /// Precomputes every canonical role's (`ROLE_ORDER`) worktree once for a
@@ -336,6 +353,7 @@ async fn spawn_sprint(
     goal: &str,
     data_dir: &Path,
     project_root: Option<&Path>,
+    browser_binary: Option<&str>,
     role_worktrees: Option<&[(Role, PathBuf)]>,
     roster: &Roster,
     pool: &Arc<HarnessPool>,
@@ -421,7 +439,7 @@ async fn spawn_sprint(
     let prior_states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
     let cmd_cwd_base = data_dir.to_path_buf();
     let cmd_role_worktrees = role_worktrees.map(<[(Role, PathBuf)]>::to_vec);
-    let lead_behavior = LeadBehavior::new(
+    let mut lead_behavior = LeadBehavior::new(
         "agent:lead",
         dag.clone(),
         sprint_tasks.to_vec(),
@@ -433,6 +451,22 @@ async fn spawn_sprint(
     .with_cmd_exec(Arc::new(move |role| {
         role_cli_cwd(cmd_role_worktrees.as_deref(), &cmd_cwd_base, role)
     }));
+    // The Browser DoD resolves its cwd through the SAME `role_cli_cwd` call
+    // the Cmd DoD just used (user decision D3: the same per-role worktree) —
+    // never a second path expression, which is how pitfall 30 reappeared
+    // last time. The clones must be separate: the ones above were moved into
+    // the cmd closure.
+    if browser_wiring_enabled(project_root, browser_binary) {
+        let binary = browser_binary.expect("browser_wiring_enabled implies a configured binary");
+        let browser_cwd_base = data_dir.to_path_buf();
+        let browser_role_worktrees = role_worktrees.map(<[(Role, PathBuf)]>::to_vec);
+        lead_behavior = lead_behavior.with_browser_exec(
+            Arc::new(move |role| {
+                role_cli_cwd(browser_role_worktrees.as_deref(), &browser_cwd_base, role)
+            }),
+            BrowserPolicy::new(binary),
+        );
+    }
     let observing = ObservingLead::new(lead_behavior, sprint_tasks.to_vec(), ts_tx, cumulative);
     // Lead never gets a control channel (contracts-m6.md §D2a, plan D2/plan
     // D6, pitfall 14) — lead swaps stay M5 boundary-only via `AgentRunner::run`.
@@ -719,13 +753,32 @@ impl RunController {
         };
         // present = crew_agents' roles (contracts-m7.md §E4) — the LLM path
         // varies only the SpecDoc, DAG shaping is the same function either way.
-        let dag = LeadPlanner::plan_dag_with(
+        let mut dag = LeadPlanner::plan_dag_with(
             &spec,
             &present_roles,
             &PlanOptions {
                 dev_cmd_checks: cfg.dev_cmd_checks.clone(),
             },
         )?;
+        // Browser checks are appended HERE rather than through `PlanOptions`
+        // (t3 ruling C1): `crew_lead::plan`'s `PlanOptions` is deliberately
+        // narrow (plan.rs:36-38) so the knob can never carry a non-`Cmd`
+        // check, and `crew-lead` is frozen for this task. `TaskSpec.dod` is
+        // `pub` (crew-proto/src/dag.rs:31), so the append happens on the DAG
+        // the real planner just returned — before the snapshot and before
+        // `SpecReady`, so both carry it. With no Developer task present the
+        // checks are dropped silently, exactly as `plan.rs` documents for
+        // `dev_cmd_checks`.
+        if !cfg.dev_browser_checks.is_empty() {
+            if let Some(dev) = dag.tasks.iter_mut().find(|t| t.role == Role::Developer) {
+                dev.dod
+                    .extend(cfg.dev_browser_checks.iter().map(|c| crew_proto::DodCheck::Browser {
+                        flow: c.flow.clone(),
+                        expect: c.expect.clone(),
+                    }));
+            }
+        }
+        let dag = dag;
         let effective_max = if cfg.max_per_sprint == 0 {
             dag.tasks.len().max(1)
         } else {
@@ -847,6 +900,7 @@ impl RunController {
             &cfg.goal,
             &cfg.data_dir,
             project_root.as_deref(),
+            cfg.browser_binary.as_deref(),
             role_worktrees.as_deref(),
             &roster_snapshot0,
             &pool,
@@ -875,6 +929,7 @@ impl RunController {
         let goal = cfg.goal.clone();
         let data_dir = cfg.data_dir.clone();
         let project_root = project_root.clone();
+        let browser_binary = cfg.browser_binary.clone();
         let role_worktrees = role_worktrees.clone();
         let max_rework = cfg.max_rework;
         let escalation_timeout_ms = cfg.escalation_timeout_ms;
@@ -905,6 +960,7 @@ impl RunController {
                         &goal,
                         &data_dir,
                         project_root.as_deref(),
+                        browser_binary.as_deref(),
                         role_worktrees.as_deref(),
                         &roster_snapshot,
                         &pool,
@@ -1704,6 +1760,10 @@ mod live_controls_wiring_tests {
             roster: None,
             dev_cmd_checks: Vec::new(),
             project_root: None,
+            // t3 / 함정 29 / issue #5: the browser DoD ships UNARMED — no binary
+            // configured and no injected checks, so nothing is ever spawned.
+            browser_binary: None,
+            dev_browser_checks: Vec::new(),
             turn_timeout_secs: 900,
         }
     }
@@ -1830,6 +1890,74 @@ mod role_cli_cwd_tests {
         assert!(cwd.is_dir(), "the role cwd must exist as a directory after role_cli_cwd: {cwd:?}");
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- browser_wiring_enabled: truth table + cwd agreement (t3 plan D7 / user decision D3) ---
+
+    /// Normal + error + boundary in one table: the predicate is an AND over
+    /// two independent causes, so all FOUR input combinations are pinned.
+    /// Only both-Some wires; each of the three other rows is a distinct
+    /// reason the browser DoD stays `skipped`.
+    #[test]
+    fn browser_wiring_needs_both_a_project_root_and_a_binary() {
+        let root = std::path::PathBuf::from("/abs/project");
+
+        assert!(
+            browser_wiring_enabled(Some(&root), Some("fake-browser")),
+            "both configured must wire"
+        );
+        assert!(
+            !browser_wiring_enabled(None, Some("fake-browser")),
+            "no project_root must not wire (user decision D3) even with a binary set"
+        );
+        assert!(
+            !browser_wiring_enabled(Some(&root), None),
+            "no configured binary must not wire even with a project_root"
+        );
+        assert!(
+            !browser_wiring_enabled(None, None),
+            "the shipped default must not wire"
+        );
+    }
+
+    /// `role_cli_cwd`'s `role_worktrees` argument is LOAD-BEARING: passing
+    /// `None` where the resolved worktrees belong silently redirects
+    /// execution from the role's own git worktree to the shared
+    /// `<data_dir>/cli-cwd` scratch — the trust boundary user decision D3
+    /// draws. This is the negative control for that argument.
+    ///
+    /// It deliberately does NOT assert that "the browser cwd equals the cmd
+    /// cwd" by calling this function twice with identical literals: that
+    /// form is true no matter what `spawn_sprint` actually wires, so it
+    /// cannot fail. The real wiring is pinned end-to-end instead, by
+    /// `m10_browser_dod.rs`'s passing case, which reads the cwd the spawned
+    /// browser process itself reported and compares it against the worktree
+    /// production really created.
+    #[test]
+    fn role_cli_cwd_without_the_role_worktrees_resolves_somewhere_else_entirely() {
+        let developer_worktree = test_data_dir("browser-cwd-agreement-worktree");
+        let role_worktrees = vec![(Role::Developer, developer_worktree.clone())];
+        let data_dir = test_data_dir("browser-cwd-agreement-data");
+
+        let with_worktrees = role_cli_cwd(Some(&role_worktrees), &data_dir, Role::Developer);
+        let without_worktrees = role_cli_cwd(None, &data_dir, Role::Developer);
+
+        assert_eq!(
+            with_worktrees, developer_worktree,
+            "with resolved worktrees, a role must land in its own worktree"
+        );
+        assert_ne!(
+            with_worktrees, without_worktrees,
+            "dropping the role worktrees must be OBSERVABLE — if these were equal, \
+             no test could detect the browser closure being wired without them"
+        );
+        assert!(
+            without_worktrees.starts_with(&data_dir),
+            "without worktrees the cwd falls back under data_dir, got {without_worktrees:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&developer_worktree);
     }
 
     /// Boundary: calling it again for the same role (e.g. a second sprint's
@@ -2079,6 +2207,10 @@ mod resolve_role_worktrees_tests {
             roster: None,
             dev_cmd_checks: Vec::new(),
             project_root: Some(repo.clone()),
+            // t3 / 함정 29 / issue #5: the browser DoD ships UNARMED — no binary
+            // configured and no injected checks, so nothing is ever spawned.
+            browser_binary: None,
+            dev_browser_checks: Vec::new(),
             turn_timeout_secs: 900,
         };
 

@@ -58,6 +58,8 @@ fn config(data_dir: PathBuf, roster: Option<Roster>, dev_cmd_checks: Vec<CmdChec
         roster,
         dev_cmd_checks,
         project_root: None,
+        browser_binary: None,
+        dev_browser_checks: Vec::new(),
         turn_timeout_secs: 900,
     }
 }

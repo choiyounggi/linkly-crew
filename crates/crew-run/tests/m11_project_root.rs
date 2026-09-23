@@ -42,6 +42,8 @@ fn config(data_dir: PathBuf, project_root: Option<PathBuf>) -> RunConfig {
         roster: None,
         dev_cmd_checks: vec![],
         project_root,
+        browser_binary: None,
+        dev_browser_checks: Vec::new(),
         turn_timeout_secs: 900,
     }
 }

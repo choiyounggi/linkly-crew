@@ -9,8 +9,8 @@ mod observe;
 mod worktree;
 
 pub use config::{
-    default_dev_cmd_checks_node, default_dev_cmd_checks_rust, GateDecision, RunConfig, RunError,
-    RunMode,
+    default_dev_cmd_checks_node, default_dev_cmd_checks_rust, BrowserCheck, GateDecision,
+    RunConfig, RunError, RunMode,
 };
 pub use crew_lead::plan::CmdCheck;
 pub use controller::{validate_roster, RunController, RunHandle};
