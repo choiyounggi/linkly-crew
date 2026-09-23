@@ -7,7 +7,7 @@
 //! workers and a fresh `LeadBehavior` seeded with the accumulated terminal
 //! states of every earlier sprint (`with_prior_states`, contract C3a).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -54,6 +54,17 @@ pub(crate) const SWAP_ACK_TIMEOUT_MS: u64 = 120_000;
 /// loopback, local-only, scripted-run disconnect signal; named so a future
 /// measurement can retune it without re-deriving the mechanism.
 const HUMAN_UNREGISTER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound on a finished sprint's agents leaving the bus registry before the
+/// next sprint re-connects the very same ids. `crew_agents` yields a fixed
+/// id per role, so every sprint after the first re-registers ids the
+/// previous sprint still holds until the bus server's own, unsynchronized
+/// disconnect-detection task removes them; a still-present id is refused
+/// with `Error{code:"duplicate_agent"}` (`crew-bus`'s documented,
+/// separately-tested contract), which surfaces as `RunError::Bus` out of
+/// `spawn_sprint`. Same mechanism and therefore the same bound as
+/// `HUMAN_UNREGISTER_TIMEOUT`.
+const SPRINT_UNREGISTER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// L1 assembly budget for `summarize_sprint` (contracts-m5.md §C5a plan
 /// D6) — ≈4k tokens, per backend/common/llm/context-window-budget.md's
@@ -304,6 +315,10 @@ struct SpawnedSprint {
     worker_aborts: Vec<AbortHandle>,
     lead_task: JoinHandle<Result<(), RunnerError>>,
     controls: HashMap<String, mpsc::Sender<AgentControl>>,
+    /// Every bus id this sprint registered, in connect order — the exact set
+    /// the next sprint re-connects, so the sprint boundary knows what it
+    /// must see unregistered before spawning again.
+    agent_ids: Vec<String>,
 }
 
 /// Connects this sprint's five workers plus its `ObservingLead`-wrapped
@@ -334,6 +349,7 @@ async fn spawn_sprint(
     ts_tx: mpsc::UnboundedSender<TaskStateChange>,
 ) -> Result<SpawnedSprint, RunError> {
     let mut worker_aborts = Vec::new();
+    let mut agent_ids: Vec<String> = Vec::new();
     let mut controls: HashMap<String, mpsc::Sender<AgentControl>> = HashMap::new();
     // Vary-roster spawn/routing (contracts-m7.md §E4): `crew` replaces the
     // fixed `roles_all()` here and feeds `LeadBehavior`'s routing table
@@ -344,6 +360,7 @@ async fn spawn_sprint(
         let agent_id: &str = agent_id.as_str();
         let role = *role;
         let conn = BusConn::connect(url, token, agent_id).await?;
+        agent_ids.push(agent_id.to_string());
         // Every worker (Scripted included, plan D3) gets a control channel
         // so `swap_harness` step 3 has a real send target to test against;
         // the default `RoleBehavior::on_control` no-op-acks for behaviors
@@ -399,6 +416,7 @@ async fn spawn_sprint(
     }
 
     let lead_conn = BusConn::connect(url, token, "agent:lead").await?;
+    agent_ids.push("agent:lead".to_string());
     let routing: Vec<(Role, String)> = crew.iter().map(|(id, role)| (*role, id.clone())).collect();
     let prior_states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
     let cmd_cwd_base = data_dir.to_path_buf();
@@ -420,7 +438,7 @@ async fn spawn_sprint(
     // D6, pitfall 14) — lead swaps stay M5 boundary-only via `AgentRunner::run`.
     let lead_task = tokio::spawn(AgentRunner::run(lead_conn, observing));
 
-    Ok(SpawnedSprint { worker_aborts, lead_task, controls })
+    Ok(SpawnedSprint { worker_aborts, lead_task, controls, agent_ids })
 }
 
 /// The abort handles for whichever sprint's workers/lead are currently
@@ -481,6 +499,51 @@ async fn wait_for_bus_lifecycle(rx: &mut broadcast::Receiver<RunEvent>, kind: &s
     };
     if tokio::time::timeout(timeout, wait).await.is_err() {
         tracing::warn!(kind, agent_id, ?timeout, "bus lifecycle event not observed within bound; proceeding anyway");
+    }
+}
+
+/// [`wait_for_bus_lifecycle`] for a whole set of agent ids at once: returns
+/// as soon as a matching `kind` event has been seen for every id in
+/// `agent_ids`, or when `timeout` elapses (logged, never a silent skip nor
+/// an unbounded hang).
+///
+/// Set-based rather than a per-id loop over [`wait_for_bus_lifecycle`]: the
+/// ids leave the registry in arbitrary order, and a per-id wait would
+/// consume a *different* id's event while blocked on its own and then never
+/// see that consumed one again.
+async fn wait_for_bus_lifecycle_all(
+    rx: &mut broadcast::Receiver<RunEvent>,
+    kind: &str,
+    agent_ids: &[String],
+    timeout: Duration,
+) {
+    let mut remaining: HashSet<&str> = agent_ids.iter().map(String::as_str).collect();
+    if remaining.is_empty() {
+        return;
+    }
+    let wait = async {
+        loop {
+            match rx.recv().await {
+                Ok(RunEvent::BusLifecycle { kind: ev_kind, payload, .. }) if ev_kind == kind => {
+                    let observed = payload
+                        .get(kind)
+                        .and_then(|v| v.get("agent_id"))
+                        .and_then(|v| v.as_str());
+                    if let Some(id) = observed {
+                        remaining.remove(id);
+                        if remaining.is_empty() {
+                            return;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    };
+    if tokio::time::timeout(timeout, wait).await.is_err() {
+        tracing::warn!(kind, ?timeout, "not every agent's bus lifecycle event was observed within bound; proceeding anyway");
     }
 }
 
@@ -820,6 +883,7 @@ impl RunController {
         let finisher: JoinHandle<RunOutcomeDto> = tokio::spawn(async move {
             let mut current_worker_aborts = spawned0.worker_aborts;
             let mut current_lead_task = spawned0.lead_task;
+            let mut current_agent_ids = spawned0.agent_ids;
 
             let mut boundary_seq: i64 = 0;
             let mut summaries: Vec<String> = Vec::new();
@@ -863,6 +927,7 @@ impl RunController {
                             };
                             current_worker_aborts = spawned.worker_aborts;
                             current_lead_task = spawned.lead_task;
+                            current_agent_ids = spawned.agent_ids;
                         }
                         Err(err) => {
                             tracing::error!(error = %err, index, "failed to spawn sprint; ending run early");
@@ -872,6 +937,10 @@ impl RunController {
                     }
                 }
 
+                // Subscribed before the lead task is awaited: the lead's own
+                // connection closes the instant that task ends, so a receiver
+                // taken afterwards could miss its `Unregistered` entirely.
+                let mut boundary_unregister_rx = finisher_run_tx.subscribe();
                 let lead_result = (&mut current_lead_task).await;
                 for handle in &current_worker_aborts {
                     handle.abort();
@@ -889,6 +958,25 @@ impl RunController {
                     .clear();
 
                 drain_subscription_backlog(&drain_tx).await;
+
+                // The drain above only republishes what the bus has *already*
+                // broadcast; aborting a worker does not itself remove its bus
+                // registration, which the server drops on its own,
+                // unsynchronized disconnect-detection task. The next sprint
+                // re-connects these very same ids, and the bus refuses a
+                // still-registered id with `duplicate_agent` -> `RunError::Bus`
+                // out of `spawn_sprint`. Bound-wait for the registry to
+                // actually clear, exactly as the run-finish block does for
+                // `agent:human` (c30a1b7 / #14), instead of trusting the drain.
+                if index + 1 < sprints.len() {
+                    wait_for_bus_lifecycle_all(
+                        &mut boundary_unregister_rx,
+                        "Unregistered",
+                        &current_agent_ids,
+                        SPRINT_UNREGISTER_TIMEOUT,
+                    )
+                    .await;
+                }
 
                 let stored = finisher_ledger.messages_since(boundary_seq).unwrap_or_default();
                 boundary_seq = stored.iter().map(|m| m.seq).max().unwrap_or(boundary_seq);
@@ -2425,6 +2513,194 @@ mod human_unregister_ordering_tests {
         assert!(
             outer.is_ok(),
             "wait_for_bus_lifecycle must return within its own 50ms bound, not hang until the outer 500ms timeout"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sprint_boundary_unregister_ordering_tests {
+    //! t1-flaky-m5: `crew_agents` gives each role a fixed bus id, so every
+    //! sprint after the first re-connects ids the finished sprint still
+    //! holds until the bus server's own, unsynchronized disconnect-detection
+    //! task removes them. The bus refuses a still-registered id with
+    //! `Error{code:"duplicate_agent"}`, which `spawn_sprint` surfaces as
+    //! `RunError::Bus` and the finisher collapses into
+    //! `RunOutcomeDto::Failed` -> `RunError::Join("lead runner did not
+    //! complete")`. "Red" is the old code's exact shape (proceed straight
+    //! from the aborts to the next sprint's connect); "green" is the new
+    //! bounded wait for every id to actually leave the registry.
+    //!
+    //! Proven structurally on the wait's own call-site state (the same
+    //! approach as `human_unregister_ordering_tests`, c30a1b7): the real
+    //! end-to-end race measured only 3/21 even under 24x CPU load, so it is
+    //! not an on-demand deterministic red.
+
+    use super::*;
+    use tokio::sync::Barrier;
+
+    fn unregistered(seq: i64, agent_id: &str) -> RunEvent {
+        RunEvent::BusLifecycle {
+            seq,
+            kind: "Unregistered".to_string(),
+            payload: serde_json::json!({"Unregistered": {"agent_id": agent_id}}),
+        }
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Error case — the exact interleave that produced the bug: some of the
+    /// finished sprint's ids have left the registry and one has not. Red is
+    /// returning here (the old code did not wait at all, so the next
+    /// `BusConn::connect` for `agent:qa` hit `duplicate_agent`); green is
+    /// staying parked until that last id is actually gone.
+    ///
+    /// One pinned future is polled across both phases, so the ids already
+    /// observed in phase one stay observed — mirroring the single boundary
+    /// wait the finisher performs.
+    #[tokio::test]
+    async fn sprint_boundary_wait_blocks_while_any_agent_is_still_registered() {
+        let (tx, mut rx) = broadcast::channel::<RunEvent>(CHANNEL_CAPACITY);
+        let agents = ids(&["agent:designer", "agent:qa", "agent:lead"]);
+
+        // Two of the three are gone; `agent:qa` is still registered.
+        let _ = tx.send(unregistered(1, "agent:designer"));
+        let _ = tx.send(unregistered(2, "agent:lead"));
+
+        let barrier = Arc::new(Barrier::new(2));
+        let sender = {
+            let tx = tx.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let _ = tx.send(unregistered(3, "agent:qa"));
+            })
+        };
+
+        let waiting =
+            wait_for_bus_lifecycle_all(&mut rx, "Unregistered", &agents, SPRINT_UNREGISTER_TIMEOUT);
+        tokio::pin!(waiting);
+
+        // Red: with the sender parked, `agent:qa` has not unregistered. The
+        // boundary must not proceed -- proceeding is the bug.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut waiting)
+                .await
+                .is_err(),
+            "the boundary must keep waiting while agent:qa is still registered"
+        );
+
+        // Green: release the last unregistration; the same wait completes
+        // well inside its own 2s bound.
+        barrier.wait().await;
+        tokio::time::timeout(Duration::from_millis(500), &mut waiting)
+            .await
+            .expect("the wait must finish once every agent has left the registry");
+
+        sender.await.expect("sender task must not panic");
+    }
+
+    /// Normal case at the wait's own level: the ids leave the registry in an
+    /// order unrelated to the order they were connected in, and they arrive
+    /// one at a time while the boundary is already parked. A per-id
+    /// sequential wait would consume a different id's event while blocked on
+    /// its own and then miss it; the set-based wait must accept any order.
+    ///
+    /// Each id is released individually so every partial set is asserted to
+    /// keep the boundary parked -- without that, this case would pass just as
+    /// well against the pre-fix "proceed immediately" shape and would prove
+    /// nothing about the fix.
+    #[tokio::test]
+    async fn sprint_boundary_wait_accepts_unregistrations_in_any_order() {
+        let (tx, mut rx) = broadcast::channel::<RunEvent>(CHANNEL_CAPACITY);
+        let agents = ids(&["agent:designer", "agent:qa", "agent:lead"]);
+
+        // Reverse of the connect order that `agents` lists, one per release.
+        let barrier = Arc::new(Barrier::new(2));
+        let sender = {
+            let tx = tx.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                for (i, id) in ["agent:lead", "agent:qa", "agent:designer"].iter().enumerate() {
+                    barrier.wait().await;
+                    let _ = tx.send(unregistered(i as i64 + 1, id));
+                }
+            })
+        };
+
+        let waiting =
+            wait_for_bus_lifecycle_all(&mut rx, "Unregistered", &agents, SPRINT_UNREGISTER_TIMEOUT);
+        tokio::pin!(waiting);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "nothing has unregistered yet; the boundary must be parked"
+        );
+
+        for still_registered in ["agent:qa and agent:designer", "agent:designer"] {
+            barrier.wait().await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                    .await
+                    .is_err(),
+                "the boundary must stay parked while {still_registered} is still registered"
+            );
+        }
+
+        // The last id leaves; only now may the boundary proceed.
+        barrier.wait().await;
+        tokio::time::timeout(Duration::from_millis(500), &mut waiting)
+            .await
+            .expect("every id unregistered, in any order, must satisfy the wait");
+
+        sender.await.expect("sender task must not panic");
+    }
+
+    /// Boundary: the awaited events never arrive at all on a receiver that
+    /// stays open -- the wait must still return on its own bound rather than
+    /// hanging the run, exactly like
+    /// `wait_for_bus_lifecycle_returns_on_timeout_when_nothing_is_ever_sent`.
+    #[tokio::test]
+    async fn sprint_boundary_wait_returns_on_timeout_when_no_agent_ever_unregisters() {
+        let (_tx, mut rx) = broadcast::channel::<RunEvent>(CHANNEL_CAPACITY);
+        let agents = ids(&["agent:designer", "agent:qa"]);
+
+        let outer = tokio::time::timeout(
+            Duration::from_millis(500),
+            wait_for_bus_lifecycle_all(
+                &mut rx,
+                "Unregistered",
+                &agents,
+                Duration::from_millis(50),
+            ),
+        )
+        .await;
+
+        assert!(
+            outer.is_ok(),
+            "the wait must return within its own 50ms bound, not hang until the outer 500ms timeout"
+        );
+    }
+
+    /// Boundary: an empty id set (nothing was ever registered to wait for)
+    /// must return immediately instead of burning the whole bound.
+    #[tokio::test]
+    async fn sprint_boundary_wait_returns_immediately_for_an_empty_agent_set() {
+        let (_tx, mut rx) = broadcast::channel::<RunEvent>(CHANNEL_CAPACITY);
+        let agents: Vec<String> = Vec::new();
+
+        let outer = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_bus_lifecycle_all(&mut rx, "Unregistered", &agents, Duration::from_secs(30)),
+        )
+        .await;
+
+        assert!(
+            outer.is_ok(),
+            "an empty agent set must not wait on its 30s bound at all"
         );
     }
 }
