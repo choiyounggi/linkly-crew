@@ -330,7 +330,7 @@ impl LeadBehavior {
         task: TaskSpec,
         cmd_outcomes: &[CmdOutcome],
     ) -> Vec<Envelope> {
-        let verdict = dod_exec::judge(&task, &env.body, cmd_outcomes);
+        let verdict = dod_exec::judge(&task, &env.body, cmd_outcomes, &[]);
         let loop_ = self
             .loops
             .entry(task_id.clone())

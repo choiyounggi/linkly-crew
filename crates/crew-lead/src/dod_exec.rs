@@ -3,14 +3,18 @@
 //! executes DoD itself rather than trusting the worker's self-report
 //! (DESIGN.md §4.2).
 
+use crate::browser_exec::{parse_browser_expect, BrowserOutcome};
 use crate::cmd_exec::{parse_expect, CmdOutcome};
 use crew_proto::{DodCheck, TaskSpec};
 use serde_json::Value;
 
 /// Judgment result — contracts-m3.md 커버리지 규칙 as extended by M9 §G2d:
 /// `passed` iff `uncovered`, `missing_artifacts`, and `failed_cmds` are all
-/// empty. `Browser` checks never affect `passed`, they only land in
-/// `skipped` (M9 scope-out, G0). A `Cmd` check lands in `skipped` when no
+/// empty. A `Browser` check is matched against `browser_outcomes` by
+/// `(flow, expect)` and now *does* affect `passed` (issue #3): a failing
+/// browser outcome lands in `failed_cmds`, while an unrecognized `expect`,
+/// an unavailable binary, or no matching outcome land in `skipped` only.
+/// A `Cmd` check lands in `skipped` when no
 /// matching `CmdOutcome` was supplied (executor not wired, or `expect`
 /// unparseable) — same as M3 — and in `failed_cmds` when the matching
 /// outcome disagrees with `expect`.
@@ -30,6 +34,20 @@ fn outcome_run(outcome: &CmdOutcome) -> &str {
         | CmdOutcome::Refused { run, .. }
         | CmdOutcome::TimedOut { run }
         | CmdOutcome::SpawnFailed { run, .. } => run,
+    }
+}
+
+/// The `(flow, expect)` pair shared by every `BrowserOutcome` variant
+/// (mirrors `outcome_run`'s single-field matching key for `CmdOutcome`).
+fn outcome_flow_expect(outcome: &BrowserOutcome) -> (&str, &str) {
+    match outcome {
+        BrowserOutcome::Ran { flow, expect, .. }
+        | BrowserOutcome::Refused { flow, expect, .. }
+        | BrowserOutcome::TimedOut { flow, expect }
+        | BrowserOutcome::SpawnFailed { flow, expect, .. }
+        | BrowserOutcome::BinaryUnavailable { flow, expect, .. } => {
+            (flow.as_str(), expect.as_str())
+        }
     }
 }
 
@@ -57,10 +75,21 @@ fn artifact_present(artifacts: &[Value], name: &str) -> bool {
 /// outcome lands in `failed_cmds` (`cmd:<run> — <reason>`) and fails
 /// `passed`, and no match (executor not wired, or `expect` unparseable)
 /// lands in `skipped` only — unchanged from M3 (M9 §G2d, D11 regression
-/// invariant: an empty `cmd_outcomes` reproduces M3 exactly). `Browser` is
-/// never executed (M9 scope-out, G0) and is always recorded in `skipped`
-/// only, same as M3.
-pub fn judge(task: &TaskSpec, result_body: &Value, cmd_outcomes: &[CmdOutcome]) -> DodVerdict {
+/// invariant: an empty `cmd_outcomes` reproduces M3 exactly). `Browser`
+/// checks are matched against `browser_outcomes` by `(flow, expect)` identity
+/// (first-unused-match wins, mirroring `Cmd`): a `Ran{exit_code:0}` passes
+/// silently; a `Ran{exit_code!=0}`, `Refused`, `TimedOut`, or `SpawnFailed`
+/// outcome lands in `failed_cmds` (`browser:<flow> — <reason>`) and fails
+/// `passed`; and a `BinaryUnavailable` outcome, an unrecognized `expect`, or
+/// no matching outcome at all land in `skipped` only and never fail `passed`
+/// — "could not execute" must never be indistinguishable from "passed"
+/// (issue #3).
+pub fn judge(
+    task: &TaskSpec,
+    result_body: &Value,
+    cmd_outcomes: &[CmdOutcome],
+    browser_outcomes: &[BrowserOutcome],
+) -> DodVerdict {
     let covered: Vec<&str> = match result_body.get("covered_req_ids") {
         Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
         _ => vec![],
@@ -75,6 +104,7 @@ pub fn judge(task: &TaskSpec, result_body: &Value, cmd_outcomes: &[CmdOutcome]) 
     let mut failed_cmds = Vec::new();
     let mut skipped = Vec::new();
     let mut used_outcome = vec![false; cmd_outcomes.len()];
+    let mut used_browser_outcome = vec![false; browser_outcomes.len()];
 
     for check in &task.dod {
         match check {
@@ -121,7 +151,45 @@ pub fn judge(task: &TaskSpec, result_body: &Value, cmd_outcomes: &[CmdOutcome]) 
                     }
                 }
             }
-            DodCheck::Browser { flow, .. } => skipped.push(format!("browser:{flow}")),
+            DodCheck::Browser { flow, expect } => {
+                if parse_browser_expect(expect).is_none() {
+                    skipped.push(format!("browser:{flow}"));
+                    continue;
+                }
+                let matched = browser_outcomes.iter().enumerate().find(|(i, outcome)| {
+                    !used_browser_outcome[*i]
+                        && outcome_flow_expect(outcome) == (flow.as_str(), expect.as_str())
+                });
+                let Some((i, outcome)) = matched else {
+                    skipped.push(format!("browser:{flow}"));
+                    continue;
+                };
+                used_browser_outcome[i] = true;
+                match outcome {
+                    BrowserOutcome::Ran { exit_code, .. } if *exit_code == 0 => {}
+                    BrowserOutcome::Ran { exit_code, .. } => {
+                        failed_cmds.push(format!("browser:{flow} — exit {exit_code}"));
+                    }
+                    BrowserOutcome::Refused { reason, .. } => {
+                        failed_cmds.push(format!("browser:{flow} — refused: {reason}"));
+                    }
+                    BrowserOutcome::TimedOut { .. } => {
+                        failed_cmds.push(format!("browser:{flow} — timed out"));
+                    }
+                    BrowserOutcome::SpawnFailed { error, .. } => {
+                        failed_cmds.push(format!("browser:{flow} — spawn failed: {error}"));
+                    }
+                    // NOT `failed_cmds`: the binary was never there to run, so
+                    // this is "could not execute", not "failed". Folding it
+                    // into `failed_cmds` — the blanket rule the sibling `Cmd`
+                    // arm uses for Refused/TimedOut/SpawnFailed — would
+                    // reverse settled decision D1. Pinned by
+                    // `binary_unavailable_browser_check_is_skipped_not_failed`.
+                    BrowserOutcome::BinaryUnavailable { binary, .. } => {
+                        skipped.push(format!("browser:{flow} — binary unavailable: {binary}"));
+                    }
+                }
+            }
         }
     }
 
@@ -145,6 +213,7 @@ pub fn judge(task: &TaskSpec, result_body: &Value, cmd_outcomes: &[CmdOutcome]) 
 
 #[cfg(test)]
 mod tests {
+    use crate::browser_exec::BrowserOutcome;
     use crate::cmd_exec::CmdOutcome;
     use crew_proto::{ArtifactContract, DodCheck, ReqId, Role, TaskSpec};
     use serde_json::json;
@@ -165,6 +234,13 @@ mod tests {
         ReqId::new(id).unwrap()
     }
 
+    fn browser_check(flow: &str, expect: &str) -> DodCheck {
+        DodCheck::Browser {
+            flow: flow.to_string(),
+            expect: expect.to_string(),
+        }
+    }
+
     #[test]
     fn full_coverage_and_artifact_passes() {
         let t = task(
@@ -182,7 +258,7 @@ mod tests {
             "artifacts": [{"name": "spec.md", "kind": "doc", "req_ids": ["REQ-1", "REQ-2"], "content": "hello"}]
         });
 
-        let verdict = super::judge(&t, &body, &[]);
+        let verdict = super::judge(&t, &body, &[], &[]);
 
         assert!(verdict.passed);
         assert!(verdict.uncovered.is_empty());
@@ -199,7 +275,7 @@ mod tests {
         );
         let body = json!({"covered_req_ids": ["REQ-1"], "artifacts": []});
 
-        let verdict = super::judge(&t, &body, &[]);
+        let verdict = super::judge(&t, &body, &[], &[]);
 
         assert!(!verdict.passed);
         assert_eq!(verdict.uncovered, vec!["REQ-2".to_string()]);
@@ -227,7 +303,7 @@ mod tests {
             "artifacts": [{"name": "design.md", "kind": "doc", "req_ids": [], "content": ""}]
         });
 
-        let verdict = super::judge(&t, &body, &[]);
+        let verdict = super::judge(&t, &body, &[], &[]);
 
         assert!(!verdict.passed);
         assert_eq!(
@@ -236,6 +312,13 @@ mod tests {
         );
     }
 
+    // Still holds under the new 4-arg `judge`, but for a narrower reason
+    // than before: this check's `expect` ("success") is unparseable under the
+    // new grammar, so it exits at the `parse_browser_expect` guard and never
+    // reaches outcome matching at all. It would stay skipped no matter what
+    // `browser_outcomes` were supplied. The parseable-but-unmatched case is
+    // pinned separately by
+    // `parseable_browser_check_with_no_outcome_is_skipped_not_passed`.
     #[test]
     fn cmd_and_browser_are_skipped_and_do_not_affect_passed() {
         let t = task(
@@ -253,7 +336,7 @@ mod tests {
         );
         let body = json!({"covered_req_ids": [], "artifacts": []});
 
-        let verdict = super::judge(&t, &body, &[]);
+        let verdict = super::judge(&t, &body, &[], &[]);
 
         assert!(verdict.passed);
         assert_eq!(
@@ -272,7 +355,7 @@ mod tests {
         );
         let body = json!({"covered_req_ids": "REQ-1", "artifacts": []});
 
-        let verdict = super::judge(&t, &body, &[]);
+        let verdict = super::judge(&t, &body, &[], &[]);
 
         assert!(!verdict.passed);
         assert_eq!(verdict.uncovered, vec!["REQ-1".to_string()]);
@@ -294,7 +377,7 @@ mod tests {
             exit_code: 0,
         }];
 
-        let verdict = super::judge(&t, &body, &outcomes);
+        let verdict = super::judge(&t, &body, &outcomes, &[]);
 
         assert!(verdict.passed);
         assert!(verdict.failed_cmds.is_empty());
@@ -310,7 +393,7 @@ mod tests {
             exit_code: 1,
         }];
 
-        let verdict = super::judge(&t, &body, &outcomes);
+        let verdict = super::judge(&t, &body, &outcomes, &[]);
 
         assert!(!verdict.passed);
         assert_eq!(verdict.failed_cmds.len(), 1);
@@ -325,7 +408,7 @@ mod tests {
             reason: "matches no allowed prefix".to_string(),
         }];
 
-        let verdict = super::judge(&t, &body, &outcomes);
+        let verdict = super::judge(&t, &body, &outcomes, &[]);
 
         assert!(!verdict.passed);
         assert_eq!(verdict.failed_cmds.len(), 1);
@@ -339,7 +422,7 @@ mod tests {
             run: "npm test".to_string(),
         }];
 
-        let verdict = super::judge(&t, &body, &outcomes);
+        let verdict = super::judge(&t, &body, &outcomes, &[]);
 
         assert!(!verdict.passed);
         assert_eq!(verdict.failed_cmds.len(), 1);
@@ -357,13 +440,16 @@ mod tests {
             exit_code: 0,
         }];
 
-        let verdict = super::judge(&t, &body, &outcomes);
+        let verdict = super::judge(&t, &body, &outcomes, &[]);
 
         assert!(verdict.passed);
         assert!(verdict.failed_cmds.is_empty());
         assert_eq!(verdict.skipped, vec!["cmd:npm run e2e".to_string()]);
     }
 
+    // Same as above: unparseable `expect` ("success"), so this pins the
+    // *unrecognized grammar* path, not the *no matching outcome* path. Both
+    // land in `skipped`, but only the grammar guard is exercised here.
     #[test]
     fn browser_check_stays_skipped_and_never_fails() {
         let t = task(
@@ -375,11 +461,249 @@ mod tests {
         );
         let body = json!({"covered_req_ids": [], "artifacts": []});
 
-        let verdict = super::judge(&t, &body, &[]);
+        let verdict = super::judge(&t, &body, &[], &[]);
 
         assert!(verdict.passed);
         assert!(verdict.failed_cmds.is_empty());
         assert_eq!(verdict.skipped, vec!["browser:signup".to_string()]);
+    }
+
+    // --- browser outcomes: normal ---
+
+    #[test]
+    fn passing_browser_outcome_passes_and_is_not_skipped() {
+        let t = task(
+            vec![browser_check("http://localhost:3000", "text \"hi\"")],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![BrowserOutcome::Ran {
+            flow: "http://localhost:3000".to_string(),
+            expect: "text \"hi\"".to_string(),
+            exit_code: 0,
+        }];
+
+        let verdict = super::judge(&t, &body, &[], &outcomes);
+
+        assert!(verdict.passed);
+        assert!(verdict.failed_cmds.is_empty());
+        assert!(!verdict
+            .skipped
+            .contains(&"browser:http://localhost:3000".to_string()));
+    }
+
+    // --- browser outcomes: error ---
+
+    #[test]
+    fn failing_browser_outcome_makes_passed_false() {
+        let t = task(
+            vec![browser_check("http://localhost:3000", "text \"hi\"")],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![BrowserOutcome::Ran {
+            flow: "http://localhost:3000".to_string(),
+            expect: "text \"hi\"".to_string(),
+            exit_code: 1,
+        }];
+
+        let verdict = super::judge(&t, &body, &[], &outcomes);
+
+        // The whole point of issue #3: a failing browser check now actually
+        // blocks acceptance instead of being recorded and ignored.
+        assert!(!verdict.passed);
+        assert_eq!(verdict.failed_cmds.len(), 1);
+    }
+
+    // --- browser outcomes: boundary ---
+
+    #[test]
+    fn binary_unavailable_browser_check_is_skipped_not_failed() {
+        let t = task(
+            vec![browser_check("http://localhost:3000", "text \"hi\"")],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![BrowserOutcome::BinaryUnavailable {
+            flow: "http://localhost:3000".to_string(),
+            expect: "text \"hi\"".to_string(),
+            binary: "no-such-browser-cli".to_string(),
+        }];
+
+        let verdict = super::judge(&t, &body, &[], &outcomes);
+
+        // "Could not execute" is not "failed" — but it is also not a silent
+        // pass of the *check*: it stays visible in `skipped`. Mirroring the
+        // `Cmd` arm's blanket Refused/TimedOut/SpawnFailed fold here would
+        // reverse settled decision D1, which is what this test catches.
+        assert!(verdict.passed);
+        assert!(verdict.failed_cmds.is_empty());
+        assert!(
+            verdict
+                .skipped
+                .iter()
+                .any(|s| s.starts_with("browser:http://localhost:3000")),
+            "expected a skipped entry for the unavailable binary, got {:?}",
+            verdict.skipped
+        );
+    }
+
+    #[test]
+    fn refused_browser_outcome_fails_the_verdict() {
+        let t = task(
+            vec![browser_check("https://example.com", "text \"hi\"")],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![BrowserOutcome::Refused {
+            flow: "https://example.com".to_string(),
+            expect: "text \"hi\"".to_string(),
+            reason: "non-localhost host refused: example.com".to_string(),
+        }];
+
+        let verdict = super::judge(&t, &body, &[], &outcomes);
+
+        // A refused check is a check that did NOT verify anything. Letting it
+        // fall into `skipped` would make a DoD naming an off-localhost flow
+        // pass silently — the security-relevant half of issue #3.
+        assert!(!verdict.passed);
+        assert_eq!(verdict.failed_cmds.len(), 1);
+        assert!(
+            verdict.failed_cmds[0].contains("refused"),
+            "failure should name the refusal, got {:?}",
+            verdict.failed_cmds
+        );
+        assert!(verdict.skipped.is_empty(), "got {:?}", verdict.skipped);
+    }
+
+    #[test]
+    fn timed_out_browser_outcome_fails_the_verdict() {
+        let t = task(
+            vec![browser_check("http://localhost:3000", "text \"hi\"")],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![BrowserOutcome::TimedOut {
+            flow: "http://localhost:3000".to_string(),
+            expect: "text \"hi\"".to_string(),
+        }];
+
+        let verdict = super::judge(&t, &body, &[], &outcomes);
+
+        // A hung browser check must not become a silent pass.
+        assert!(!verdict.passed);
+        assert_eq!(verdict.failed_cmds.len(), 1);
+        assert!(
+            verdict.failed_cmds[0].contains("timed out"),
+            "failure should name the timeout, got {:?}",
+            verdict.failed_cmds
+        );
+        assert!(verdict.skipped.is_empty(), "got {:?}", verdict.skipped);
+    }
+
+    #[test]
+    fn spawn_failed_browser_outcome_fails_the_verdict() {
+        let t = task(
+            vec![browser_check("http://localhost:3000", "text \"hi\"")],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![BrowserOutcome::SpawnFailed {
+            flow: "http://localhost:3000".to_string(),
+            expect: "text \"hi\"".to_string(),
+            error: "No such file or directory (os error 2)".to_string(),
+        }];
+
+        let verdict = super::judge(&t, &body, &[], &outcomes);
+
+        // A binary that was found but could not be executed is a broken
+        // check, not an absent one — unlike `BinaryUnavailable`, it fails.
+        assert!(!verdict.passed);
+        assert_eq!(verdict.failed_cmds.len(), 1);
+        assert!(
+            verdict.failed_cmds[0].contains("spawn failed"),
+            "failure should name the spawn failure, got {:?}",
+            verdict.failed_cmds
+        );
+        assert!(verdict.skipped.is_empty(), "got {:?}", verdict.skipped);
+    }
+
+    #[test]
+    fn parseable_browser_check_with_no_outcome_is_skipped_not_passed() {
+        let t = task(
+            vec![browser_check("http://localhost:3000", "text \"hi\"")],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+
+        // The live production path today: `dispatch.rs` passes `&[]` because
+        // the executor is not wired yet (t3 owns that). A parseable check
+        // with no outcome must stay VISIBLE in `skipped`, never be dropped.
+        let verdict = super::judge(&t, &body, &[], &[]);
+
+        assert!(verdict.passed);
+        assert!(verdict.failed_cmds.is_empty());
+        assert_eq!(
+            verdict.skipped,
+            vec!["browser:http://localhost:3000".to_string()]
+        );
+    }
+
+    #[test]
+    fn browser_outcome_for_a_different_expect_is_not_matched() {
+        let t = task(
+            vec![browser_check("http://localhost:3000", "text \"hi\"")],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        // Same `flow`, different `expect`: this outcome belongs to another
+        // check. A flow-only matching key would consume it here and report a
+        // failure the task never actually incurred.
+        let outcomes = vec![BrowserOutcome::Ran {
+            flow: "http://localhost:3000".to_string(),
+            expect: "visible \"#done\"".to_string(),
+            exit_code: 1,
+        }];
+
+        let verdict = super::judge(&t, &body, &[], &outcomes);
+
+        assert!(verdict.passed);
+        assert!(verdict.failed_cmds.is_empty());
+        assert_eq!(
+            verdict.skipped,
+            vec!["browser:http://localhost:3000".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_browser_checks_consume_outcomes_in_order() {
+        let t = task(
+            vec![
+                browser_check("http://localhost:3000", "text \"hi\""),
+                browser_check("http://localhost:3000", "text \"hi\""),
+            ],
+            vec![],
+        );
+        let body = json!({"covered_req_ids": [], "artifacts": []});
+        let outcomes = vec![
+            BrowserOutcome::Ran {
+                flow: "http://localhost:3000".to_string(),
+                expect: "text \"hi\"".to_string(),
+                exit_code: 0,
+            },
+            BrowserOutcome::Ran {
+                flow: "http://localhost:3000".to_string(),
+                expect: "text \"hi\"".to_string(),
+                exit_code: 1,
+            },
+        ];
+
+        let verdict = super::judge(&t, &body, &[], &outcomes);
+
+        // Without the `used_browser_outcome` bookkeeping both checks would
+        // match the first (passing) outcome and the failure would vanish.
+        assert!(!verdict.passed);
+        assert_eq!(verdict.failed_cmds.len(), 1);
     }
 
     #[test]
@@ -403,7 +727,7 @@ mod tests {
             },
         ];
 
-        let verdict = super::judge(&t, &body, &outcomes);
+        let verdict = super::judge(&t, &body, &outcomes, &[]);
 
         assert!(!verdict.passed);
         assert_eq!(verdict.failed_cmds.len(), 1);

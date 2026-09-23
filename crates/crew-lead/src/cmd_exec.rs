@@ -778,7 +778,11 @@ mod tests {
         std::fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\nsleep 300 &\nGCPID=$!\necho \"$GCPID\" > \"{}\"\nsync\nsleep 300\n",
+                // No `sync`: the reader is another process on the same machine, so
+                // the page cache already makes the write visible, while a
+                // filesystem-wide flush stalls every other process-spawning
+                // test running concurrently.
+                "#!/bin/sh\nsleep 300 &\nGCPID=$!\necho \"$GCPID\" > \"{}\"\nsleep 300\n",
                 pid_file.display()
             ),
         )
@@ -796,48 +800,87 @@ mod tests {
             .expect("scratch path is utf8")
             .to_string();
 
-        // A generous window: under concurrent test-thread load, forking the
-        // shell and backgrounding+recording its own grandchild can take
-        // longer than a tight timeout would allow, and the group-kill must
-        // not fire before the script finishes writing its pid file.
-        let policy = CmdPolicy::default_allowlist()
-            .allow(&[script_abs.as_str()])
-            .with_timeout(Duration::from_millis(1500));
         let t = task(vec![cmd_check(&script_abs, "exit 0")]);
 
-        let outcomes = execute_cmd_checks(&t, &cwd(), &policy).await;
+        // The scenario this test needs — a timed-out command that had
+        // already forked and recorded a grandchild — only exists if the
+        // spawner wins a race against the policy timeout. A single
+        // hardcoded budget is a guess about how fast this machine schedules
+        // a fork, and that guess breaks as the crate's parallel test count
+        // grows (measured under identical load: 0/10 failures at 91 tests,
+        // 8/10 at 119). So establish the scenario by escalating the budget
+        // rather than assuming one value is always enough.
+        //
+        // Only the SETUP is retried. Once a grandchild pid is recorded the
+        // group-kill assertion below runs exactly once, and a surviving
+        // grandchild fails immediately — a real regression is never retried
+        // away.
+        const SETUP_BUDGETS: [Duration; 3] = [
+            Duration::from_millis(1500),
+            Duration::from_secs(5),
+            Duration::from_secs(15),
+        ];
 
-        assert_eq!(
-            outcomes,
-            vec![CmdOutcome::TimedOut {
-                run: script_abs.clone(),
-            }]
-        );
+        for budget in SETUP_BUDGETS {
+            let _ = std::fs::remove_file(&pid_file);
+            let policy = CmdPolicy::default_allowlist()
+                .allow(&[script_abs.as_str()])
+                .with_timeout(budget);
 
-        let pid_contents = wait_for_nonempty_file(&pid_file, Duration::from_secs(2))
-            .await
-            .expect("grandchild pid file was never written by the spawner script");
-        let grandchild_pid: i32 = pid_contents
-            .trim()
-            .parse()
-            .unwrap_or_else(|e| panic!("grandchild pid file {pid_contents:?} did not parse: {e}"));
-        assert!(
-            grandchild_pid > 1,
-            "grandchild pid must be a real pid, got {grandchild_pid}"
-        );
-        cleanup.grandchild_pid = Some(grandchild_pid);
+            let outcomes = execute_cmd_checks(&t, &cwd(), &policy).await;
 
-        let alive = unsafe { libc::kill(grandchild_pid, 0) };
-        let probe_err = std::io::Error::last_os_error();
-        assert_eq!(
-            alive, -1,
-            "expected grandchild pid {grandchild_pid} to be dead after the timeout, \
-             but kill(pid, 0) returned {alive} (still alive)"
-        );
-        assert_eq!(
-            probe_err.raw_os_error(),
-            Some(libc::ESRCH),
-            "expected ESRCH (no such process) for grandchild {grandchild_pid}, got {probe_err}"
+            // Holds on every attempt: the script sleeps far longer than any
+            // budget, so it always times out rather than completing.
+            assert_eq!(
+                outcomes,
+                vec![CmdOutcome::TimedOut {
+                    run: script_abs.clone(),
+                }]
+            );
+
+            let Some(pid_contents) = wait_for_nonempty_file(&pid_file, Duration::from_secs(2)).await
+            else {
+                // The group-kill fired before the spawner could record
+                // anything, so the scenario never existed to be tested.
+                // Sweep a pid that lands late, then retry with more budget.
+                if let Ok(late) = std::fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = late.trim().parse::<i32>() {
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                    }
+                }
+                continue;
+            };
+
+            let grandchild_pid: i32 = pid_contents.trim().parse().unwrap_or_else(|e| {
+                panic!("grandchild pid file {pid_contents:?} did not parse: {e}")
+            });
+            assert!(
+                grandchild_pid > 1,
+                "grandchild pid must be a real pid, got {grandchild_pid}"
+            );
+            cleanup.grandchild_pid = Some(grandchild_pid);
+
+            let alive = unsafe { libc::kill(grandchild_pid, 0) };
+            let probe_err = std::io::Error::last_os_error();
+            assert_eq!(
+                alive, -1,
+                "expected grandchild pid {grandchild_pid} to be dead after the timeout, \
+                 but kill(pid, 0) returned {alive} (still alive)"
+            );
+            assert_eq!(
+                probe_err.raw_os_error(),
+                Some(libc::ESRCH),
+                "expected ESRCH (no such process) for grandchild {grandchild_pid}, got {probe_err}"
+            );
+            return;
+        }
+
+        panic!(
+            "the spawner never recorded a grandchild pid within {:?} — the scenario \
+             could not be established on this machine, so the group-kill was never exercised",
+            SETUP_BUDGETS.last()
         );
     }
 
