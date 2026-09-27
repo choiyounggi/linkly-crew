@@ -13,10 +13,10 @@ use crew_agent::RoleBehavior;
 use crew_proto::{Envelope, MessageKind, Role, TaskDag, TaskSpec};
 use serde_json::{json, Value};
 
-use crate::accept::{AcceptDecision, AcceptanceLoop};
+use crate::accept::{AcceptDecision, AcceptanceLoop, dod_violation_strings};
 use crate::browser_exec::{self, BrowserOutcome, BrowserPolicy};
 use crate::cmd_exec::{self, CmdOutcome, CmdPolicy};
-use crate::dod_exec::{self, DodVerdict};
+use crate::dod_exec;
 
 const DEADLINE_MS: u64 = 900_000;
 const SPRINT_LABEL: &str = "sp-m3";
@@ -390,7 +390,7 @@ impl LeadBehavior {
             AcceptDecision::Escalate { reason } => {
                 self.states.insert(task_id.clone(), TaskState::Escalated);
                 self.track_pending_escalation(&task_id);
-                vec![self.human_gate(&task_id, &reason, &env.corr, violation_strings(&verdict))]
+                vec![self.human_gate(&task_id, &reason, &env.corr, dod_violation_strings(&verdict))]
             }
         }
     }
@@ -507,24 +507,6 @@ impl LeadBehavior {
         self.states.insert(task_id, TaskState::Pending);
         self.dispatch_ready()
     }
-}
-
-/// Same violation-string shape as `accept::AcceptanceLoop::decide`'s
-/// `Rework` arm (`"REQ-x"` / `"artifact:name"`), rebuilt here because
-/// `AcceptDecision::Escalate` (plan D3) carries only a `reason`, not the
-/// verdict's violations — and `human.gate`'s body still needs them.
-fn violation_strings(verdict: &DodVerdict) -> Vec<String> {
-    verdict
-        .uncovered
-        .iter()
-        .cloned()
-        .chain(
-            verdict
-                .missing_artifacts
-                .iter()
-                .map(|name| format!("artifact:{name}")),
-        )
-        .collect()
 }
 
 #[async_trait]
@@ -1142,6 +1124,32 @@ mod tests {
         let violations = replies[0].body["violations"].as_array().unwrap();
         assert!(violations.iter().any(|v| v.as_str().unwrap().starts_with("cmd:")));
         assert_eq!(lead.state_of("t-cmd"), Some(TaskState::Assigned));
+    }
+
+    #[tokio::test]
+    async fn cmd_wiring_on_nonzero_exit_with_budget_exhausted_surfaces_cmd_in_human_gate() {
+        let cmd_check = crew_proto::DodCheck::Cmd {
+            run: "/usr/bin/false".to_string(),
+            expect: "exit 0".to_string(),
+        };
+        let policy = CmdPolicy::default_allowlist().allow(&["/usr/bin/false"]);
+        let mut lead = lead_for_tasks(
+            vec![cmd_task("t-cmd", Role::Pm, vec![cmd_check])],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            0,
+        )
+        .with_cmd_policy(policy)
+        .with_cmd_exec(Arc::new(|_role| cmd_test_cwd()));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:pm", empty_result_body());
+        let replies = lead.on_envelope(result).await;
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].kind, MessageKind::HumanGate);
+        let violations = replies[0].body["violations"].as_array().unwrap();
+        assert!(violations.iter().any(|v| v.as_str().unwrap().starts_with("cmd:")));
+        assert_eq!(lead.state_of("t-cmd"), Some(TaskState::Escalated));
     }
 
     #[tokio::test]

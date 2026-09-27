@@ -14,6 +14,27 @@ pub enum AcceptDecision {
     Escalate { reason: String },
 }
 
+/// Shared `DodVerdict` -> violation-string serialization (t1-lead-violations):
+/// `uncovered`, then `missing_artifacts` prefixed `"artifact:"`, then
+/// `failed_cmds` (already `cmd:<run> — <reason>`-formatted by
+/// `dod_exec::judge`), in that order. Used by both `AcceptanceLoop::decide`
+/// (Rework path) and `dispatch.rs`'s `human.gate` path so a verdict with only
+/// `failed_cmds` populated no longer serializes to an empty list on either.
+pub(crate) fn dod_violation_strings(verdict: &DodVerdict) -> Vec<String> {
+    verdict
+        .uncovered
+        .iter()
+        .cloned()
+        .chain(
+            verdict
+                .missing_artifacts
+                .iter()
+                .map(|name| format!("artifact:{name}")),
+        )
+        .chain(verdict.failed_cmds.iter().cloned())
+        .collect()
+}
+
 /// Per-task rework budget tracker (plan D3).
 #[derive(Debug, Clone)]
 pub struct AcceptanceLoop {
@@ -55,18 +76,7 @@ impl AcceptanceLoop {
         }
 
         self.rounds_used += 1;
-        let violations = verdict
-            .uncovered
-            .iter()
-            .cloned()
-            .chain(
-                verdict
-                    .missing_artifacts
-                    .iter()
-                    .map(|name| format!("artifact:{name}")),
-            )
-            .chain(verdict.failed_cmds.iter().cloned())
-            .collect();
+        let violations = dod_violation_strings(verdict);
         AcceptDecision::Rework { violations }
     }
 }
@@ -163,6 +173,47 @@ mod tests {
             AcceptDecision::Rework {
                 violations: vec!["cmd:cargo test — exit 1 (expected 0)".to_string()]
             }
+        );
+    }
+
+    #[test]
+    fn dod_violation_strings_chains_all_three_buckets_in_order() {
+        let verdict = DodVerdict {
+            passed: false,
+            uncovered: vec!["REQ-1".to_string()],
+            missing_artifacts: vec!["spec.md".to_string()],
+            failed_cmds: vec!["cmd:cargo test — exit 1 (expected 0)".to_string()],
+            skipped: vec![],
+        };
+
+        assert_eq!(
+            dod_violation_strings(&verdict),
+            vec![
+                "REQ-1".to_string(),
+                "artifact:spec.md".to_string(),
+                "cmd:cargo test — exit 1 (expected 0)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dod_violation_strings_all_buckets_empty_returns_empty_list() {
+        assert_eq!(dod_violation_strings(&passing_verdict()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn dod_violation_strings_failed_cmds_alone_is_not_dropped() {
+        let verdict = DodVerdict {
+            passed: false,
+            uncovered: vec![],
+            missing_artifacts: vec![],
+            failed_cmds: vec!["cmd:cargo test — exit 1 (expected 0)".to_string()],
+            skipped: vec![],
+        };
+
+        assert_eq!(
+            dod_violation_strings(&verdict),
+            vec!["cmd:cargo test — exit 1 (expected 0)".to_string()]
         );
     }
 }
