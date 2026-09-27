@@ -233,28 +233,76 @@ pub async fn execute_cmd_checks(
             }
             Err(_) => {
                 #[cfg(unix)]
-                {
-                    match group_guard.as_mut() {
-                        Some(guard) => {
-                            guard.kill_group();
-                            guard.disarm();
-                            let _ = child.wait().await;
-                        }
-                        None => {
-                            let _ = child.kill().await;
-                        }
-                    }
-                }
+                outcomes
+                    .push(cleanup_after_timeout(run, group_guard.as_mut(), &mut child).await);
                 #[cfg(not(unix))]
                 {
                     let _ = child.kill().await;
+                    outcomes.push(CmdOutcome::TimedOut { run: run.clone() });
                 }
-                outcomes.push(CmdOutcome::TimedOut { run: run.clone() });
             }
         }
     }
 
     outcomes
+}
+
+/// How long the cleanup path waits for the killed process to actually be
+/// reaped after a SIGKILL has been sent. SIGKILL-to-reap is a local kernel
+/// operation, not a network call: 5 back-to-back `kill -9`/`wait` probes on
+/// this machine measured 1ms, 1ms, 1ms, 1ms, 3ms; 5s is roughly
+/// 1700x-5000x that observed latency, so it only fires on genuine
+/// kernel-level pathology (an unkillable child in uninterruptible sleep, a
+/// kill that never landed), never on correct behavior.
+#[cfg(unix)]
+const CLEANUP_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Awaits `reap` under `bound`. Expiry is the whole point: it means the
+/// child was signalled but never became reapable, so the caller must
+/// report that explicitly instead of awaiting `child.wait()` forever
+/// inside the very path that exists to enforce `policy.timeout`.
+#[cfg(unix)]
+async fn reap_or_report(
+    run: &str,
+    bound: Duration,
+    reap: impl std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
+) -> CmdOutcome {
+    match timeout(bound, reap).await {
+        Ok(_) => CmdOutcome::TimedOut {
+            run: run.to_string(),
+        },
+        Err(_) => CmdOutcome::SpawnFailed {
+            run: run.to_string(),
+            error: "timed out; child not reaped within CLEANUP_REAP_TIMEOUT".to_string(),
+        },
+    }
+}
+
+/// The `killpg` call `ProcessGroupGuard` makes, as a plain fn pointer so a
+/// test can substitute a failing one per guard instance (no global toggle,
+/// which would race across `cargo test`'s parallel threads).
+#[cfg(unix)]
+type KillGroupFn = fn(i32) -> std::io::Result<()>;
+
+/// The production `kill_fn`: `killpg(pgid, SIGKILL)`, reporting whether the
+/// signal was actually delivered. `ESRCH` ("no such process group") is
+/// success, not failure — it means the whole group already exited on its
+/// own. Any other errno (notably `EPERM`, which a `setsid` child that
+/// changed credentials produces) means the group is still alive and the
+/// caller must fall back to killing the direct child.
+#[cfg(unix)]
+fn real_kill_group(pgid: i32) -> std::io::Result<()> {
+    // SAFETY: killpg is called with a valid signal constant and no
+    // borrowed/untrusted memory.
+    let rc = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err)
 }
 
 /// Owns the group-kill responsibility for a spawned child's entire process
@@ -266,6 +314,7 @@ pub async fn execute_cmd_checks(
 struct ProcessGroupGuard {
     pgid: i32,
     armed: bool,
+    kill_fn: KillGroupFn,
 }
 
 #[cfg(unix)]
@@ -282,16 +331,26 @@ impl ProcessGroupGuard {
         Some(ProcessGroupGuard {
             pgid: child_id as i32,
             armed: true,
+            kill_fn: real_kill_group,
         })
     }
 
-    fn kill_group(&self) {
-        // SAFETY: killpg is called with a valid signal constant and no
-        // borrowed/untrusted memory. The return value is ignored: ESRCH
-        // ("no such process group") just means the whole group already
-        // exited on its own, which is the success case, not an error.
-        unsafe {
-            libc::killpg(self.pgid, libc::SIGKILL);
+    /// Signals the whole group. The result is deliberately returned rather
+    /// than swallowed: a failed `killpg` leaves a live child that the
+    /// caller must deal with (see `cleanup_after_timeout`).
+    fn kill_group(&self) -> std::io::Result<()> {
+        (self.kill_fn)(self.pgid)
+    }
+
+    /// Builds a guard around an arbitrary pgid with a substituted kill, so
+    /// a test can exercise the `killpg`-failed path without needing a real
+    /// process whose credentials actually reject the signal.
+    #[cfg(test)]
+    fn new_for_test(pgid: i32, kill_fn: KillGroupFn) -> Self {
+        ProcessGroupGuard {
+            pgid,
+            armed: true,
+            kill_fn,
         }
     }
 
@@ -304,9 +363,43 @@ impl ProcessGroupGuard {
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.kill_group();
+            let _ = self.kill_group();
         }
     }
+}
+
+/// Cleans up after `policy.timeout` expired: kill the runaway, then reap
+/// it. Pulled out of `execute_cmd_checks` so a test can inject a failing
+/// kill — the suite has no reliable way to make a real `killpg` fail.
+#[cfg(unix)]
+async fn cleanup_after_timeout(
+    run: &str,
+    guard: Option<&mut ProcessGroupGuard>,
+    child: &mut Child,
+) -> CmdOutcome {
+    match guard {
+        Some(guard) => {
+            // A swallowed `killpg` is the bug this path exists to avoid:
+            // on EPERM (a setsid child that changed credentials) or a
+            // recycled pgid the group survives, and an unbounded
+            // `child.wait()` below would then hang forever inside the very
+            // branch that enforces `policy.timeout`. Killing the direct
+            // child is the fallback that is always ours to make.
+            //
+            // It is deliberately direct-child-only (review r1 N2): if
+            // `killpg` refused the group, nothing here can reach the
+            // grandchildren either, so they are left to the reap bound
+            // below to report rather than silently waited on.
+            if guard.kill_group().is_err() {
+                let _ = child.kill().await;
+            }
+            guard.disarm();
+        }
+        None => {
+            let _ = child.kill().await;
+        }
+    }
+    reap_or_report(run, CLEANUP_REAP_TIMEOUT, child.wait()).await
 }
 
 /// Cleans up after `child.wait()` itself returns an I/O error — the exit
@@ -318,7 +411,7 @@ impl Drop for ProcessGroupGuard {
 async fn cleanup_unknown_state(guard: Option<&mut ProcessGroupGuard>, child: &mut Child) {
     match guard {
         Some(guard) => {
-            guard.kill_group();
+            let _ = guard.kill_group();
             guard.disarm();
         }
         None => {
@@ -881,6 +974,222 @@ mod tests {
             "the spawner never recorded a grandchild pid within {:?} — the scenario \
              could not be established on this machine, so the group-kill was never exercised",
             SETUP_BUDGETS.last()
+        );
+    }
+
+    // --- cleanup_after_timeout: the killpg-failed branch ---
+    //
+    // A real `killpg` cannot be made to fail on demand here (it would need
+    // a child that actually changed credentials via setsid), so the kill
+    // itself is the injected seam: `new_for_test` takes the fn pointer.
+    //
+    // RED-then-GREEN evidence, both runs of the exact same command:
+    //   cargo test -p crew-lead \
+    //     cmd_exec::tests::kill_group_failure_falls_back_to_killing_the_direct_child \
+    //     -- --nocapture
+    // RED   (pre-fix `cleanup_after_timeout`, killpg result swallowed):
+    //   panicked at crates/crew-lead/src/cmd_exec.rs:1013:
+    //     cleanup_after_timeout hung past its 3s test bound when
+    //     kill_group failed
+    //   test result: FAILED. 0 passed; 1 failed; finished in 3.01s
+    // GREEN (post-fix, falls back to child.kill() and bounds the reap):
+    //   test result: ok. 1 passed; 0 failed; finished in 0.00s
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_group_failure_falls_back_to_killing_the_direct_child() {
+        let dir = cwd()
+            .join("target")
+            .join(format!("m2-killfail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test scratch dir");
+        let mut child = Command::new("/bin/sleep")
+            .arg("300")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("has pid") as i32;
+        let mut cleanup = TestCleanup {
+            dir,
+            grandchild_pid: Some(pid),
+        };
+        let mut guard = ProcessGroupGuard::new_for_test(pid, |_pgid| {
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            cleanup_after_timeout("sleep 300", Some(&mut guard), &mut child),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "cleanup_after_timeout hung past its 3s test bound when kill_group failed"
+        );
+        assert_eq!(
+            result.unwrap(),
+            CmdOutcome::TimedOut {
+                run: "sleep 300".to_string()
+            }
+        );
+        assert!(
+            wait_until_dead(pid, Duration::from_secs(2)).await,
+            "direct child {pid} was not reaped after the injected kill_group failure"
+        );
+        cleanup.grandchild_pid = None;
+    }
+
+    /// The reap bound's own expiry, with no timing luck: `pending()` never
+    /// resolves, so this pins the outcome an unreapable child produces —
+    /// an explicit, named failure instead of the original silent hang.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_or_report_returns_explicit_outcome_when_the_bound_expires() {
+        let outcome = reap_or_report(
+            "sleep 300",
+            Duration::from_millis(50),
+            std::future::pending(),
+        )
+        .await;
+
+        match outcome {
+            CmdOutcome::SpawnFailed { run, error } => {
+                assert_eq!(run, "sleep 300");
+                assert!(
+                    error.contains("timed out"),
+                    "error {error:?} must name the timeout"
+                );
+                assert!(
+                    error.contains("not reaped"),
+                    "error {error:?} must name the unreaped child"
+                );
+            }
+            other => panic!("expected SpawnFailed on reap-bound expiry, got {other:?}"),
+        }
+    }
+
+    // --- cleanup_after_timeout: the PRODUCTION reap bound (review r1 F1) ---
+    //
+    // `reap_or_report_returns_explicit_outcome_when_the_bound_expires`
+    // pins the helper but not its wiring: r1's mutation 2 deleted
+    // `reap_or_report(run, CLEANUP_REAP_TIMEOUT, child.wait())` from
+    // `cleanup_after_timeout`, restored the old unbounded
+    // `let _ = child.wait().await`, and all 32 tests still passed. This
+    // test drives the real `cleanup_after_timeout` into expiry using the
+    // real constant, so deleting the bound hangs it.
+    //
+    // A `kill_fn` that reports success WITHOUT killing is the whole trick:
+    // it is what a recycled pgid looks like from inside the process, so
+    // the EPERM fallback is skipped and the live child is never reaped —
+    // exactly issue #25's hang, with nothing unkillable required.
+    //
+    // RED-then-GREEN evidence, both runs of the exact same command:
+    //   cargo test -p crew-lead --lib \
+    //     cmd_exec::tests::cleanup_after_timeout_reports_an_unreaped_child_when_the_bound_expires
+    // RED   (r1 mutation 2 applied — bound removed from the call site):
+    //   panicked at crates/crew-lead/src/cmd_exec.rs:1122:
+    //     cleanup_after_timeout never returned: the production call site
+    //     is not bounded by CLEANUP_REAP_TIMEOUT: Elapsed(())
+    //   test result: FAILED. 0 passed; 1 failed; finished in 10.01s
+    // GREEN (bound restored):
+    //   test result: ok. 1 passed; 0 failed; finished in 5.00s
+    //     (5.00s = the production CLEANUP_REAP_TIMEOUT actually elapsing)
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_after_timeout_reports_an_unreaped_child_when_the_bound_expires() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("300")
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("has pid") as i32;
+        // The guard is disarmed by `cleanup_after_timeout` before it
+        // returns, so nothing else will kill this child: the test owns it.
+        let mut cleanup = TestCleanup {
+            dir: cwd().join("target").join(format!(
+                "m2-unreaped-{}-{}",
+                std::process::id(),
+                pid
+            )),
+            grandchild_pid: Some(pid),
+        };
+        // Reports success without signalling anything — a recycled pgid.
+        let mut guard = ProcessGroupGuard::new_for_test(pid, |_pgid| Ok(()));
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            cleanup_after_timeout("sleep 300", Some(&mut guard), &mut child),
+        )
+        .await
+        .expect(
+            "cleanup_after_timeout never returned: the production call site is not \
+             bounded by CLEANUP_REAP_TIMEOUT",
+        );
+        let elapsed = started.elapsed();
+
+        match outcome {
+            CmdOutcome::SpawnFailed { run, error } => {
+                assert_eq!(run, "sleep 300");
+                assert!(
+                    error.contains("timed out") && error.contains("not reaped"),
+                    "error {error:?} must name both the timeout and the unreaped child"
+                );
+            }
+            other => panic!(
+                "a child that was never killed must be reported unreaped, got {other:?}"
+            ),
+        }
+        // A `timeout` cannot fire early, so this lower bound is not racy:
+        // it pins that the constant governing the wait is the 5s
+        // production one and not some smaller bound slipped in later.
+        assert!(
+            elapsed >= Duration::from_secs(4),
+            "returned after {elapsed:?}, too fast to have waited out \
+             CLEANUP_REAP_TIMEOUT ({CLEANUP_REAP_TIMEOUT:?})"
+        );
+
+        // The test owns this still-live child: kill and reap it here.
+        let _ = child.kill().await;
+        assert!(
+            wait_until_dead(pid, Duration::from_secs(2)).await,
+            "test failed to clean up its own unreaped child {pid}"
+        );
+        cleanup.grandchild_pid = None;
+    }
+
+    /// Boundary: `ProcessGroupGuard::new` returns `None` for pgid 0 (and
+    /// the guard does not exist at all off unix), so the cleanup path must
+    /// still kill and reap through the direct child alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_after_timeout_without_a_group_guard_kills_and_reaps_the_child() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id().expect("has pid") as i32;
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            cleanup_after_timeout("sleep 300", None, &mut child),
+        )
+        .await
+        .expect("cleanup_after_timeout hung with no group guard");
+
+        assert_eq!(
+            outcome,
+            CmdOutcome::TimedOut {
+                run: "sleep 300".to_string()
+            }
+        );
+        assert!(
+            wait_until_dead(pid, Duration::from_secs(2)).await,
+            "direct child {pid} was not reaped on the no-guard path"
         );
     }
 
