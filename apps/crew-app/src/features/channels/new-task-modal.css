@@ -101,6 +101,9 @@
   border-radius: var(--radius-md);
   padding: var(--space-2);
   margin: 0;
+  max-height: 10rem;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .new-task-modal__project-item {
@@ -109,4 +112,10 @@
   gap: var(--space-2);
   font-size: var(--font-size-sm);
   color: var(--ink-text);
+}
+
+.new-task-modal .panel--roster {
+  max-height: 16rem;
+  min-height: 0;
+  overflow-y: auto;
 }

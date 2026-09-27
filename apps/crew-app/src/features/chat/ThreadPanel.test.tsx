@@ -99,5 +99,45 @@ describe("ThreadPanel — timeline filtering (normal/boundary)", () => {
     render(<ThreadPanel runId={RUN_ID} threadId="t-ghost" onClose={() => {}} />);
 
     expect(screen.getByText("메시지가 없습니다")).toBeInTheDocument();
+    expect(document.querySelector(".thread-panel__list")).toBeNull();
+  });
+});
+
+describe("ThreadPanel — list container structure (issue #29 regression pin)", () => {
+  it("renders exactly one .thread-panel__list containing exactly one row (normal)", () => {
+    setChannel({
+      messages: [{ seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-single", body: {} }) }],
+    });
+
+    const { container } = render(<ThreadPanel runId={RUN_ID} threadId="t-single" onClose={() => {}} />);
+
+    expect(container.querySelectorAll(".thread-panel__list")).toHaveLength(1);
+    expect(container.querySelectorAll(".thread-panel__list > li.message-row")).toHaveLength(1);
+  });
+
+  it("renders exactly one .thread-panel__list containing 500 rows, no second scroll wrapper (boundary)", () => {
+    const messages = Array.from({ length: 500 }, (_, i) => ({
+      seq: i + 1,
+      envelope: envelope({ id: `e${i}`, kind: "task.assign", thread: "t-many", body: {} }),
+    }));
+    setChannel({ messages });
+
+    const { container } = render(<ThreadPanel runId={RUN_ID} threadId="t-many" onClose={() => {}} />);
+
+    expect(container.querySelectorAll(".thread-panel__list")).toHaveLength(1);
+    expect(container.querySelectorAll(".thread-panel__list > li.message-row")).toHaveLength(500);
+  });
+
+  it("still renders exactly one .thread-panel__list when a human.gate message has an empty body (error)", () => {
+    setChannel({
+      messages: [
+        { seq: 1, envelope: envelope({ id: "e-gate", kind: "human.gate", thread: "t-gate", body: {} }) },
+      ],
+    });
+
+    expect(() =>
+      render(<ThreadPanel runId={RUN_ID} threadId="t-gate" onClose={() => {}} />),
+    ).not.toThrow();
+    expect(document.querySelectorAll(".thread-panel__list")).toHaveLength(1);
   });
 });
