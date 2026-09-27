@@ -14,6 +14,7 @@ use crew_proto::{Envelope, MessageKind, Role, TaskDag, TaskSpec};
 use serde_json::{json, Value};
 
 use crate::accept::{AcceptDecision, AcceptanceLoop};
+use crate::browser_exec::{self, BrowserOutcome, BrowserPolicy};
 use crate::cmd_exec::{self, CmdOutcome, CmdPolicy};
 use crate::dod_exec::{self, DodVerdict};
 
@@ -91,6 +92,19 @@ pub struct LeadBehavior {
     /// crew-run이 클로저로 주입한다.
     cmd_exec_cwd_for_role: Option<Arc<dyn Fn(Role) -> PathBuf + Send + Sync>>,
     cmd_policy: CmdPolicy,
+    /// Browser DoD 실행기 배선. `None`(기본)이면 브라우저 DoD를 실행하지 않고
+    /// 모든 `DodCheck::Browser`가 `skipped`로 남는다 — `cmd_exec_cwd_for_role`와
+    /// 같은 이유로, 이 빌더를 한 번도 부르지 않은 기존 생성 지점의 동작이
+    /// 바뀌지 않아야 한다. cwd 해석기는 Cmd와 마찬가지로 crew-run이 주입한다.
+    browser_exec: Option<BrowserExec>,
+}
+
+/// `with_browser_exec`가 한 번에 받는 두 조각(plan D5): 역할 → 실행 cwd 해석기와
+/// 바이너리·타임아웃 정책. 둘 중 하나만 설정된 중간 상태가 존재할 수 없도록
+/// 하나의 `Option`에 함께 담는다.
+struct BrowserExec {
+    cwd_for_role: Arc<dyn Fn(Role) -> PathBuf + Send + Sync>,
+    policy: BrowserPolicy,
 }
 
 impl LeadBehavior {
@@ -123,6 +137,7 @@ impl LeadBehavior {
             pending_escalations: HashMap::new(),
             cmd_exec_cwd_for_role: None,
             cmd_policy: CmdPolicy::default_allowlist(),
+            browser_exec: None,
         }
     }
 
@@ -153,6 +168,22 @@ impl LeadBehavior {
     /// Overrides the default `CmdPolicy::default_allowlist()` (plan D7).
     pub fn with_cmd_policy(mut self, policy: CmdPolicy) -> Self {
         self.cmd_policy = policy;
+        self
+    }
+
+    /// Wires the Browser DoD executor in (t3 plan D5), mirroring
+    /// `with_cmd_exec`: `cwd_for_role` resolves a task's role to its
+    /// execution cwd and `policy` carries the configured binary. Default
+    /// (never calling this) leaves the browser DoD unexecuted, so every
+    /// `DodCheck::Browser` stays `skipped`. Taking both pieces in ONE call
+    /// is deliberate — a separate policy setter would allow a half-wired
+    /// state where the binary is configured but no cwd resolver exists.
+    pub fn with_browser_exec(
+        mut self,
+        cwd_for_role: Arc<dyn Fn(Role) -> PathBuf + Send + Sync>,
+        policy: BrowserPolicy,
+    ) -> Self {
+        self.browser_exec = Some(BrowserExec { cwd_for_role, policy });
         self
     }
 
@@ -321,16 +352,18 @@ impl LeadBehavior {
     }
 
     /// `task.result` handling (plan D6/D3): `task_id`/`task` are already
-    /// resolved by `resolve_task_result`, and `cmd_outcomes` is whatever the
-    /// caller's Cmd executor produced (empty when wiring is off, plan D6).
+    /// resolved by `resolve_task_result`, and `cmd_outcomes`/`browser_outcomes`
+    /// are whatever the caller's Cmd and Browser executors produced (each
+    /// empty when its wiring is off, plan D6 / t3 plan D6).
     fn handle_task_result(
         &mut self,
         env: Envelope,
         task_id: String,
         task: TaskSpec,
         cmd_outcomes: &[CmdOutcome],
+        browser_outcomes: &[BrowserOutcome],
     ) -> Vec<Envelope> {
-        let verdict = dod_exec::judge(&task, &env.body, cmd_outcomes);
+        let verdict = dod_exec::judge(&task, &env.body, cmd_outcomes, browser_outcomes);
         let loop_ = self
             .loops
             .entry(task_id.clone())
@@ -511,7 +544,14 @@ impl RoleBehavior for LeadBehavior {
                         }
                         None => Vec::new(),
                     };
-                    self.handle_task_result(env, task_id, task, &outcomes)
+                    let browser_outcomes = match &self.browser_exec {
+                        Some(b) => {
+                            let cwd = (b.cwd_for_role)(task.role);
+                            browser_exec::execute_browser_checks(&task, &cwd, &b.policy).await
+                        }
+                        None => Vec::new(),
+                    };
+                    self.handle_task_result(env, task_id, task, &outcomes, &browser_outcomes)
                 }
                 None => vec![],
             },
@@ -1177,5 +1217,154 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert!(seen.contains(&Role::Pm));
         assert!(seen.contains(&Role::Designer));
+    }
+    // --- Browser DoD wiring (plan D5/D6/D8: with_browser_exec) ---
+
+    /// Helper mirroring `cmd_task`'s role in the Cmd block: one Developer
+    /// task carrying exactly one `DodCheck::Browser`.
+    fn browser_task(flow: &str, expect: &str) -> TaskSpec {
+        cmd_task(
+            "t-browser",
+            Role::Developer,
+            vec![crew_proto::DodCheck::Browser {
+                flow: flow.to_string(),
+                expect: expect.to_string(),
+            }],
+        )
+    }
+
+    fn lead_with_one_browser_task() -> super::LeadBehavior {
+        lead_for_tasks(
+            vec![browser_task("http://localhost:3000/signup", "text \"ok\"")],
+            vec![(Role::Developer, "agent:developer".to_string())],
+            AcceptanceLoop::default_budget(),
+        )
+    }
+
+    // --- Browser DoD wiring: normal ---
+
+    /// A wired executor whose binary exits 0 runs the check for real and
+    /// leaves `passed` intact, so the task is accepted.
+    ///
+    /// `/usr/bin/true`, never `/bin/true`: the latter does NOT exist on this
+    /// platform, and an absent absolute path takes `locate_binary` -> `None`
+    /// -> `BinaryUnavailable` -> `skipped`, which would make this case pass
+    /// by the very path `browser_wiring_on_with_an_absent_binary_...` below
+    /// asserts — two cases, one code path, neither able to fail.
+    #[tokio::test]
+    async fn browser_wiring_on_with_an_exit_zero_binary_accepts_the_task() {
+        let mut lead = lead_with_one_browser_task()
+            .with_browser_exec(Arc::new(|_role| cmd_test_cwd()), BrowserPolicy::new("/usr/bin/true"));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:developer", empty_result_body());
+        let replies = lead.on_envelope(result).await;
+
+        assert!(
+            replies.is_empty(),
+            "an exit-0 browser check must not produce a change.request, got {replies:?}"
+        );
+        assert_eq!(lead.state_of("t-browser"), Some(TaskState::Accepted));
+    }
+
+    // --- Browser DoD wiring: error ---
+
+    /// The load-bearing case for user decision D4: a browser check that
+    /// really fails really withholds acceptance. `/usr/bin/false` exits 1,
+    /// so `judge` buckets `Ran { exit_code: 1 }` into `failed_cmds` and the
+    /// Lead replies with a `change.request` naming the flow.
+    #[tokio::test]
+    async fn browser_wiring_on_with_a_nonzero_exit_sends_change_request_and_withholds_acceptance() {
+        let mut lead = lead_with_one_browser_task()
+            .with_browser_exec(Arc::new(|_role| cmd_test_cwd()), BrowserPolicy::new("/usr/bin/false"));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:developer", empty_result_body());
+        let replies = lead.on_envelope(result).await;
+
+        assert_eq!(replies.len(), 1, "expected exactly one reply, got {replies:?}");
+        assert_eq!(replies[0].kind, MessageKind::ChangeRequest);
+        let violations = replies[0].body["violations"]
+            .as_array()
+            .expect("a change.request body must carry a violations array");
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.as_str() == Some("browser:http://localhost:3000/signup — exit 1")),
+            "violations must name the failed browser flow and its exit code, got {violations:?}"
+        );
+        assert_eq!(lead.state_of("t-browser"), Some(TaskState::Assigned));
+    }
+
+    // --- Browser DoD wiring: boundary ---
+
+    /// Default (the builder never called) must be byte-identical to today:
+    /// the check is never executed and stays `skipped`. `/usr/bin/false` is
+    /// the binary that WOULD have failed it, so a green here means "not
+    /// executed", not "executed and happened to pass".
+    #[tokio::test]
+    async fn browser_wiring_off_by_default_never_executes_and_accepts_the_task() {
+        let mut lead = lead_for_tasks(
+            vec![browser_task("http://localhost:3000/signup", "text \"ok\"")],
+            vec![(Role::Developer, "agent:developer".to_string())],
+            AcceptanceLoop::default_budget(),
+        );
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:developer", empty_result_body());
+        let replies = lead.on_envelope(result).await;
+
+        assert!(
+            !replies.iter().any(|r| r.kind == MessageKind::ChangeRequest),
+            "unwired browser DoD must never emit a change.request, got {replies:?}"
+        );
+        assert_eq!(lead.state_of("t-browser"), Some(TaskState::Accepted));
+    }
+
+    /// Settled user decision D1, pinned at the WIRING level (t2 pins it only
+    /// at the judging level): a configured-but-absent binary is a normal
+    /// path — `BinaryUnavailable` goes to `skipped`, never `failed_cmds`, so
+    /// "could not execute" never folds into a failure. This is also the live
+    /// production path on this machine, which has no browser CLI on PATH.
+    #[tokio::test]
+    async fn browser_wiring_on_with_an_absent_binary_stays_skipped_and_accepts_the_task() {
+        let mut lead = lead_with_one_browser_task().with_browser_exec(
+            Arc::new(|_role| cmd_test_cwd()),
+            BrowserPolicy::new("linkly-no-such-browser"),
+        );
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:developer", empty_result_body());
+        let replies = lead.on_envelope(result).await;
+
+        assert!(
+            !replies.iter().any(|r| r.kind == MessageKind::ChangeRequest),
+            "an absent binary is skipped, never a failure (D1), got {replies:?}"
+        );
+        assert_eq!(lead.state_of("t-browser"), Some(TaskState::Accepted));
+    }
+
+    /// An `expect` outside the three structured forms is never executed
+    /// (D2). The wiring is fully ON and points at `/usr/bin/false`, which
+    /// exits 1, so if an unparseable `expect` were ever spawned this task
+    /// would be held at `Assigned` instead of accepted.
+    #[tokio::test]
+    async fn browser_wiring_on_with_an_unparseable_expect_never_executes_and_accepts_the_task() {
+        let mut lead = lead_for_tasks(
+            vec![browser_task("http://localhost:3000/signup", "성공 토스트 노출")],
+            vec![(Role::Developer, "agent:developer".to_string())],
+            AcceptanceLoop::default_budget(),
+        )
+        .with_browser_exec(Arc::new(|_role| cmd_test_cwd()), BrowserPolicy::new("/usr/bin/false"));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:developer", empty_result_body());
+        let replies = lead.on_envelope(result).await;
+
+        assert!(
+            !replies.iter().any(|r| r.kind == MessageKind::ChangeRequest),
+            "an unparseable expect must never be executed, got {replies:?}"
+        );
+        assert_eq!(lead.state_of("t-browser"), Some(TaskState::Accepted));
     }
 }

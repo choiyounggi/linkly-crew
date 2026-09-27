@@ -7,7 +7,7 @@
 //! workers and a fresh `LeadBehavior` seeded with the accumulated terminal
 //! states of every earlier sprint (`with_prior_states`, contract C3a).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +15,7 @@ use std::time::Duration;
 use crew_agent::{AgentControl, AgentRunner, BusConn, RoleHarnessBehavior, RunnerError, ScriptedCrewMember};
 use crew_bus::{BusConfig, BusEvent as BusLifecycleEvent, BusHandle, BusServer};
 use crew_harness::{AgentCfg as HarnessAgentCfg, HandoffSnapshot, Harness, HarnessPool, HarnessRegistry};
+use crew_lead::browser_exec::BrowserPolicy;
 use crew_lead::compress::summarize_sprint;
 use crew_lead::dispatch::{LeadBehavior, TaskState};
 use crew_lead::plan::{LeadPlanner, PlanError, PlanOptions, SprintSlicer};
@@ -54,6 +55,17 @@ pub(crate) const SWAP_ACK_TIMEOUT_MS: u64 = 120_000;
 /// loopback, local-only, scripted-run disconnect signal; named so a future
 /// measurement can retune it without re-deriving the mechanism.
 const HUMAN_UNREGISTER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Bound on a finished sprint's agents leaving the bus registry before the
+/// next sprint re-connects the very same ids. `crew_agents` yields a fixed
+/// id per role, so every sprint after the first re-registers ids the
+/// previous sprint still holds until the bus server's own, unsynchronized
+/// disconnect-detection task removes them; a still-present id is refused
+/// with `Error{code:"duplicate_agent"}` (`crew-bus`'s documented,
+/// separately-tested contract), which surfaces as `RunError::Bus` out of
+/// `spawn_sprint`. Same mechanism and therefore the same bound as
+/// `HUMAN_UNREGISTER_TIMEOUT`.
+const SPRINT_UNREGISTER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// L1 assembly budget for `summarize_sprint` (contracts-m5.md §C5a plan
 /// D6) — ≈4k tokens, per backend/common/llm/context-window-budget.md's
@@ -129,6 +141,22 @@ fn role_cli_cwd(role_worktrees: Option<&[(Role, PathBuf)]>, data_dir: &Path, rol
     let cwd = data_dir.join("cli-cwd").join(role_dir_name(role));
     let _ = std::fs::create_dir_all(&cwd);
     cwd
+}
+
+/// Whether `spawn_sprint` should wire the Browser DoD executor at all.
+///
+/// BOTH conditions are required. `project_root` is required by settled user
+/// decision D3: the browser executor runs in the same per-role worktree the
+/// Cmd DoD uses, and those worktrees only exist when a `project_root` was
+/// designated. `browser_binary` is required because there is nothing to
+/// spawn without it.
+///
+/// When this is false, nothing is wired and every `DodCheck::Browser` stays
+/// `skipped` — which is the shipped default and a normal path, not an error.
+/// The two causes stay distinguishable on purpose: "no project_root" and
+/// "no binary configured" are different diagnoses for the same silence.
+fn browser_wiring_enabled(project_root: Option<&Path>, browser_binary: Option<&str>) -> bool {
+    project_root.is_some() && browser_binary.is_some()
 }
 
 /// Precomputes every canonical role's (`ROLE_ORDER`) worktree once for a
@@ -304,6 +332,10 @@ struct SpawnedSprint {
     worker_aborts: Vec<AbortHandle>,
     lead_task: JoinHandle<Result<(), RunnerError>>,
     controls: HashMap<String, mpsc::Sender<AgentControl>>,
+    /// Every bus id this sprint registered, in connect order — the exact set
+    /// the next sprint re-connects, so the sprint boundary knows what it
+    /// must see unregistered before spawning again.
+    agent_ids: Vec<String>,
 }
 
 /// Connects this sprint's five workers plus its `ObservingLead`-wrapped
@@ -321,6 +353,7 @@ async fn spawn_sprint(
     goal: &str,
     data_dir: &Path,
     project_root: Option<&Path>,
+    browser_binary: Option<&str>,
     role_worktrees: Option<&[(Role, PathBuf)]>,
     roster: &Roster,
     pool: &Arc<HarnessPool>,
@@ -334,6 +367,7 @@ async fn spawn_sprint(
     ts_tx: mpsc::UnboundedSender<TaskStateChange>,
 ) -> Result<SpawnedSprint, RunError> {
     let mut worker_aborts = Vec::new();
+    let mut agent_ids: Vec<String> = Vec::new();
     let mut controls: HashMap<String, mpsc::Sender<AgentControl>> = HashMap::new();
     // Vary-roster spawn/routing (contracts-m7.md §E4): `crew` replaces the
     // fixed `roles_all()` here and feeds `LeadBehavior`'s routing table
@@ -344,6 +378,7 @@ async fn spawn_sprint(
         let agent_id: &str = agent_id.as_str();
         let role = *role;
         let conn = BusConn::connect(url, token, agent_id).await?;
+        agent_ids.push(agent_id.to_string());
         // Every worker (Scripted included, plan D3) gets a control channel
         // so `swap_harness` step 3 has a real send target to test against;
         // the default `RoleBehavior::on_control` no-op-acks for behaviors
@@ -399,11 +434,12 @@ async fn spawn_sprint(
     }
 
     let lead_conn = BusConn::connect(url, token, "agent:lead").await?;
+    agent_ids.push("agent:lead".to_string());
     let routing: Vec<(Role, String)> = crew.iter().map(|(id, role)| (*role, id.clone())).collect();
     let prior_states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
     let cmd_cwd_base = data_dir.to_path_buf();
     let cmd_role_worktrees = role_worktrees.map(<[(Role, PathBuf)]>::to_vec);
-    let lead_behavior = LeadBehavior::new(
+    let mut lead_behavior = LeadBehavior::new(
         "agent:lead",
         dag.clone(),
         sprint_tasks.to_vec(),
@@ -415,12 +451,28 @@ async fn spawn_sprint(
     .with_cmd_exec(Arc::new(move |role| {
         role_cli_cwd(cmd_role_worktrees.as_deref(), &cmd_cwd_base, role)
     }));
+    // The Browser DoD resolves its cwd through the SAME `role_cli_cwd` call
+    // the Cmd DoD just used (user decision D3: the same per-role worktree) —
+    // never a second path expression, which is how pitfall 30 reappeared
+    // last time. The clones must be separate: the ones above were moved into
+    // the cmd closure.
+    if browser_wiring_enabled(project_root, browser_binary) {
+        let binary = browser_binary.expect("browser_wiring_enabled implies a configured binary");
+        let browser_cwd_base = data_dir.to_path_buf();
+        let browser_role_worktrees = role_worktrees.map(<[(Role, PathBuf)]>::to_vec);
+        lead_behavior = lead_behavior.with_browser_exec(
+            Arc::new(move |role| {
+                role_cli_cwd(browser_role_worktrees.as_deref(), &browser_cwd_base, role)
+            }),
+            BrowserPolicy::new(binary),
+        );
+    }
     let observing = ObservingLead::new(lead_behavior, sprint_tasks.to_vec(), ts_tx, cumulative);
     // Lead never gets a control channel (contracts-m6.md §D2a, plan D2/plan
     // D6, pitfall 14) — lead swaps stay M5 boundary-only via `AgentRunner::run`.
     let lead_task = tokio::spawn(AgentRunner::run(lead_conn, observing));
 
-    Ok(SpawnedSprint { worker_aborts, lead_task, controls })
+    Ok(SpawnedSprint { worker_aborts, lead_task, controls, agent_ids })
 }
 
 /// The abort handles for whichever sprint's workers/lead are currently
@@ -481,6 +533,51 @@ async fn wait_for_bus_lifecycle(rx: &mut broadcast::Receiver<RunEvent>, kind: &s
     };
     if tokio::time::timeout(timeout, wait).await.is_err() {
         tracing::warn!(kind, agent_id, ?timeout, "bus lifecycle event not observed within bound; proceeding anyway");
+    }
+}
+
+/// [`wait_for_bus_lifecycle`] for a whole set of agent ids at once: returns
+/// as soon as a matching `kind` event has been seen for every id in
+/// `agent_ids`, or when `timeout` elapses (logged, never a silent skip nor
+/// an unbounded hang).
+///
+/// Set-based rather than a per-id loop over [`wait_for_bus_lifecycle`]: the
+/// ids leave the registry in arbitrary order, and a per-id wait would
+/// consume a *different* id's event while blocked on its own and then never
+/// see that consumed one again.
+async fn wait_for_bus_lifecycle_all(
+    rx: &mut broadcast::Receiver<RunEvent>,
+    kind: &str,
+    agent_ids: &[String],
+    timeout: Duration,
+) {
+    let mut remaining: HashSet<&str> = agent_ids.iter().map(String::as_str).collect();
+    if remaining.is_empty() {
+        return;
+    }
+    let wait = async {
+        loop {
+            match rx.recv().await {
+                Ok(RunEvent::BusLifecycle { kind: ev_kind, payload, .. }) if ev_kind == kind => {
+                    let observed = payload
+                        .get(kind)
+                        .and_then(|v| v.get("agent_id"))
+                        .and_then(|v| v.as_str());
+                    if let Some(id) = observed {
+                        remaining.remove(id);
+                        if remaining.is_empty() {
+                            return;
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    };
+    if tokio::time::timeout(timeout, wait).await.is_err() {
+        tracing::warn!(kind, ?timeout, "not every agent's bus lifecycle event was observed within bound; proceeding anyway");
     }
 }
 
@@ -656,13 +753,32 @@ impl RunController {
         };
         // present = crew_agents' roles (contracts-m7.md §E4) — the LLM path
         // varies only the SpecDoc, DAG shaping is the same function either way.
-        let dag = LeadPlanner::plan_dag_with(
+        let mut dag = LeadPlanner::plan_dag_with(
             &spec,
             &present_roles,
             &PlanOptions {
                 dev_cmd_checks: cfg.dev_cmd_checks.clone(),
             },
         )?;
+        // Browser checks are appended HERE rather than through `PlanOptions`
+        // (t3 ruling C1): `crew_lead::plan`'s `PlanOptions` is deliberately
+        // narrow (plan.rs:36-38) so the knob can never carry a non-`Cmd`
+        // check, and `crew-lead` is frozen for this task. `TaskSpec.dod` is
+        // `pub` (crew-proto/src/dag.rs:31), so the append happens on the DAG
+        // the real planner just returned — before the snapshot and before
+        // `SpecReady`, so both carry it. With no Developer task present the
+        // checks are dropped silently, exactly as `plan.rs` documents for
+        // `dev_cmd_checks`.
+        if !cfg.dev_browser_checks.is_empty() {
+            if let Some(dev) = dag.tasks.iter_mut().find(|t| t.role == Role::Developer) {
+                dev.dod
+                    .extend(cfg.dev_browser_checks.iter().map(|c| crew_proto::DodCheck::Browser {
+                        flow: c.flow.clone(),
+                        expect: c.expect.clone(),
+                    }));
+            }
+        }
+        let dag = dag;
         let effective_max = if cfg.max_per_sprint == 0 {
             dag.tasks.len().max(1)
         } else {
@@ -784,6 +900,7 @@ impl RunController {
             &cfg.goal,
             &cfg.data_dir,
             project_root.as_deref(),
+            cfg.browser_binary.as_deref(),
             role_worktrees.as_deref(),
             &roster_snapshot0,
             &pool,
@@ -812,6 +929,7 @@ impl RunController {
         let goal = cfg.goal.clone();
         let data_dir = cfg.data_dir.clone();
         let project_root = project_root.clone();
+        let browser_binary = cfg.browser_binary.clone();
         let role_worktrees = role_worktrees.clone();
         let max_rework = cfg.max_rework;
         let escalation_timeout_ms = cfg.escalation_timeout_ms;
@@ -820,6 +938,7 @@ impl RunController {
         let finisher: JoinHandle<RunOutcomeDto> = tokio::spawn(async move {
             let mut current_worker_aborts = spawned0.worker_aborts;
             let mut current_lead_task = spawned0.lead_task;
+            let mut current_agent_ids = spawned0.agent_ids;
 
             let mut boundary_seq: i64 = 0;
             let mut summaries: Vec<String> = Vec::new();
@@ -841,6 +960,7 @@ impl RunController {
                         &goal,
                         &data_dir,
                         project_root.as_deref(),
+                        browser_binary.as_deref(),
                         role_worktrees.as_deref(),
                         &roster_snapshot,
                         &pool,
@@ -863,6 +983,7 @@ impl RunController {
                             };
                             current_worker_aborts = spawned.worker_aborts;
                             current_lead_task = spawned.lead_task;
+                            current_agent_ids = spawned.agent_ids;
                         }
                         Err(err) => {
                             tracing::error!(error = %err, index, "failed to spawn sprint; ending run early");
@@ -872,6 +993,10 @@ impl RunController {
                     }
                 }
 
+                // Subscribed before the lead task is awaited: the lead's own
+                // connection closes the instant that task ends, so a receiver
+                // taken afterwards could miss its `Unregistered` entirely.
+                let mut boundary_unregister_rx = finisher_run_tx.subscribe();
                 let lead_result = (&mut current_lead_task).await;
                 for handle in &current_worker_aborts {
                     handle.abort();
@@ -889,6 +1014,25 @@ impl RunController {
                     .clear();
 
                 drain_subscription_backlog(&drain_tx).await;
+
+                // The drain above only republishes what the bus has *already*
+                // broadcast; aborting a worker does not itself remove its bus
+                // registration, which the server drops on its own,
+                // unsynchronized disconnect-detection task. The next sprint
+                // re-connects these very same ids, and the bus refuses a
+                // still-registered id with `duplicate_agent` -> `RunError::Bus`
+                // out of `spawn_sprint`. Bound-wait for the registry to
+                // actually clear, exactly as the run-finish block does for
+                // `agent:human` (c30a1b7 / #14), instead of trusting the drain.
+                if index + 1 < sprints.len() {
+                    wait_for_bus_lifecycle_all(
+                        &mut boundary_unregister_rx,
+                        "Unregistered",
+                        &current_agent_ids,
+                        SPRINT_UNREGISTER_TIMEOUT,
+                    )
+                    .await;
+                }
 
                 let stored = finisher_ledger.messages_since(boundary_seq).unwrap_or_default();
                 boundary_seq = stored.iter().map(|m| m.seq).max().unwrap_or(boundary_seq);
@@ -1616,6 +1760,10 @@ mod live_controls_wiring_tests {
             roster: None,
             dev_cmd_checks: Vec::new(),
             project_root: None,
+            // t3 / 함정 29 / issue #5: the browser DoD ships UNARMED — no binary
+            // configured and no injected checks, so nothing is ever spawned.
+            browser_binary: None,
+            dev_browser_checks: Vec::new(),
             turn_timeout_secs: 900,
         }
     }
@@ -1742,6 +1890,74 @@ mod role_cli_cwd_tests {
         assert!(cwd.is_dir(), "the role cwd must exist as a directory after role_cli_cwd: {cwd:?}");
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    // --- browser_wiring_enabled: truth table + cwd agreement (t3 plan D7 / user decision D3) ---
+
+    /// Normal + error + boundary in one table: the predicate is an AND over
+    /// two independent causes, so all FOUR input combinations are pinned.
+    /// Only both-Some wires; each of the three other rows is a distinct
+    /// reason the browser DoD stays `skipped`.
+    #[test]
+    fn browser_wiring_needs_both_a_project_root_and_a_binary() {
+        let root = std::path::PathBuf::from("/abs/project");
+
+        assert!(
+            browser_wiring_enabled(Some(&root), Some("fake-browser")),
+            "both configured must wire"
+        );
+        assert!(
+            !browser_wiring_enabled(None, Some("fake-browser")),
+            "no project_root must not wire (user decision D3) even with a binary set"
+        );
+        assert!(
+            !browser_wiring_enabled(Some(&root), None),
+            "no configured binary must not wire even with a project_root"
+        );
+        assert!(
+            !browser_wiring_enabled(None, None),
+            "the shipped default must not wire"
+        );
+    }
+
+    /// `role_cli_cwd`'s `role_worktrees` argument is LOAD-BEARING: passing
+    /// `None` where the resolved worktrees belong silently redirects
+    /// execution from the role's own git worktree to the shared
+    /// `<data_dir>/cli-cwd` scratch — the trust boundary user decision D3
+    /// draws. This is the negative control for that argument.
+    ///
+    /// It deliberately does NOT assert that "the browser cwd equals the cmd
+    /// cwd" by calling this function twice with identical literals: that
+    /// form is true no matter what `spawn_sprint` actually wires, so it
+    /// cannot fail. The real wiring is pinned end-to-end instead, by
+    /// `m10_browser_dod.rs`'s passing case, which reads the cwd the spawned
+    /// browser process itself reported and compares it against the worktree
+    /// production really created.
+    #[test]
+    fn role_cli_cwd_without_the_role_worktrees_resolves_somewhere_else_entirely() {
+        let developer_worktree = test_data_dir("browser-cwd-agreement-worktree");
+        let role_worktrees = vec![(Role::Developer, developer_worktree.clone())];
+        let data_dir = test_data_dir("browser-cwd-agreement-data");
+
+        let with_worktrees = role_cli_cwd(Some(&role_worktrees), &data_dir, Role::Developer);
+        let without_worktrees = role_cli_cwd(None, &data_dir, Role::Developer);
+
+        assert_eq!(
+            with_worktrees, developer_worktree,
+            "with resolved worktrees, a role must land in its own worktree"
+        );
+        assert_ne!(
+            with_worktrees, without_worktrees,
+            "dropping the role worktrees must be OBSERVABLE — if these were equal, \
+             no test could detect the browser closure being wired without them"
+        );
+        assert!(
+            without_worktrees.starts_with(&data_dir),
+            "without worktrees the cwd falls back under data_dir, got {without_worktrees:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&developer_worktree);
     }
 
     /// Boundary: calling it again for the same role (e.g. a second sprint's
@@ -1991,6 +2207,10 @@ mod resolve_role_worktrees_tests {
             roster: None,
             dev_cmd_checks: Vec::new(),
             project_root: Some(repo.clone()),
+            // t3 / 함정 29 / issue #5: the browser DoD ships UNARMED — no binary
+            // configured and no injected checks, so nothing is ever spawned.
+            browser_binary: None,
+            dev_browser_checks: Vec::new(),
             turn_timeout_secs: 900,
         };
 
@@ -2425,6 +2645,194 @@ mod human_unregister_ordering_tests {
         assert!(
             outer.is_ok(),
             "wait_for_bus_lifecycle must return within its own 50ms bound, not hang until the outer 500ms timeout"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sprint_boundary_unregister_ordering_tests {
+    //! t1-flaky-m5: `crew_agents` gives each role a fixed bus id, so every
+    //! sprint after the first re-connects ids the finished sprint still
+    //! holds until the bus server's own, unsynchronized disconnect-detection
+    //! task removes them. The bus refuses a still-registered id with
+    //! `Error{code:"duplicate_agent"}`, which `spawn_sprint` surfaces as
+    //! `RunError::Bus` and the finisher collapses into
+    //! `RunOutcomeDto::Failed` -> `RunError::Join("lead runner did not
+    //! complete")`. "Red" is the old code's exact shape (proceed straight
+    //! from the aborts to the next sprint's connect); "green" is the new
+    //! bounded wait for every id to actually leave the registry.
+    //!
+    //! Proven structurally on the wait's own call-site state (the same
+    //! approach as `human_unregister_ordering_tests`, c30a1b7): the real
+    //! end-to-end race measured only 3/21 even under 24x CPU load, so it is
+    //! not an on-demand deterministic red.
+
+    use super::*;
+    use tokio::sync::Barrier;
+
+    fn unregistered(seq: i64, agent_id: &str) -> RunEvent {
+        RunEvent::BusLifecycle {
+            seq,
+            kind: "Unregistered".to_string(),
+            payload: serde_json::json!({"Unregistered": {"agent_id": agent_id}}),
+        }
+    }
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Error case — the exact interleave that produced the bug: some of the
+    /// finished sprint's ids have left the registry and one has not. Red is
+    /// returning here (the old code did not wait at all, so the next
+    /// `BusConn::connect` for `agent:qa` hit `duplicate_agent`); green is
+    /// staying parked until that last id is actually gone.
+    ///
+    /// One pinned future is polled across both phases, so the ids already
+    /// observed in phase one stay observed — mirroring the single boundary
+    /// wait the finisher performs.
+    #[tokio::test]
+    async fn sprint_boundary_wait_blocks_while_any_agent_is_still_registered() {
+        let (tx, mut rx) = broadcast::channel::<RunEvent>(CHANNEL_CAPACITY);
+        let agents = ids(&["agent:designer", "agent:qa", "agent:lead"]);
+
+        // Two of the three are gone; `agent:qa` is still registered.
+        let _ = tx.send(unregistered(1, "agent:designer"));
+        let _ = tx.send(unregistered(2, "agent:lead"));
+
+        let barrier = Arc::new(Barrier::new(2));
+        let sender = {
+            let tx = tx.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                let _ = tx.send(unregistered(3, "agent:qa"));
+            })
+        };
+
+        let waiting =
+            wait_for_bus_lifecycle_all(&mut rx, "Unregistered", &agents, SPRINT_UNREGISTER_TIMEOUT);
+        tokio::pin!(waiting);
+
+        // Red: with the sender parked, `agent:qa` has not unregistered. The
+        // boundary must not proceed -- proceeding is the bug.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut waiting)
+                .await
+                .is_err(),
+            "the boundary must keep waiting while agent:qa is still registered"
+        );
+
+        // Green: release the last unregistration; the same wait completes
+        // well inside its own 2s bound.
+        barrier.wait().await;
+        tokio::time::timeout(Duration::from_millis(500), &mut waiting)
+            .await
+            .expect("the wait must finish once every agent has left the registry");
+
+        sender.await.expect("sender task must not panic");
+    }
+
+    /// Normal case at the wait's own level: the ids leave the registry in an
+    /// order unrelated to the order they were connected in, and they arrive
+    /// one at a time while the boundary is already parked. A per-id
+    /// sequential wait would consume a different id's event while blocked on
+    /// its own and then miss it; the set-based wait must accept any order.
+    ///
+    /// Each id is released individually so every partial set is asserted to
+    /// keep the boundary parked -- without that, this case would pass just as
+    /// well against the pre-fix "proceed immediately" shape and would prove
+    /// nothing about the fix.
+    #[tokio::test]
+    async fn sprint_boundary_wait_accepts_unregistrations_in_any_order() {
+        let (tx, mut rx) = broadcast::channel::<RunEvent>(CHANNEL_CAPACITY);
+        let agents = ids(&["agent:designer", "agent:qa", "agent:lead"]);
+
+        // Reverse of the connect order that `agents` lists, one per release.
+        let barrier = Arc::new(Barrier::new(2));
+        let sender = {
+            let tx = tx.clone();
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                for (i, id) in ["agent:lead", "agent:qa", "agent:designer"].iter().enumerate() {
+                    barrier.wait().await;
+                    let _ = tx.send(unregistered(i as i64 + 1, id));
+                }
+            })
+        };
+
+        let waiting =
+            wait_for_bus_lifecycle_all(&mut rx, "Unregistered", &agents, SPRINT_UNREGISTER_TIMEOUT);
+        tokio::pin!(waiting);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                .await
+                .is_err(),
+            "nothing has unregistered yet; the boundary must be parked"
+        );
+
+        for still_registered in ["agent:qa and agent:designer", "agent:designer"] {
+            barrier.wait().await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut waiting)
+                    .await
+                    .is_err(),
+                "the boundary must stay parked while {still_registered} is still registered"
+            );
+        }
+
+        // The last id leaves; only now may the boundary proceed.
+        barrier.wait().await;
+        tokio::time::timeout(Duration::from_millis(500), &mut waiting)
+            .await
+            .expect("every id unregistered, in any order, must satisfy the wait");
+
+        sender.await.expect("sender task must not panic");
+    }
+
+    /// Boundary: the awaited events never arrive at all on a receiver that
+    /// stays open -- the wait must still return on its own bound rather than
+    /// hanging the run, exactly like
+    /// `wait_for_bus_lifecycle_returns_on_timeout_when_nothing_is_ever_sent`.
+    #[tokio::test]
+    async fn sprint_boundary_wait_returns_on_timeout_when_no_agent_ever_unregisters() {
+        let (_tx, mut rx) = broadcast::channel::<RunEvent>(CHANNEL_CAPACITY);
+        let agents = ids(&["agent:designer", "agent:qa"]);
+
+        let outer = tokio::time::timeout(
+            Duration::from_millis(500),
+            wait_for_bus_lifecycle_all(
+                &mut rx,
+                "Unregistered",
+                &agents,
+                Duration::from_millis(50),
+            ),
+        )
+        .await;
+
+        assert!(
+            outer.is_ok(),
+            "the wait must return within its own 50ms bound, not hang until the outer 500ms timeout"
+        );
+    }
+
+    /// Boundary: an empty id set (nothing was ever registered to wait for)
+    /// must return immediately instead of burning the whole bound.
+    #[tokio::test]
+    async fn sprint_boundary_wait_returns_immediately_for_an_empty_agent_set() {
+        let (_tx, mut rx) = broadcast::channel::<RunEvent>(CHANNEL_CAPACITY);
+        let agents: Vec<String> = Vec::new();
+
+        let outer = tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_bus_lifecycle_all(&mut rx, "Unregistered", &agents, Duration::from_secs(30)),
+        )
+        .await;
+
+        assert!(
+            outer.is_ok(),
+            "an empty agent set must not wait on its 30s bound at all"
         );
     }
 }

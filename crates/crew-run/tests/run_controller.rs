@@ -43,6 +43,8 @@ fn scripted_config(data_dir: PathBuf, planted_violations: Vec<(Role, Vec<String>
         roster: None,
         dev_cmd_checks: Vec::new(),
         project_root: None,
+        browser_binary: None,
+        dev_browser_checks: Vec::new(),
         turn_timeout_secs: 900,
     }
 }

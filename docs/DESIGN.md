@@ -230,7 +230,7 @@ task.dod = [
   { "kind":"cmd",      "run":"npm test",  "expect":"exit 0" },
   { "kind":"cmd",      "run":"npm run build", "expect":"exit 0" },
   { "kind":"req_cover","ids":["REQ-1","REQ-3"] },     // 산출물이 해당 id를 참조하는지
-  { "kind":"browser",  "flow":"signup", "expect":"성공 토스트 노출" }  // gstack /browse 재사용
+  { "kind":"browser",  "flow":"http://localhost:3000/signup", "expect":"text \"가입 완료\"" }  // 외부 CLI 셸아웃, localhost 전용
 ]
 ```
 Lead는 `task.result`를 받으면 **DoD를 직접 실행**해서 수락 여부를 판정한다.
@@ -257,8 +257,10 @@ Lead는 `task.result`를 받으면 위 예시의 `kind:"cmd"` 체크를 셸을 �
 - `cargo test --workspace`처럼 정당해 보이는 명령도 **거부된다**(`--workspace`가 트레일링
   플래그라서) — 이 거부는 조용한 통과가 아니라 `failed_cmds`에 남는 **보이는 실패**다. DoD를
   쓸 때 이 제약을 감안해야 한다.
-- **`expect`는 `"exit <N>"` 형식만 인식**한다(`parse_expect`). 그 외 문자열(예: 위 예시의
-  `browser` 체크처럼 자연어)은 체크가 아예 실행되지 않고 `skipped`로만 기록된다.
+- **`cmd`의 `expect`는 `"exit <N>"` 형식만 인식**한다(`parse_expect`). 그 외 문자열(예:
+  `"테스트 통과"` 같은 자연어)은 체크가 아예 실행되지 않고 `skipped`로만 기록된다.
+  `browser`는 이 문법을 공유하지 않는다 — 자기 문법 `parse_browser_expect`를 가지며
+  `text "<v>"` / `visible "<v>"` / `url "<v>"` **세 형식뿐**이다(아래 `kind:"browser"` 항목).
 - **타임아웃 기본 120초**(`CmdPolicy::default_allowlist().timeout`). M10부터 자식은 spawn
   시 `process_group(0)`으로 자기 그룹의 리더가 되고(`cmd_exec.rs`), 타임아웃과
   `ProcessGroupGuard`의 `Drop` **양쪽**에서 `libc::killpg(pgid, SIGKILL)`로 **그룹 전체**를
@@ -292,8 +294,32 @@ Lead는 `task.result`를 받으면 위 예시의 `kind:"cmd"` 체크를 셸을 �
   상위 저장소의 무관한 규칙에 걸려 잘못된 사유("ignored")로 거부될 수 있다.
   관찰 근거: 이 저장소 자신의 `.gitignore`가 `.crew/`를 무시해,
   `project_root`로 자신을 도그푸딩하면 이 검사가 실제로 발동한다(이슈 #16 본문).
-- `kind:"browser"`는 **M10에서도 아직 미실행**이다 — 항상 `skipped`로만 기록된다(스코프
-  아웃).
+- `kind:"browser"`는 **이슈 #3에서 실제로 실행된다**. Lead가 외부 브라우저 CLI에
+  셸아웃하며(새 크레이트 의존성 0), argv는 `[resolved_binary, flow, kind, value]`,
+  exit `0`이 통과다. 실행되려면 **네 조건이 모두** 충족돼야 한다:
+  `RunConfig.project_root`가 `Some`이고(실행 cwd는 `cmd` DoD와 **같은** 역할별 worktree),
+  `RunConfig.browser_binary`가 설정돼 있고, 그 바이너리가 PATH에 존재하고,
+  `expect`가 파싱된다. `flow`는 **`localhost`/`127.0.0.1` 전용**이며 그 밖의 호스트는
+  spawn 전에 `Refused`로 거부된다(`browser_exec::validate_localhost_url`).
+  `expect` 문법은 `text "<v>"` / `visible "<v>"` / `url "<v>"` 세 가지뿐이고 이스케이프가
+  없으므로 값 안의 `"`는 파싱 불가를 만든다. 판정은 결정론적이며 LLM을 쓰지 않는다.
+
+  **`skipped`로 남는 경로는 정확히 네 가지이고, 어느 것도 `passed`에 영향을 주지 않는다**
+  — "실행할 수 없었다"가 조용히 통과로 접히지 않게 하려고 넷을 구분해 둔다:
+  1. `project_root`가 `None`이다 — 역할별 worktree가 없어 배선 자체를 하지 않는다.
+  2. `browser_binary`가 설정되지 않았다 — 실행할 대상이 없다.
+  3. 설정된 바이너리가 PATH에 없다 — `BinaryUnavailable`. **정상 경로이지 오류가 아니다**
+     (확정 결정 D1). 참고로 이 저장소를 개발한 기계에는 브라우저 CLI가 하나도 없어,
+     기본 설정에서는 이 배선이 아무것도 실행하지 않는다.
+  4. `expect`가 세 형식 중 어디에도 맞지 않는다 — 아예 spawn하지 않는다.
+
+  반대로 `Ran{exit_code != 0}`·`Refused`·`TimedOut`·`SpawnFailed`는 `failed_cmds`로 가서
+  `passed=false`를 만든다. 체크는 `RunConfig.dev_browser_checks`로 주입하며 **기본은
+  비어 있다**(함정 29 / 이슈 #5와 같은 취지로 기본 무장 해제).
+
+  **미검증 지점**: 위 argv 계약은 **실제 브라우저 CLI와 대조된 적이 없다** — 이 기계에
+  존재하지 않아 가짜 CLI 픽스처로만 고정돼 있다. 실제 도구를 처음 설정하는 사람이 그
+  대조를 함께 책임진다.
 - 실행 결과 중 하나라도 `Refused`/`TimedOut`/`SpawnFailed`이거나 exit code가 `expect`와
   다르면 `DodVerdict.failed_cmds`에 쌓이고 `passed=false`가 되며, `AcceptanceLoop::decide`가
   이를 그대로 `Rework.violations`에 포함한다.

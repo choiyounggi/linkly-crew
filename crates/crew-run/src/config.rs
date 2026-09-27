@@ -7,6 +7,24 @@ use crew_agent::BusError;
 use crew_ledger::LedgerError;
 use crew_lead::plan::{CmdCheck, PlanError};
 
+/// One browser DoD check to attach to the Developer task (t3 plan D3),
+/// the browser-side sibling of [`CmdCheck`].
+///
+/// `flow` is a navigation URL and only `localhost` / `127.0.0.1` are
+/// accepted — `crew_lead::browser_exec` refuses any other host before a
+/// spawn is ever attempted (user decision D3).
+///
+/// `expect` must be exactly one of the three structured forms
+/// `text "<v>"`, `visible "<v>"`, `url "<v>"` (user decision D2). There is
+/// no escaping, so a `"` inside `<v>` makes the whole `expect` unparseable.
+/// Anything outside those three forms is never executed and is recorded as
+/// `skipped` — it is not an error and it never affects `passed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserCheck {
+    pub flow: String,
+    pub expect: String,
+}
+
 /// One run's configuration (contract §C3, extended by contracts-m5.md
 /// §C5a).
 pub struct RunConfig {
@@ -49,6 +67,59 @@ pub struct RunConfig {
     /// executes agent-authored code by design; the containment is this
     /// human-designated tree, not the argv allowlist.
     pub project_root: Option<PathBuf>,
+    // ---------------------------------------------------------------------
+    // Construction-site inventory for the two fields below (t3 plan D2,
+    // reconciled 2026-09-23). `RunConfig` has no `Default` impl, so adding a
+    // field forces an explicit initializer at every literal construction, and
+    // the plan made this reconciliation a stop-and-report tripwire.
+    //
+    // Measured at base 193f52a, before the sweep:
+    //     git grep -c 'RunConfig {'   ->  26 lines
+    //       = 1 struct definition + 9 fn signatures + 16 literal constructions
+    //
+    // Only 14 of those 16 literals needed an explicit initializer:
+    //   - 13 were named by `cargo check --workspace --all-targets`;
+    //   - 1 more, apps/crew-app/src-tauri/src/core.rs, is INVISIBLE to that
+    //     command: apps/crew-app/src-tauri carries its own empty [workspace]
+    //     table and is not a root-workspace member, so it has to be checked
+    //     with its own --manifest-path;
+    //   - the last 2, crates/crew-run/tests/run_controller.rs:200 and :220,
+    //     use functional-update syntax (`..cfg`, `..scripted_config(..)`) and
+    //     INHERIT new fields, so they compile untouched and need no line.
+    //
+    // So a later sweep that counts explicit initializers and finds 14, not
+    // 16, has NOT missed two sites. Re-measure with this file excluded —
+    // otherwise this comment's own text inflates the count it quotes:
+    //     git grep -c 'RunConfig {' -- ':!crates/crew-run/src/config.rs'
+    // -> 27 today = the 25 above (26 less this file's struct definition),
+    //    plus the one signature and one literal added by the new
+    //    tests/m10_browser_dod.rs.
+    // ---------------------------------------------------------------------
+    /// External browser CLI the Lead shells out to for `browser` DoD checks
+    /// (user decision D1 — no new crate dependency, no tool hardcoded).
+    /// `None` (the shipped default) = the browser DoD is never wired, so
+    /// every browser check stays `skipped`, exactly as before t3.
+    ///
+    /// A bare name is resolved against the run process's `PATH`; an
+    /// absolute path is used as-is. Note the `PATH` that matters is the one
+    /// the run process inherited — for the Tauri app that is the
+    /// GUI-launched environment, not the shell you tested in.
+    ///
+    /// Being absent from `PATH` is a NORMAL path, not an error: nothing is
+    /// spawned and the check is recorded as `skipped`, never as a failure.
+    /// Wiring additionally requires `project_root` to be `Some` (D3); with
+    /// `project_root: None` this field alone changes nothing.
+    pub browser_binary: Option<String>,
+    /// `browser` DoD checks to attach to the Developer task — the browser
+    /// sibling of `dev_cmd_checks`, and the only producer of
+    /// `DodCheck::Browser` in production (t3 ruling C1).
+    ///
+    /// Empty (the shipped default) = no browser check is ever attached, so
+    /// a run started from a default config produces zero browser checks.
+    /// It must stay unarmed by default for the same reason `dev_cmd_checks`
+    /// does (함정 29 / issue #5): a knob that arms itself executes
+    /// agent-adjacent tooling nobody asked for.
+    pub dev_browser_checks: Vec<BrowserCheck>,
     /// Per-turn timeout (seconds) for every role worker's CLI turn and the
     /// Lead's LLM `specify` call (M13 turn-recovery fix D3). Default 900 —
     /// matches the task deadline (`deadline_ms` 900_000). `0` is rejected by

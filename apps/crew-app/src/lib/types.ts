@@ -33,6 +33,14 @@ export interface ArtifactContract {
 export type DodCheck =
   | { kind: "cmd"; run: string; expect: string }
   | { kind: "req_cover"; ids: ReqId[] }
+  /**
+   * `flow` is a navigation URL, restricted to `localhost` / `127.0.0.1` —
+   * any other host is refused before anything is spawned.
+   * `expect` is one of exactly three structured forms:
+   * `text "<v>"`, `visible "<v>"`, `url "<v>"` (no escaping, so a `"`
+   * inside `<v>` makes it unparseable). Anything else is never executed
+   * and is recorded as `skipped`, which never affects `passed`.
+   */
   | { kind: "browser"; flow: string; expect: string }
   | { kind: "artifact"; name: string };
 
