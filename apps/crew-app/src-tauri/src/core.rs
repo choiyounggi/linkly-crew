@@ -125,11 +125,11 @@ pub(crate) fn build_run_config(
         // To turn it on, pass crew_run::default_dev_cmd_checks_rust() etc.
         dev_cmd_checks: Vec::new(),
         project_root,
-        // M13 turn-recovery fix D3: = task deadline_ms / 1000.
         // t3 / 함정 29 / issue #5: the browser DoD ships UNARMED — no binary
         // configured and no injected checks, so nothing is ever spawned.
         browser_binary: None,
         dev_browser_checks: Vec::new(),
+        // M13 turn-recovery fix D3: = task deadline_ms / 1000.
         turn_timeout_secs: 900,
     }
 }

@@ -62,7 +62,13 @@ struct Scratch {
 impl Scratch {
     fn new(label: &str) -> Self {
         let id = uuid::Uuid::new_v4();
-        let base = std::env::current_dir().expect("cwd must resolve").join(".crew-test");
+        // `CARGO_MANIFEST_DIR`, not `current_dir()`: every sibling integration
+        // test in this crate uses it, and it keeps the scratch location tied
+        // to the package rather than to however the binary was invoked —
+        // running the compiled test binary from the workspace root would
+        // otherwise create a FOURTH `.crew-test` at the repo root and break
+        // the residue criterion.
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".crew-test");
         let repo_name = format!("{label}-{id}");
         Self {
             repo: base.join(&repo_name),
@@ -257,6 +263,62 @@ async fn wait_for(
     .expect("expected event did not arrive within the deterministic budget")
 }
 
+/// Whether `ev` is a `change.request` reply — the envelope the fail case must
+/// observe (never `human.gate`; see [`change_request_violations`]).
+fn is_change_request(ev: &RunEvent) -> bool {
+    matches!(ev, RunEvent::Message { envelope, .. } if envelope.kind == MessageKind::ChangeRequest)
+}
+
+/// Whether `ev` reports `task_id` reaching a state it will not leave on its
+/// own. Waiting on this instead of on one specific expected state is what
+/// keeps a regression reporting as its own assertion rather than as a
+/// 30-60s "expected event did not arrive" timeout.
+fn is_settled(ev: &RunEvent, task_id: &str) -> bool {
+    is_task_state(ev, task_id, TaskStateDto::Accepted)
+        || is_task_state(ev, task_id, TaskStateDto::Escalated)
+        || is_task_state(ev, task_id, TaskStateDto::Blocked)
+}
+
+/// Waits until EITHER the fixture has spawned (its `argv.log` appeared) OR
+/// `task_id` has been judged — whichever happens first, bounded.
+///
+/// This is how a case that asserts ABSENCE ("nothing was spawned") reports
+/// its own assertion instead of a timeout. Asserting immediately is vacuous
+/// (nothing has had a chance to spawn yet); waiting for a fixed task state is
+/// worse, because a wrongly-wired run makes the injected check FAIL, and a
+/// failing check parks the task in `Assigned` through its rework rounds —
+/// measured: with the `project_root` guard removed, `t-dev` emitted
+/// `Assigned` and then no further state change for 25s while `argv.log`
+/// already existed. Racing the two conditions ends the wait in both worlds.
+async fn wait_until_spawned_or_settled(
+    rx: &mut tokio::sync::broadcast::Receiver<RunEvent>,
+    buf: &mut Vec<RunEvent>,
+    bin_dir: &Path,
+    task_id: &str,
+) {
+    let deadline = std::time::Instant::now() + EVENT_TIMEOUT;
+    loop {
+        if argv_log(bin_dir).exists() {
+            return;
+        }
+        match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+            Ok(Ok(ev)) => {
+                let settled = is_settled(&ev, task_id);
+                buf.push(ev);
+                if settled {
+                    return;
+                }
+            }
+            Ok(Err(e)) => panic!("broadcast receiver closed before {task_id} settled: {e}"),
+            Err(_) => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "neither a spawn nor a verdict for {task_id} within the deterministic budget"
+        );
+    }
+}
+
 fn is_task_state(ev: &RunEvent, task_id: &str, state: TaskStateDto) -> bool {
     matches!(ev, RunEvent::TaskStateChanged { task_id: t, state: s, .. } if t == task_id && *s == state)
 }
@@ -297,6 +359,40 @@ fn snapshot_projects() -> HashSet<OsString> {
     }
 }
 
+/// The `~/.linkly-crew/projects` entries THIS case's run created, selected by
+/// TWO independent conditions: absent from the `before` snapshot, AND carrying
+/// this case's own `<label>-<uuid>-` prefix.
+///
+/// Both conditions are required by every caller, including the cases that
+/// assert ZERO. The set difference alone is not enough: libtest runs all five
+/// cases in this binary concurrently, and the cases that DO create an entry
+/// (`project_root: Some(..)`) create it roughly a second into their run, long
+/// after a `project_root: None` case has finished. An unfiltered difference
+/// therefore counts a SIBLING's entry and reddens a correct implementation
+/// under load — measured margin was ~0.83s. The uuid prefix also excludes a
+/// concurrent leak from another test binary during `cargo test --workspace`.
+fn created_home_entries(before: &HashSet<OsString>, repo_name: &str) -> Vec<OsString> {
+    let prefix = format!("{repo_name}-");
+    let mut created: Vec<OsString> = snapshot_projects()
+        .difference(before)
+        .filter(|name| name.to_string_lossy().starts_with(&prefix))
+        .cloned()
+        .collect();
+    created.sort();
+    created
+}
+
+/// Asserts this case created NO `~/.linkly-crew/projects` entry of its own.
+/// Uses the same two-condition rule as [`created_home_entries`], so a sibling
+/// case's concurrent entry can never be misread as this case's.
+fn assert_no_home_entry_created(before: &HashSet<OsString>, repo_name: &str) {
+    let created = created_home_entries(before, repo_name);
+    assert!(
+        created.is_empty(),
+        "this case must create no ~/.linkly-crew/projects entry of its own, found {created:?}"
+    );
+}
+
 /// Deletes the ONE `~/.linkly-crew/projects` entry this case's run created.
 ///
 /// The target is selected by TWO independent conditions — absent from the
@@ -314,15 +410,8 @@ fn snapshot_projects() -> HashSet<OsString> {
 /// unwinding.
 fn find_created_home_entry(before: &HashSet<OsString>, repo_name: &str) -> PathBuf {
     let projects = projects_dir();
-    let after = snapshot_projects();
+    let created = created_home_entries(before, repo_name);
     let prefix = format!("{repo_name}-");
-
-    let mut created: Vec<OsString> = after
-        .difference(before)
-        .filter(|name| name.to_string_lossy().starts_with(&prefix))
-        .cloned()
-        .collect();
-    created.sort();
 
     assert_eq!(
         created.len(),
@@ -484,7 +573,12 @@ async fn a_failing_browser_check_withholds_acceptance_and_escalates() {
     let mut rx = handle.subscribe();
     let mut seen = Vec::new();
 
-    wait_for(&mut rx, &mut seen, |ev| is_task_state(ev, "t-dev", TaskStateDto::Escalated)).await;
+    // Wait only until the run has SPOKEN about `t-dev` — a change.request, or
+    // the task settling — then assert. Waiting specifically for `Escalated`
+    // would mean that a regression which stops the browser check from failing
+    // reports as a 30s "expected event did not arrive" instead of as "no
+    // browser violation was raised": correct red, wrong diagnosis.
+    wait_for(&mut rx, &mut seen, |ev| is_change_request(ev) || is_settled(ev, "t-dev")).await;
 
     // The change.request envelope — NEVER human.gate (violation_strings
     // drops failed_cmds, so a human.gate assertion could never fire).
@@ -494,6 +588,7 @@ async fn a_failing_browser_check_withholds_acceptance_and_escalates() {
         "a non-zero browser exit must appear as a change.request violation; got {violations:?}"
     );
 
+    wait_for(&mut rx, &mut seen, |ev| is_task_state(ev, "t-dev", TaskStateDto::Escalated)).await;
     handle
         .resolve_gate("t-dev", GateDecision::Reject, "browser check failed")
         .await
@@ -543,14 +638,21 @@ async fn no_project_root_never_spawns_even_with_a_binary_configured() {
     );
     let mut handle = start_ok(cfg).await;
     let mut rx = handle.subscribe();
+    let mut events = Vec::new();
 
-    join_ok(&mut handle).await;
-    let events = drain(&mut rx);
+    // Assert BEFORE `join_ok`, at the first moment a spawn would already have
+    // happened. See `wait_until_spawned_or_settled` for why a fixed task
+    // state is the wrong milestone here.
+    wait_until_spawned_or_settled(&mut rx, &mut events, &s.bin_dir, "t-dev").await;
 
     assert!(
         !argv_log(&s.bin_dir).exists(),
-        "project_root: None must spawn nothing, but the fixture logged an argv"
+        "project_root: None must spawn nothing (user decision D3), but the fixture \
+         logged an argv — the browser executor was wired without a project_root"
     );
+
+    join_ok(&mut handle).await;
+    events.extend(drain(&mut rx));
     // The check still reached the DAG — proving the silence comes from the
     // wiring predicate, not from the check being dropped upstream.
     assert_eq!(developer_browser_checks(&spec_ready_dag(&events)).len(), 1);
@@ -565,11 +667,7 @@ async fn no_project_root_never_spawns_even_with_a_binary_configured() {
     );
 
     handle.shutdown().await;
-    assert_eq!(
-        snapshot_projects().difference(&home_before).count(),
-        0,
-        "a project_root: None run must create no ~/.linkly-crew/projects entry"
-    );
+    assert_no_home_entry_created(&home_before, &s.repo_name);
     s.cleanup();
 }
 
@@ -641,10 +739,6 @@ async fn the_shipped_default_attaches_no_browser_check_at_all() {
     );
 
     handle.shutdown().await;
-    assert_eq!(
-        snapshot_projects().difference(&home_before).count(),
-        0,
-        "a default run must create no ~/.linkly-crew/projects entry"
-    );
+    assert_no_home_entry_created(&home_before, &s.repo_name);
     s.cleanup();
 }

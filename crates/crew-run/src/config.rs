@@ -67,6 +67,34 @@ pub struct RunConfig {
     /// executes agent-authored code by design; the containment is this
     /// human-designated tree, not the argv allowlist.
     pub project_root: Option<PathBuf>,
+    // ---------------------------------------------------------------------
+    // Construction-site inventory for the two fields below (t3 plan D2,
+    // reconciled 2026-09-23). `RunConfig` has no `Default` impl, so adding a
+    // field forces an explicit initializer at every literal construction, and
+    // the plan made this reconciliation a stop-and-report tripwire.
+    //
+    // Measured at base 193f52a, before the sweep:
+    //     git grep -c 'RunConfig {'   ->  26 lines
+    //       = 1 struct definition + 9 fn signatures + 16 literal constructions
+    //
+    // Only 14 of those 16 literals needed an explicit initializer:
+    //   - 13 were named by `cargo check --workspace --all-targets`;
+    //   - 1 more, apps/crew-app/src-tauri/src/core.rs, is INVISIBLE to that
+    //     command: apps/crew-app/src-tauri carries its own empty [workspace]
+    //     table and is not a root-workspace member, so it has to be checked
+    //     with its own --manifest-path;
+    //   - the last 2, crates/crew-run/tests/run_controller.rs:200 and :220,
+    //     use functional-update syntax (`..cfg`, `..scripted_config(..)`) and
+    //     INHERIT new fields, so they compile untouched and need no line.
+    //
+    // So a later sweep that counts explicit initializers and finds 14, not
+    // 16, has NOT missed two sites. Re-measure with this file excluded —
+    // otherwise this comment's own text inflates the count it quotes:
+    //     git grep -c 'RunConfig {' -- ':!crates/crew-run/src/config.rs'
+    // -> 27 today = the 25 above (26 less this file's struct definition),
+    //    plus the one signature and one literal added by the new
+    //    tests/m10_browser_dod.rs.
+    // ---------------------------------------------------------------------
     /// External browser CLI the Lead shells out to for `browser` DoD checks
     /// (user decision D1 — no new crate dependency, no tool hardcoded).
     /// `None` (the shipped default) = the browser DoD is never wired, so
