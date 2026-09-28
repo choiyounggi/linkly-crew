@@ -15,4 +15,8 @@ pub enum ProtoError {
     InvalidDeadline,
     #[error("task.assign requires requires_ack = true")]
     TaskAssignRequiresAck,
+    #[error("task.result artifact has no \"path\"")]
+    ArtifactPathMissing,
+    #[error("task.result artifact path must be a non-empty relative path with no \"..\" component, got {0:?}")]
+    InvalidArtifactPath(String),
 }
