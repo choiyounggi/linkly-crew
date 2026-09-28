@@ -8,8 +8,8 @@ import { useEffect, useMemo, useRef } from "react";
 
 import { useRunStore } from "../../lib/store";
 import { parseHumanGateBody } from "./body";
-import { deriveRoots, gateResolutions } from "./derive";
-import { EMPTY_MESSAGES, EMPTY_READ_RECEIPTS, EMPTY_READERS } from "./empty";
+import { ackReaders, deriveRoots, gateResolutions, readersFor, unresolvedGateThreads } from "./derive";
+import { EMPTY_MESSAGES, EMPTY_READ_RECEIPTS } from "./empty";
 import MessageRow from "./MessageRow";
 
 const STICK_TO_BOTTOM_THRESHOLD_PX = 40;
@@ -25,6 +25,8 @@ export default function ChatStream({ runId, onOpenThread }: ChatStreamProps) {
 
   const roots = useMemo(() => deriveRoots(messages), [messages]);
   const resolutions = useMemo(() => gateResolutions(messages), [messages]);
+  const ackMap = useMemo(() => ackReaders(messages), [messages]);
+  const unresolvedThreads = useMemo(() => unresolvedGateThreads(messages), [messages]);
 
   const sectionRef = useRef<HTMLElement | null>(null);
   const stickToBottomRef = useRef(true);
@@ -56,9 +58,9 @@ export default function ChatStream({ runId, onOpenThread }: ChatStreamProps) {
                 runId={runId}
                 envelope={root.envelope}
                 replyCount={root.replyCount}
-                readers={readReceipts[root.envelope.id] ?? EMPTY_READERS}
+                readers={readersFor(root.envelope.id, readReceipts, ackMap)}
                 gateResolution={gateTaskId ? (resolutions.get(gateTaskId) ?? null) : null}
-                parentThread={root.parentThread}
+                unresolvedGate={unresolvedThreads.has(root.envelope.thread)}
                 onOpenThread={onOpenThread}
               />
             );

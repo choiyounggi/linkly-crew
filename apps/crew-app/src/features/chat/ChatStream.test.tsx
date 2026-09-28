@@ -63,8 +63,8 @@ describe("ChatStream — empty channel (boundary)", () => {
   });
 });
 
-describe("ChatStream — human.gate main-stream exception (normal, D1/R3)", () => {
-  it("shows a human.gate directly in the main stream even though it is a reply on its thread", () => {
+describe("ChatStream — human.gate folds into the reply badge, no main-stream duplicate row (normal, D3a/D3b — REPLACES the old main-stream-promotion exception)", () => {
+  it("an unresolved human.gate reply folds into the assign root's 댓글 N개 badge and shows the 응답 필요 badge on that root", () => {
     setChannel({
       messages: [
         { seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-qa", body: {} }) },
@@ -82,9 +82,10 @@ describe("ChatStream — human.gate main-stream exception (normal, D1/R3)", () =
 
     render(<ChatStream runId={RUN_ID} />);
 
-    expect(screen.getAllByRole("listitem")).toHaveLength(2);
-    expect(screen.getByText("qa 차단 사유 검토 필요")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "승인" })).toBeInTheDocument();
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getByText("댓글 1개")).toBeInTheDocument();
+    expect(screen.getByText("응답 필요")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "승인" })).not.toBeInTheDocument();
   });
 });
 
@@ -93,6 +94,30 @@ describe("ChatStream — read receipts (normal, D4)", () => {
     setChannel({
       messages: [{ seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-pm", body: {} }) }],
       readReceipts: { e1: ["agent:pm"] },
+    });
+
+    render(<ChatStream runId={RUN_ID} />);
+
+    expect(screen.getByText("👀 1")).toBeInTheDocument();
+  });
+
+  it("shows the 👀 badge from an ack's in_reply_to even with no presence-sourced readReceipts entry (normal, D2)", () => {
+    setChannel({
+      messages: [
+        { seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-pm", body: {} }) },
+        {
+          seq: 2,
+          envelope: envelope({
+            id: "e2",
+            kind: "task.ack",
+            thread: "t-pm",
+            from: "agent:pm",
+            in_reply_to: "e1",
+            body: {},
+          }),
+        },
+      ],
+      readReceipts: {},
     });
 
     render(<ChatStream runId={RUN_ID} />);
