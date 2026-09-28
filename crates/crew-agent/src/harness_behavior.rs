@@ -456,11 +456,20 @@ impl RoleHarnessBehavior {
 
         // Hardcoded here rather than left to `system_hint` (SPIKE-M2 Finding
         // 1): a caller that forgets to fold it into the hint reintroduces
-        // the 120s tool-use timeout.
-        let prompt = format!(
-            "{}\n\n{}\n\nDo not use tools, do not read or write files, do not run commands, answer immediately.\n\nreply ONLY with JSON {{\"covered_req_ids\": [...], \"artifacts\": [{{\"name\": \"...\", \"kind\": \"...\", \"req_ids\": [...], \"content\": \"...\"}}]}}",
-            self.system_hint, task_desc
-        );
+        // the 120s tool-use timeout. The `tool_use` branch (issue #31) omits
+        // it: a tool-using turn is bounded by `turn_timeout_secs` and the M10
+        // process-group kill instead.
+        let prompt = if self.cfg.tool_use {
+            format!(
+                "{}\n\n{}\n\nYou are working in your role worktree, which is the current directory. Use your file tools to create and edit the files this task needs inside the current directory. Leave every path outside the current directory untouched.\n\nWhen the files are written, reply ONLY with JSON {{\"covered_req_ids\": [...], \"artifacts\": [{{\"name\": \"...\", \"kind\": \"...\", \"req_ids\": [...], \"path\": \"...\"}}]}} with one artifacts entry per file you created or changed, where \"path\" is that file's path relative to the current directory (for example src/app.js), never absolute and never containing \"..\".",
+                self.system_hint, task_desc
+            )
+        } else {
+            format!(
+                "{}\n\n{}\n\nDo not use tools, do not read or write files, do not run commands, answer immediately.\n\nreply ONLY with JSON {{\"covered_req_ids\": [...], \"artifacts\": [{{\"name\": \"...\", \"kind\": \"...\", \"req_ids\": [...], \"content\": \"...\"}}]}}",
+                self.system_hint, task_desc
+            )
+        };
 
         Ok(match self.injected_context.as_deref() {
             Some(injected) => format!("{injected}\n\n{prompt}"),
@@ -681,7 +690,7 @@ mod role_harness_behavior_tests {
         )
     }
 
-    fn behavior() -> RoleHarnessBehavior {
+    fn behavior_with_tool_use(tool_use: bool) -> RoleHarnessBehavior {
         // No harness turn is ever sent in this test — build_prompt is
         // called directly — so a never-invoked fake binary path is fine.
         RoleHarnessBehavior::new(
@@ -689,7 +698,7 @@ mod role_harness_behavior_tests {
             AgentCfg {
                 cwd: std::env::current_dir().expect("current dir"),
                 model: None,
-                tool_use: false,
+                tool_use,
             },
             Role::Developer,
             // Deliberately does NOT mention tools or JSON — proves the
@@ -698,6 +707,15 @@ mod role_harness_behavior_tests {
             "You are a helpful assistant.".to_string(),
         )
     }
+
+    fn behavior() -> RoleHarnessBehavior {
+        behavior_with_tool_use(false)
+    }
+
+    /// design.md "Prompt text" — the legacy prompt tail, verbatim. D10 pins it as
+    /// a characterization test: adding the tool-use branch must not perturb one
+    /// byte of the prompt every production run depends on today.
+    const LEGACY_TAIL: &str = "\n\nDo not use tools, do not read or write files, do not run commands, answer immediately.\n\nreply ONLY with JSON {\"covered_req_ids\": [...], \"artifacts\": [{\"name\": \"...\", \"kind\": \"...\", \"req_ids\": [...], \"content\": \"...\"}]}";
 
     #[test]
     fn build_prompt_hardcodes_no_tool_use_and_json_schema_instructions() {
@@ -736,6 +754,143 @@ mod role_harness_behavior_tests {
             .build_prompt(&env)
             .expect_err("missing body[\"task\"] must not build a prompt");
         assert!(err.contains("task"));
+    }
+
+    /// D9 normal case — the tool-use prompt is a positive recipe ("work here,
+    /// leave outside alone") plus a JSON template whose required slot is
+    /// `"path"`. The prohibition is GONE rather than amended with an exception
+    /// clause: per wiki backend-common-llm-binding-instructions-for-agents, a
+    /// wrong-shape failure gets MORE of the unwanted content when you add
+    /// prohibitions, and one appended "unless" clause degrades a wording that
+    /// was previously consistent.
+    #[test]
+    fn build_prompt_with_tool_use_asks_for_in_cwd_files_and_relative_paths() {
+        let task = make_task_spec(&["REQ-1"]);
+        let prompt = behavior_with_tool_use(true)
+            .build_prompt(&task_assign(&task))
+            .expect("valid task assign must build a prompt");
+
+        // Each of these pins a LOAD-BEARING clause, not merely the phrase "current
+        // directory": an audit replaced the whole recipe with a vacuous
+        // for-context-only sentence that still contained that phrase, and a
+        // phrase-presence assertion stayed green, so the directive itself must be
+        // asserted (wiki testing-quality-tests-that-cannot-fail rule 2 — mutate
+        // what the assertion actually reads).
+        assert!(
+            prompt.contains("create and edit the files"),
+            "tool-use prompt must instruct the agent to CREATE and EDIT files, not merely mention the directory: {prompt}"
+        );
+        assert!(
+            prompt.contains("Leave every path outside the current directory untouched"),
+            "tool-use prompt must forbid touching paths outside cwd: {prompt}"
+        );
+        assert!(
+            prompt.contains("current directory"),
+            "tool-use prompt must tell the agent to work in the current directory: {prompt}"
+        );
+        assert!(
+            prompt.contains("\"path\""),
+            "tool-use prompt must require the `path` artifact key: {prompt}"
+        );
+        assert!(
+            prompt.contains("relative to the current directory"),
+            "tool-use prompt must define path as cwd-relative, or the judge cannot resolve it: {prompt}"
+        );
+        assert!(
+            !prompt.to_lowercase().contains("do not use tools"),
+            "tool-use prompt must not carry the no-tool prohibition: {prompt}"
+        );
+        assert!(
+            !prompt.contains("\"content\""),
+            "tool-use prompt must ask for `path`, not inline `content`: {prompt}"
+        );
+        assert!(
+            prompt.contains("covered_req_ids"),
+            "tool-use prompt must keep the M3 coverage key: {prompt}"
+        );
+    }
+
+    /// D10 characterization — the legacy prompt must stay byte-identical. Asserted
+    /// through the public `build_prompt` return value (wiki
+    /// testing-quality-behavior-not-implementation: pin behaviour at the nearest
+    /// public boundary), not by reading the source literal.
+    #[test]
+    fn build_prompt_without_tool_use_keeps_the_legacy_tail_byte_for_byte() {
+        let task = make_task_spec(&["REQ-1"]);
+        let prompt = behavior()
+            .build_prompt(&task_assign(&task))
+            .expect("valid task assign must build a prompt");
+
+        assert!(
+            prompt.ends_with(LEGACY_TAIL),
+            "legacy prompt tail changed — every existing run depends on it: {prompt}"
+        );
+        assert!(
+            prompt.starts_with(
+                "You are a helpful assistant.\n\nTask assignment. role=Developer title=\"Build the landing page\""
+            ),
+            "legacy prompt prefix changed: {prompt}"
+        );
+    }
+
+    /// D14 boundary — an empty `artifacts_expected` collection still yields a
+    /// valid prompt in BOTH modes (the mode is what this task branches on, so the
+    /// boundary has to be checked on both sides).
+    #[test]
+    fn build_prompt_with_empty_artifacts_expected_is_valid_in_both_modes() {
+        let mut task = make_task_spec(&["REQ-1"]);
+        task.artifacts_expected.clear();
+
+        let tool_use_prompt = behavior_with_tool_use(true)
+            .build_prompt(&task_assign(&task))
+            .expect("empty artifacts_expected must still build a tool-use prompt");
+        let legacy_prompt = behavior()
+            .build_prompt(&task_assign(&task))
+            .expect("empty artifacts_expected must still build a legacy prompt");
+
+        for (label, prompt) in [("tool_use", &tool_use_prompt), ("legacy", &legacy_prompt)] {
+            assert!(
+                prompt.contains("artifacts_expected=[]"),
+                "{label}: an empty contract list must render as []: {prompt}"
+            );
+        }
+        assert!(
+            tool_use_prompt.contains("\"path\""),
+            "tool-use prompt must still require `path` with no expected artifacts: {tool_use_prompt}"
+        );
+        assert!(
+            legacy_prompt.ends_with(LEGACY_TAIL),
+            "legacy prompt must keep its tail with no expected artifacts: {legacy_prompt}"
+        );
+    }
+
+    /// D14 error — the tool-use branch must not change the error contract: a
+    /// task.assign with no `task` body still fails, with the same message callers
+    /// branch on. (The false-mode half of "both modes" is
+    /// `build_prompt_rejects_task_assign_with_missing_task_body` above.)
+    #[test]
+    fn build_prompt_with_tool_use_rejects_task_assign_with_missing_task_body() {
+        let env = Envelope::new(
+            "sp-3".to_string(),
+            "th-1".to_string(),
+            "agent:lead".to_string(),
+            vec!["agent:developer".to_string()],
+            MessageKind::TaskAssign,
+            None,
+            "req_01".to_string(),
+            json!({}),
+            vec![],
+            true,
+            900_000,
+        );
+
+        let err = behavior_with_tool_use(true)
+            .build_prompt(&env)
+            .expect_err("missing body[\"task\"] must not build a prompt");
+        assert!(
+            err.contains("task"),
+            "error must name the missing field so callers can branch: {err}"
+        );
     }
 }
 
