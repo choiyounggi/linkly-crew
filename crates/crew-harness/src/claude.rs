@@ -18,7 +18,7 @@ use crate::{
     Session, TurnOutcome, UserTurn,
 };
 
-const HARNESS_ID: HarnessId = HarnessId("claude-code");
+pub const HARNESS_ID: HarnessId = HarnessId("claude-code");
 const EVENTS_CHANNEL_CAPACITY: usize = 64;
 const TURN_CHANNEL_CAPACITY: usize = 8;
 const DEFAULT_SETTING_SOURCES: &str = "project,local";

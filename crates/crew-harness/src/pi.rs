@@ -62,17 +62,19 @@ impl Harness for PiHarness {
     }
 
     async fn spawn(&self, cfg: &AgentCfg) -> Result<Session, HarnessError> {
-        let session_id = Uuid::new_v4();
-
-        let mut args: Vec<String> = vec![
-            "--mode".to_string(),
-            "rpc".to_string(),
-            "--no-session".to_string(),
-        ];
-        if let Some(model) = &cfg.model {
-            args.push("--model".to_string());
-            args.push(model.clone());
+        // pi has no flag that confines writes to `cwd` (`--tools read,edit,write`
+        // still reaches any path), so a tool-using role must never run on it
+        // (integration review F1). crew-run never hands pi `tool_use`: its
+        // cfg gates tool use on claude-code, and `RunHandle::swap_harness`
+        // refuses a tool-using role's swap to pi up front. This refusal is
+        // the last line of defence for any other caller.
+        if cfg.tool_use {
+            return Err(HarnessError::Unavailable(
+                "pi harness cannot confine writes to the worktree; tool_use is unsupported".to_string(),
+            ));
         }
+        let session_id = Uuid::new_v4();
+        let args = pi_args(cfg);
 
         let mut command = Command::new("pi");
         command
@@ -169,6 +171,23 @@ impl Harness for PiHarness {
         let _ = session.child.wait().await;
         Ok(())
     }
+}
+
+/// The `pi` argv for `cfg`. `--no-tools` is unconditional: pi's default
+/// read/bash/edit/write tools are not confined to `cwd` (`pi --help`:
+/// "--no-tools, -nt  Disable all tools by default").
+fn pi_args(cfg: &AgentCfg) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--mode".to_string(),
+        "rpc".to_string(),
+        "--no-session".to_string(),
+        "--no-tools".to_string(),
+    ];
+    if let Some(model) = &cfg.model {
+        args.push("--model".to_string());
+        args.push(model.clone());
+    }
+    args
 }
 
 /// Reads pi's RPC-mode NDJSON `stdout` (D1/D4), normalizes each line into
@@ -551,5 +570,60 @@ mod tests {
     #[test]
     fn id_is_pi() {
         assert_eq!(PiHarness::new().id().0, "pi");
+    }
+
+    fn cfg(cwd: &str, tool_use: bool) -> AgentCfg {
+        AgentCfg {
+            cwd: std::path::PathBuf::from(cwd),
+            model: None,
+            tool_use,
+        }
+    }
+
+    /// Normal: with tool_use off (every default path) pi still gets
+    /// `--no-tools` — pi's default tool set (read/bash/edit/write) is
+    /// unconfined, so it must never be on (integration review F1).
+    #[test]
+    fn argv_always_disables_pi_tools() {
+        let args = pi_args(&cfg("/abs/unused", false));
+
+        assert!(args.iter().any(|a| a == "--no-tools"), "argv must contain --no-tools: {args:?}");
+        assert_eq!(&args[..3], &["--mode", "rpc", "--no-session"]);
+    }
+
+    /// Boundary: `--model` still follows the fixed flags alongside `--no-tools`.
+    #[test]
+    fn argv_keeps_model_with_no_tools() {
+        let mut c = cfg("/abs/unused", false);
+        c.model = Some("m1".to_string());
+
+        let args = pi_args(&c);
+
+        assert!(args.iter().any(|a| a == "--no-tools"), "argv must contain --no-tools: {args:?}");
+        let at = args.iter().position(|a| a == "--model").expect("--model present");
+        assert_eq!(args[at + 1], "m1");
+    }
+
+    /// Error: pi cannot confine writes to its cwd, so tool_use=true is
+    /// refused BEFORE any process is spawned. The cwd does not exist, so a
+    /// spawn attempt would surface as `Spawn`, never `Unavailable`.
+    #[tokio::test]
+    async fn tool_use_is_refused_before_spawning() {
+        let missing = std::env::current_dir()
+            .unwrap()
+            .join(".crew-test")
+            .join(format!("pi-missing-{}", Uuid::new_v4()));
+
+        let result = PiHarness::new().spawn(&cfg(missing.to_str().unwrap(), true)).await;
+
+        match result {
+            Err(HarnessError::Unavailable(msg)) => {
+                assert!(msg.contains("pi"), "error must name pi: {msg}");
+                assert!(msg.contains("tool_use"), "error must name tool_use: {msg}");
+            }
+            Err(other) => panic!("expected Unavailable before spawning, got {other:?}"),
+            Ok(_) => panic!("expected Unavailable, got a spawned session"),
+        }
+        assert!(!missing.exists(), "no cwd may be created");
     }
 }

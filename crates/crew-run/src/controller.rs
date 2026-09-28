@@ -149,12 +149,42 @@ fn role_cli_cwd(role_worktrees: Option<&[(Role, PathBuf)]>, data_dir: &Path, rol
 /// exactly when the run has per-role worktrees, i.e. when the CLI's cwd —
 /// the only place tool use lets it write — is the role's own git worktree.
 /// Without a `project_root` the cwd is the scratch `data_dir/cli-cwd/<role>`
-/// and the CLI stays tool-less.
-fn role_harness_cfg(role_worktrees: Option<&[(Role, PathBuf)]>, data_dir: &Path, role: Role) -> HarnessAgentCfg {
+/// and the CLI stays tool-less. Tool use is also gated on the harness: only
+/// claude-code confines writes to its cwd, so every other harness (pi) stays
+/// tool-less even in a worktree (integration review F1).
+fn role_harness_cfg(
+    role_worktrees: Option<&[(Role, PathBuf)]>,
+    data_dir: &Path,
+    role: Role,
+    harness_id: &str,
+) -> HarnessAgentCfg {
     HarnessAgentCfg {
         cwd: role_cli_cwd(role_worktrees, data_dir, role),
         model: None,
-        tool_use: role_worktrees.is_some(),
+        tool_use: harness_gets_tool_use(role_worktrees.is_some(), harness_id),
+    }
+}
+
+/// The single tool-use predicate shared by `role_harness_cfg` and
+/// `RunHandle::swap_harness`: a worker role gets tool use only in its own
+/// worktree and only on claude-code (integration review F1).
+fn harness_gets_tool_use(has_role_worktrees: bool, harness_id: &str) -> bool {
+    has_role_worktrees && harness_id == crew_harness::claude::HARNESS_ID.0
+}
+
+/// Why a mid-run swap of a worker role from `current` to `target` must be
+/// refused, if it must. A live worker keeps its spawn-time cfg across a swap,
+/// so a tool-using role swapped onto a harness that cannot confine writes
+/// would either run unconfined or (pi) block every later turn until the
+/// sprint boundary — it is refused before anything changes instead
+/// (integration review F1 r2).
+fn swap_tool_use_refusal(has_role_worktrees: bool, current: &str, target: &str) -> Option<String> {
+    if harness_gets_tool_use(has_role_worktrees, current) && !harness_gets_tool_use(has_role_worktrees, target) {
+        Some(format!(
+            "{target} cannot confine writes to the worktree; this role runs with tool use under the project_root"
+        ))
+    } else {
+        None
     }
 }
 
@@ -442,7 +472,7 @@ async fn spawn_sprint(
                     );
                     continue;
                 };
-                let harness_cfg = role_harness_cfg(role_worktrees, data_dir, role);
+                let harness_cfg = role_harness_cfg(role_worktrees, data_dir, role, &harness_id);
                 let system_hint = role_system_hint(role, goal, project_root);
                 // Permit is scoped to each CLI interaction (turn), not the
                 // runner's lifetime (contracts-m6.md §D2d) — a runner-
@@ -848,6 +878,7 @@ impl RunController {
                 Some(resolve_role_worktrees(root, &worktrees_base).map_err(RunError::ProjectRootInvalid)?)
             }
         };
+        let has_role_worktrees = role_worktrees.is_some();
         // None — and so no git command for the whole run — unless both are
         // present (t7 design D12).
         let gitflow: Option<Arc<GitFlowCtx>> = GitFlowCtx::for_run(
@@ -1369,6 +1400,7 @@ impl RunController {
             gate_tx,
             gitflow,
             lock_slot,
+            has_role_worktrees,
         })
     }
 }
@@ -1598,6 +1630,9 @@ pub struct RunHandle {
     gitflow: Option<Arc<GitFlowCtx>>,
     /// The run lock's slot (D21) — empty once the finisher released it.
     lock_slot: gitflow::LockSlot,
+    /// Whether the run has per-role worktrees (`project_root` set) — the
+    /// `swap_harness` side of `harness_gets_tool_use`.
+    has_role_worktrees: bool,
 }
 
 /// One control-channel swap attempt against a specific worker's sender —
@@ -1726,18 +1761,26 @@ impl RunHandle {
     /// steps 1-2's effects are **not** rolled back when that happens; the
     /// same boundary fallback still applies.
     pub async fn swap_harness(&self, agent_id: &str, harness: &str) -> Result<(), RunError> {
-        {
+        let (current_harness, current_role) = {
             let roster = self.roster.lock().expect("roster mutex poisoned");
-            if !roster.agents.iter().any(|a| a.id == agent_id) {
-                return Err(RunError::SwapRejected(format!("unknown agent id: {agent_id}")));
+            match roster.agents.iter().find(|a| a.id == agent_id) {
+                Some(slot) => (slot.harness.clone(), slot.role.clone()),
+                None => return Err(RunError::SwapRejected(format!("unknown agent id: {agent_id}"))),
             }
-        }
+        };
         // D8: keep the built `Arc<dyn Harness>` for step 3 — `make` is only
         // ever called once per swap.
         let harness_arc = match HarnessRegistry::make(harness) {
             Some(h) => h,
             None => return Err(RunError::SwapRejected(format!("unknown harness id: {harness}"))),
         };
+        // Integration review F1 r2: refused before any mutation, so the live
+        // worker keeps its current session. The lead slot never has tool use.
+        if role_from_str(&current_role).is_some() {
+            if let Some(reason) = swap_tool_use_refusal(self.has_role_worktrees, &current_harness, harness) {
+                return Err(RunError::SwapRejected(reason));
+            }
+        }
 
         let (old_harness, role_str) = {
             let mut roster = self.roster.lock().expect("roster mutex poisoned");
@@ -3001,9 +3044,13 @@ mod role_system_hint_tests {
 mod role_harness_cfg_tests {
     //! t7 design D1: RealCli workers get `tool_use` exactly when the run has
     //! per-role worktrees (`project_root` Some) — the only case where the
-    //! write-confining cwd is the role's own git worktree.
+    //! write-confining cwd is the role's own git worktree — and only on
+    //! claude-code, the one harness that confines writes (integration
+    //! review F1).
 
     use super::*;
+
+    const CLAUDE: &str = crew_harness::claude::HARNESS_ID.0;
 
     /// Removes the per-test data dir even when an assertion panics, so a
     /// failing run leaves no `.crew-test/` leftover.
@@ -3022,7 +3069,7 @@ mod role_harness_cfg_tests {
         let worktree = PathBuf::from("/abs/worktrees/developer");
         let worktrees = [(Role::Developer, worktree.clone())];
 
-        let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Developer);
+        let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Developer, CLAUDE);
 
         assert!(cfg.tool_use, "a role with a worktree must get tool_use");
         assert_eq!(cfg.cwd, worktree);
@@ -3041,13 +3088,13 @@ mod role_harness_cfg_tests {
         assert!(worktrees.len() >= 2, "test setup: needs at least two roles");
 
         for (role, expected) in &worktrees {
-            let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), *role);
+            let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), *role, CLAUDE);
 
             assert_eq!(&cfg.cwd, expected, "{role:?} must run in its own worktree");
             assert!(cfg.tool_use, "{role:?} with a worktree must get tool_use");
             assert_eq!(cfg.model, None);
         }
-        let qa = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Qa);
+        let qa = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Qa, CLAUDE);
         assert_eq!(qa.cwd, PathBuf::from("/abs/worktrees/qa"));
     }
 
@@ -3061,11 +3108,68 @@ mod role_harness_cfg_tests {
             .join(format!("rhc-{}", uuid::Uuid::new_v4()));
         let _guard = DirGuard(data_dir.clone());
 
-        let cfg = role_harness_cfg(None, &data_dir, Role::Developer);
+        let cfg = role_harness_cfg(None, &data_dir, Role::Developer, CLAUDE);
 
         assert!(!cfg.tool_use, "no worktree must keep tool_use off");
         assert_eq!(cfg.cwd, data_dir.join("cli-cwd").join("developer"));
         assert_eq!(cfg.model, None);
+    }
+
+    /// Normal: pi cannot confine writes, so a pi role keeps tool use off even
+    /// with a worktree — it still runs in that worktree.
+    #[test]
+    fn pi_with_worktrees_keeps_tool_use_off() {
+        let worktree = PathBuf::from("/abs/worktrees/developer");
+        let worktrees = [(Role::Developer, worktree.clone())];
+        let pi = crew_harness::pi::PiHarness::new().id().0;
+
+        let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Developer, pi);
+
+        assert!(!cfg.tool_use, "a pi role must never get tool_use");
+        assert_eq!(cfg.cwd, worktree);
+    }
+
+    /// Boundary: an unknown harness id with worktrees keeps tool use off.
+    #[test]
+    fn unknown_harness_with_worktrees_keeps_tool_use_off() {
+        let worktrees = [(Role::Developer, PathBuf::from("/abs/worktrees/developer"))];
+
+        let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Developer, "");
+
+        assert!(!cfg.tool_use, "only claude-code may get tool_use");
+    }
+
+    /// Error (F1 r2): a tool-using claude-code role swapped to pi is refused,
+    /// and the message names the target and why.
+    #[test]
+    fn swap_from_tool_using_claude_to_pi_is_refused() {
+        let pi = crew_harness::pi::PiHarness::new().id().0;
+
+        let reason = swap_tool_use_refusal(true, CLAUDE, pi).expect("the swap must be refused");
+
+        assert!(reason.contains("pi"), "must name the target harness: {reason}");
+        assert!(reason.contains("cannot confine writes to the worktree"), "must say why: {reason}");
+    }
+
+    /// Normal: every swap that keeps the role's tool use consistent proceeds —
+    /// claude-code -> claude-code under worktrees, anything without worktrees,
+    /// and a role that already runs tool-less (pi -> claude-code keeps the
+    /// live cfg's tool_use=false).
+    #[test]
+    fn swaps_that_keep_tool_use_consistent_proceed() {
+        let pi = crew_harness::pi::PiHarness::new().id().0;
+
+        assert_eq!(swap_tool_use_refusal(true, CLAUDE, CLAUDE), None);
+        assert_eq!(swap_tool_use_refusal(false, CLAUDE, pi), None);
+        assert_eq!(swap_tool_use_refusal(true, pi, CLAUDE), None);
+        assert_eq!(swap_tool_use_refusal(true, pi, pi), None);
+    }
+
+    /// Boundary: an empty target id is refused too — only claude-code keeps
+    /// tool use.
+    #[test]
+    fn swap_from_tool_using_claude_to_an_empty_id_is_refused() {
+        assert!(swap_tool_use_refusal(true, CLAUDE, "").is_some());
     }
 
     /// Error/boundary: an empty worktree slice is a lookup bug and still
@@ -3073,7 +3177,7 @@ mod role_harness_cfg_tests {
     #[test]
     #[should_panic(expected = "no precomputed worktree")]
     fn empty_worktrees_still_panic() {
-        let _ = role_harness_cfg(Some(&[]), Path::new("/abs/data-unused"), Role::Developer);
+        let _ = role_harness_cfg(Some(&[]), Path::new("/abs/data-unused"), Role::Developer, CLAUDE);
     }
 }
 

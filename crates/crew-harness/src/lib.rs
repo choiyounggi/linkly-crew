@@ -81,8 +81,9 @@ pub struct AgentCfg {
     /// `.claude/settings*.json` (loaded via `--setting-sources project,local`)
     /// adds no allow rule or `additionalDirectories` reaching outside `cwd`, and
     /// no allow rule for any code-running tool (that would re-open command
-    /// execution). Only `ClaudeCodeHarness` reads this; `PiHarness` and
-    /// `OpencodeHarness` ignore it.
+    /// execution). Only `ClaudeCodeHarness` honours this; `PiHarness` refuses
+    /// `true` with `Unavailable` (it cannot confine writes) and
+    /// `OpencodeHarness` ignores it.
     pub tool_use: bool,
 }
 
