@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  parseBlockedBody,
   parseChangeRequestBody,
+  parseHandoffBody,
   parseHumanGateBody,
   parseHumanResponseBody,
+  parseTaskAssignBody,
+  parseTaskProgressBody,
   parseTaskResultBody,
+  parseTextBody,
 } from "./body";
 
 describe("parseTaskResultBody — normal", () => {
@@ -109,5 +114,99 @@ describe("parseHumanResponseBody — error/boundary", () => {
 
   it("returns null for a non-object body", () => {
     expect(parseHumanResponseBody(42)).toBeNull();
+  });
+});
+
+describe("parseTaskAssignBody — normal", () => {
+  it("parses a well-formed task.assign body", () => {
+    expect(parseTaskAssignBody({ task: { title: "로그인 페이지 구현" } })).toEqual({
+      title: "로그인 페이지 구현",
+    });
+  });
+});
+
+describe("parseTaskAssignBody — error/boundary", () => {
+  it("returns null when task.title is missing", () => {
+    expect(parseTaskAssignBody({ task: {} })).toBeNull();
+  });
+
+  it("returns null when task is not an object", () => {
+    expect(parseTaskAssignBody({ task: "nope" })).toBeNull();
+  });
+
+  it("returns null for a non-object body", () => {
+    expect(parseTaskAssignBody(null)).toBeNull();
+  });
+});
+
+describe("parseTaskProgressBody — normal", () => {
+  it("parses a well-formed task.progress body", () => {
+    expect(parseTaskProgressBody({ summary: "구현 60% 진행" })).toEqual({
+      summary: "구현 60% 진행",
+    });
+  });
+});
+
+describe("parseTaskProgressBody — error/boundary", () => {
+  it("returns null when summary is missing", () => {
+    expect(parseTaskProgressBody({})).toBeNull();
+  });
+
+  it("returns null for a non-object body", () => {
+    expect(parseTaskProgressBody("nope")).toBeNull();
+  });
+});
+
+describe("parseBlockedBody — normal", () => {
+  it("parses a well-formed blocked body", () => {
+    expect(parseBlockedBody({ reason: "의존성 대기 중" })).toEqual({ reason: "의존성 대기 중" });
+  });
+});
+
+describe("parseBlockedBody — error/boundary", () => {
+  it("returns null when reason is missing", () => {
+    expect(parseBlockedBody({})).toBeNull();
+  });
+
+  it("returns null for a non-object body", () => {
+    expect(parseBlockedBody(undefined)).toBeNull();
+  });
+});
+
+describe("parseHandoffBody — normal", () => {
+  it("parses a well-formed handoff body", () => {
+    expect(parseHandoffBody({ pack: { role: "developer" } })).toEqual({ role: "developer" });
+  });
+});
+
+describe("parseHandoffBody — error/boundary", () => {
+  it("returns null when pack.role is missing", () => {
+    expect(parseHandoffBody({ pack: {} })).toBeNull();
+  });
+
+  it("returns null when pack is not an object", () => {
+    expect(parseHandoffBody({ pack: null })).toBeNull();
+  });
+
+  it("returns null for a non-object body", () => {
+    expect(parseHandoffBody(42)).toBeNull();
+  });
+});
+
+describe("parseTextBody — normal", () => {
+  it("parses a well-formed text body", () => {
+    expect(parseTextBody({ text: "REQ-4 반응형 기준이 뭔가요?" })).toEqual({
+      text: "REQ-4 반응형 기준이 뭔가요?",
+    });
+  });
+});
+
+describe("parseTextBody — error/boundary", () => {
+  it("returns null when text is missing", () => {
+    expect(parseTextBody({})).toBeNull();
+  });
+
+  it("returns null for a non-object body", () => {
+    expect(parseTextBody(null)).toBeNull();
   });
 });

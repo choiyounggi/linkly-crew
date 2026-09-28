@@ -39,6 +39,7 @@ fn agent_cfg() -> AgentCfg {
     AgentCfg {
         cwd: std::env::current_dir().expect("current dir"),
         model: None,
+        tool_use: false,
     }
 }
 

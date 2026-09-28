@@ -86,6 +86,7 @@ fn event_type_name(ev: &RunEvent) -> &'static str {
         RunEvent::SprintFinished { .. } => "sprint_finished",
         RunEvent::RosterChanged { .. } => "roster_changed",
         RunEvent::Presence { .. } => "presence",
+        RunEvent::GitFlow { .. } => "git_flow",
     }
 }
 

@@ -74,6 +74,7 @@ mod tests {
         let cfg = AgentCfg {
             cwd: std::env::current_dir().unwrap(),
             model: None,
+            tool_use: false,
         };
         let result = harness.spawn(&cfg).await;
         let err = match result {

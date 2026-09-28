@@ -7,6 +7,7 @@ pub mod handoff;
 pub mod kind;
 pub mod roster;
 pub mod spec;
+pub mod task_result;
 pub mod wire;
 
 pub use dag::{DagError, Role, TaskDag, TaskSpec};
@@ -21,4 +22,5 @@ pub use kind::{
 };
 pub use roster::{Roster, RosterAgent};
 pub use spec::{ArtifactContract, ReqId, Requirement, SpecDoc, SpecError};
+pub use task_result::{task_result_artifacts_from_body, TaskResultArtifact};
 pub use wire::{ClientFrame, ServerFrame};

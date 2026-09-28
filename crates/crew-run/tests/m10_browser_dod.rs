@@ -30,8 +30,8 @@ use std::time::Duration;
 use crew_lead::accept::AcceptanceLoop;
 use crew_proto::{DodCheck, MessageKind, Role};
 use crew_run::{
-    BrowserCheck, GateDecision, RunConfig, RunController, RunEvent, RunMode, RunOutcomeDto,
-    TaskStateDto,
+    BrowserCheck, GateDecision, GitFlowKindDto, RunConfig, RunController, RunError, RunEvent, RunMode,
+    RunOutcomeDto, TaskStateDto,
 };
 
 const GOAL: &str = "간단한 랜딩 페이지";
@@ -448,6 +448,22 @@ fn cleanup_home_entry(victim: &Path) {
     assert!(!victim.exists(), "{victim:?} still exists after removal");
 }
 
+/// The outcome the run's RunFinished event carried.
+fn run_finished_outcome(events: &[RunEvent]) -> Option<RunOutcomeDto> {
+    events.iter().find_map(|ev| match ev {
+        RunEvent::RunFinished { outcome, .. } => Some(*outcome),
+        _ => None,
+    })
+}
+
+/// How many git_flow events of `kind` the run emitted.
+fn git_flow_kinds(events: &[RunEvent], kind: GitFlowKindDto) -> usize {
+    events
+        .iter()
+        .filter(|ev| matches!(ev, RunEvent::GitFlow { kind: k, .. } if *k == kind))
+        .count()
+}
+
 /// The absolute path the spawned fixture reported as its working directory.
 fn recorded_spawn_cwd(bin_dir: &Path) -> PathBuf {
     let log = bin_dir.join("cwd.log");
@@ -595,7 +611,19 @@ async fn a_failing_browser_check_withholds_acceptance_and_escalates() {
         .expect("resolve_gate must succeed while the run is live");
     wait_for(&mut rx, &mut seen, |ev| is_task_state(ev, "t-dev", TaskStateDto::Blocked)).await;
 
-    join_ok(&mut handle).await;
+    // Ruling C2 (t7 design D10): with a project_root, no accepted task
+    // carried an executed-and-passed check, so the run ends Failed.
+    let joined = tokio::time::timeout(JOIN_TIMEOUT, handle.join())
+        .await
+        .expect("join must finish within the deterministic budget");
+    assert!(matches!(joined, Err(RunError::Join(_))), "the Completed gate must fail this run: {joined:?}");
+    seen.extend(drain(&mut rx));
+    assert_eq!(run_finished_outcome(&seen), Some(RunOutcomeDto::Failed));
+    assert_eq!(git_flow_kinds(&seen, GitFlowKindDto::Gate), 1, "exactly one gate event");
+    assert!(
+        !seen.iter().any(|ev| matches!(ev, RunEvent::GitFlow { task_id: Some(t), .. } if t == "t-dev")),
+        "a task that never reached Accepted gets no git flow event"
+    );
     let snap = handle.snapshot();
     let dev_state = snap
         .task_states
@@ -698,7 +726,12 @@ async fn an_unconfigured_binary_never_spawns_but_still_creates_the_home_entry() 
     let mut handle = start_ok(cfg).await;
     let mut rx = handle.subscribe();
 
-    join_ok(&mut handle).await;
+    // Ruling C3 (t7 design D10): the browser check never executed, so it
+    // cannot satisfy the Completed gate and the run ends Failed.
+    let joined = tokio::time::timeout(JOIN_TIMEOUT, handle.join())
+        .await
+        .expect("join must finish within the deterministic budget");
+    assert!(matches!(joined, Err(RunError::Join(_))), "the Completed gate must fail this run: {joined:?}");
     let events = drain(&mut rx);
 
     assert!(
@@ -709,7 +742,8 @@ async fn an_unconfigured_binary_never_spawns_but_still_creates_the_home_entry() 
         RunEvent::RunFinished { outcome, .. } => Some(*outcome),
         _ => None,
     });
-    assert_eq!(finished, Some(RunOutcomeDto::Completed));
+    assert_eq!(finished, Some(RunOutcomeDto::Failed));
+    assert_eq!(git_flow_kinds(&events, GitFlowKindDto::Gate), 1, "exactly one gate event");
 
     handle.shutdown().await;
     cleanup_home_entry(&find_created_home_entry(&home_before, &s.repo_name));

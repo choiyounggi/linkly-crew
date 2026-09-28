@@ -51,26 +51,33 @@ describe("ChatPane — typing indicator (normal/boundary, D5)", () => {
   });
 });
 
-describe("ChatPane — composer reflects the store's active gate (normal/boundary, D6)", () => {
-  it("enables the composer when the channel has an unresolved human.gate", () => {
+describe("ChatPane — the gate-answer composer lives inside ThreadPanel, not at ChatPane's own root (normal/boundary, D3d — REPLACES the retired bottom-composer describe block)", () => {
+  it("mounts the composer inside the opened thread panel once its unresolved human.gate is reached, never at ChatPane's own root", () => {
     setChannel({
       messages: [
+        { seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-qa", body: {} }) },
         {
-          seq: 1,
-          envelope: envelope({ id: "e1", kind: "human.gate", thread: "t-qa", body: { task_id: "t-qa", reason: "why" } }),
+          seq: 2,
+          envelope: envelope({ id: "e2", kind: "human.gate", thread: "t-qa", body: { task_id: "t-qa", reason: "why" } }),
         },
       ],
     });
 
     render(<ChatPane runId={RUN_ID} />);
 
-    expect(screen.getByLabelText("게이트 응답")).not.toBeDisabled();
+    expect(screen.queryByLabelText("게이트 응답")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "댓글 1개" }));
+
+    const composer = screen.getByLabelText("게이트 응답");
+    expect(composer).not.toBeDisabled();
+    expect(screen.getByLabelText("스레드 패널")).toContainElement(composer);
   });
 
-  it("disables the composer when there is no active gate (boundary, D6)", () => {
+  it("shows no composer anywhere when there is no active gate (boundary)", () => {
     render(<ChatPane runId={RUN_ID} />);
 
-    expect(screen.getByPlaceholderText("@멘션 2차 예정")).toBeDisabled();
+    expect(screen.queryByLabelText("게이트 응답")).not.toBeInTheDocument();
   });
 });
 

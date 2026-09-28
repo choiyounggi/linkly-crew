@@ -17,6 +17,7 @@ use std::process::Command;
 use crew_proto::Role;
 
 use crate::controller::role_dir_name;
+use crate::gitflow::{run_git_bounded, GIT_LOCAL_TIMEOUT};
 
 /// Production default for `ensure_role_worktree`'s `worktrees_base` (design
 /// D1): `~/.linkly-crew/projects/<basename>-<fnv1a-hash8hex of the absolute
@@ -150,11 +151,15 @@ pub(crate) fn check_artifacts_not_ignored(project_root: &Path) -> Result<(), Str
 }
 
 /// Ensures `role`'s worktree exists under `worktrees_base` for the git repo
-/// at `project_root`, creating it (`git worktree add -B crew/<role>`, base =
-/// `project_root`'s current `HEAD`) if it isn't already there, or reusing it
-/// idempotently if `git worktree list` already registers it. `project_root`
-/// not being a git repository, or the `git worktree add` invocation itself
-/// failing, is returned as `Err` — no fallback to a shared cwd (design D5).
+/// at `project_root`, creating it if it isn't already there, or reusing it
+/// idempotently if `git worktree list` already registers it. An existing
+/// `crew/<role>` branch is checked out as is (it can hold accepted work that
+/// never reached main); only a missing one is created from `project_root`'s
+/// current `HEAD` — never `-B`, which would reset the branch (t7 design D20).
+/// The add runs through the flow's bounded runner, so no checkout hook runs.
+/// `project_root` not being a git repository, or the `git worktree add`
+/// invocation itself failing, is returned as `Err` — no fallback to a shared
+/// cwd (design D5).
 pub(crate) fn ensure_role_worktree(project_root: &Path, worktrees_base: &Path, role: Role) -> Result<PathBuf, String> {
     let canonical_root = confirm_git_toplevel(project_root)?;
 
@@ -169,15 +174,24 @@ pub(crate) fn ensure_role_worktree(project_root: &Path, worktrees_base: &Path, r
     }
 
     let branch = format!("crew/{}", role_dir_name(role));
-    let (added, stderr) = run_git(
-        &canonical_root,
-        &["worktree", "add", "-B", &branch, &role_path.to_string_lossy()],
-    )?;
-    if !added {
+    let path = role_path.to_string_lossy();
+    let git = |args: &[&str]| run_git_bounded(&canonical_root, args, GIT_LOCAL_TIMEOUT, &[], None);
+    let exists = git(&["rev-parse", "--verify", "-q", &format!("refs/heads/{branch}")])?;
+    let added = match exists.code {
+        Some(0) => git(&["worktree", "add", &path, &branch])?,
+        Some(1) => git(&["worktree", "add", "-b", &branch, &path])?,
+        _ => {
+            return Err(format!(
+                "git rev-parse {branch} failed for role {role:?}: {}",
+                exists.stderr
+            ))
+        }
+    };
+    if !added.ok {
         return Err(format!(
             "git worktree add failed for role {role:?} at {}: {}",
             role_path.display(),
-            stderr.trim()
+            added.stderr
         ));
     }
     Ok(role_path)
@@ -209,19 +223,6 @@ fn worktree_is_registered(project_root: &Path, role_path: &Path) -> Result<bool,
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
         .any(|p| p == target))
-}
-
-/// Runs `git -C cwd <args>`, returning `(exit_success, stderr)`. A failure
-/// to even spawn `git` (not on `PATH`) is itself an `Err`, distinct from git
-/// running and reporting a non-zero exit.
-fn run_git(cwd: &Path, args: &[&str]) -> Result<(bool, String), String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .map_err(|e| format!("failed to run git {args:?}: {e}"))?;
-    Ok((output.status.success(), String::from_utf8_lossy(&output.stderr).into_owned()))
 }
 
 #[cfg(test)]
@@ -450,6 +451,80 @@ mod tests {
             Err(msg) => assert!(msg.contains("fatal: something"), "message must surface git's stderr: {msg}"),
             Ok(()) => panic!("exit code 128 must be Err, not treated as not-ignored"),
         }
+    }
+
+    /// Boundary (t7 D20): a role folder deleted and pruned while its branch
+    /// holds commits that never reached main is recreated ON that branch —
+    /// never reset to the root's HEAD.
+    #[test]
+    fn recreating_a_missing_worktree_keeps_the_existing_branch_commits() {
+        let repo = init_test_repo("wt-recreate-repo");
+        let base = test_dir("wt-recreate-base");
+        let _cleanup = RemoveOnDrop(vec![repo.clone(), base.clone()]);
+        let first = ensure_role_worktree(&repo, &base, Role::Qa).expect("first creation");
+        std::fs::write(first.join("report.md"), b"qa work\n").expect("test setup: role work");
+        run_git_ok(&first, &["add", "report.md"]);
+        run_git_ok(&first, &["commit", "-q", "-m", "qa work not yet on main"]);
+        let branch_sha = rev_parse(&repo, "crew/qa");
+        assert_ne!(branch_sha, rev_parse(&repo, "HEAD"), "test setup: the role branch must be ahead");
+        std::fs::remove_dir_all(&first).expect("test setup: delete the role folder");
+        run_git_ok(&repo, &["worktree", "prune"]);
+
+        let second = ensure_role_worktree(&repo, &base, Role::Qa).expect("recreation must succeed");
+
+        assert_eq!(rev_parse(&repo, "crew/qa"), branch_sha, "the role branch must keep its commits");
+        assert_eq!(rev_parse(&second, "HEAD"), branch_sha, "the new worktree checks out that branch as is");
+        assert!(second.join("report.md").is_file());
+    }
+
+    /// t7 D20/D6: adding a role worktree for an existing, possibly
+    /// agent-authored branch runs no post-checkout hook — proven against a
+    /// plain `git worktree add` that does run it.
+    #[test]
+    fn worktree_add_runs_no_checkout_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = init_test_repo("wt-hook-repo");
+        let base = test_dir("wt-hook-base");
+        let hooks = test_dir("wt-hook-hooks");
+        let _cleanup = RemoveOnDrop(vec![repo.clone(), base.clone(), hooks.clone()]);
+        std::fs::create_dir_all(&hooks).unwrap();
+        let marker = hooks.join("marker");
+        let hook = hooks.join("post-checkout");
+        std::fs::write(&hook, format!("#!/bin/sh\necho ran >> '{}'\n", marker.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        run_git_ok(&repo, &["config", "core.hooksPath", &hooks.to_string_lossy()]);
+        let probe = base.join("probe");
+        run_git_ok(&repo, &["worktree", "add", "-q", "-b", "probe", &probe.to_string_lossy()]);
+        assert!(marker.exists(), "test setup: the hook must run for a plain worktree add");
+        std::fs::remove_file(&marker).unwrap();
+        run_git_ok(&repo, &["branch", "crew/qa"]);
+
+        let path = ensure_role_worktree(&repo, &base, Role::Qa).expect("worktree for the existing branch");
+
+        assert_eq!(current_branch(&path), "crew/qa");
+        assert!(!marker.exists(), "ensure_role_worktree must run no checkout hook");
+    }
+
+    /// Removes the listed test dirs even when an assertion panics.
+    struct RemoveOnDrop(Vec<PathBuf>);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            for dir in &self.0 {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    fn rev_parse(cwd: &Path, rev: &str) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["rev-parse", rev])
+            .output()
+            .expect("test: git rev-parse must run");
+        assert!(output.status.success(), "test: git rev-parse {rev} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     /// Boundary (R3): a `None` exit code (Unix signal termination) is also

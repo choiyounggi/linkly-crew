@@ -23,7 +23,7 @@ use crew_lead::plan_llm::LlmLeadPlanner;
 use crew_ledger::{EventLedger, StoredMessage};
 use crew_proto::{
     handoff_body, presence_read_from_body, presence_typing_from_body, Envelope, HandoffPack, MessageKind, Role,
-    Roster, RosterAgent, SpecDoc, TaskDag,
+    Roster, RosterAgent, SpecDoc, TaskDag, TaskSpec,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -31,8 +31,10 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::config::{GateDecision, RunConfig, RunError, RunMode};
 use crate::events::{
-    now_ts, PresenceKindDto, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto,
+    now_ts, GitFlowKindDto, PresenceKindDto, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto,
+    TaskStateDto,
 };
+use crate::gitflow::{self, GitFlowCtx};
 use crate::observe::{ObservingLead, TaskStateChange};
 use crate::worktree;
 
@@ -143,6 +145,49 @@ fn role_cli_cwd(role_worktrees: Option<&[(Role, PathBuf)]>, data_dir: &Path, rol
     cwd
 }
 
+/// The RealCli spawn spec's harness config (t7 design D1): tool use is on
+/// exactly when the run has per-role worktrees, i.e. when the CLI's cwd —
+/// the only place tool use lets it write — is the role's own git worktree.
+/// Without a `project_root` the cwd is the scratch `data_dir/cli-cwd/<role>`
+/// and the CLI stays tool-less. Tool use is also gated on the harness: only
+/// claude-code confines writes to its cwd, so every other harness (pi) stays
+/// tool-less even in a worktree (integration review F1).
+fn role_harness_cfg(
+    role_worktrees: Option<&[(Role, PathBuf)]>,
+    data_dir: &Path,
+    role: Role,
+    harness_id: &str,
+) -> HarnessAgentCfg {
+    HarnessAgentCfg {
+        cwd: role_cli_cwd(role_worktrees, data_dir, role),
+        model: None,
+        tool_use: harness_gets_tool_use(role_worktrees.is_some(), harness_id),
+    }
+}
+
+/// The single tool-use predicate shared by `role_harness_cfg` and
+/// `RunHandle::swap_harness`: a worker role gets tool use only in its own
+/// worktree and only on claude-code (integration review F1).
+fn harness_gets_tool_use(has_role_worktrees: bool, harness_id: &str) -> bool {
+    has_role_worktrees && harness_id == crew_harness::claude::HARNESS_ID.0
+}
+
+/// Why a mid-run swap of a worker role from `current` to `target` must be
+/// refused, if it must. A live worker keeps its spawn-time cfg across a swap,
+/// so a tool-using role swapped onto a harness that cannot confine writes
+/// would either run unconfined or (pi) block every later turn until the
+/// sprint boundary — it is refused before anything changes instead
+/// (integration review F1 r2).
+fn swap_tool_use_refusal(has_role_worktrees: bool, current: &str, target: &str) -> Option<String> {
+    if harness_gets_tool_use(has_role_worktrees, current) && !harness_gets_tool_use(has_role_worktrees, target) {
+        Some(format!(
+            "{target} cannot confine writes to the worktree; this role runs with tool use under the project_root"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Whether `spawn_sprint` should wire the Browser DoD executor at all.
 ///
 /// BOTH conditions are required. `project_root` is required by settled user
@@ -187,10 +232,13 @@ fn role_system_hint(role: Role, goal: &str, project_root: Option<&Path>) -> Stri
     let mut hint = format!("You are the {role:?} of a crew building: {goal}");
     if let Some(root) = project_root {
         hint.push_str(&format!(
-            "\n\n공유 산출물·문서·이미지·디자인 토큰은 {}/.crew/artifacts 에서 주고받는다(하위 docs/ images/ design-tokens/ deliverables/). \
-             같은 파일을 동시에 편집하지 말고 역할별 파일로 분리하라. \
+            "\n\n공유 산출물·문서·이미지·디자인 토큰은 현재 디렉터리(역할 worktree) 기준 상대 경로 .crew/artifacts/{role_dir}/ 아래에 쓴다(하위 docs/ images/ design-tokens/ deliverables/). \
+             현재 디렉터리 밖이나 절대 경로에는 쓰지 않는다. \
+             다른 역할의 산출물은 스프린트가 끝나 메인 브랜치로 머지된 뒤에야 {root}/.crew/artifacts 에서 읽기 전용으로 볼 수 있다(그곳에는 쓰지 않는다). \
+             같은 파일을 동시에 편집하지 말고 역할별 파일로 분리하라 — 두 역할이 같은 파일을 쓰면 머지할 때마다 충돌한다. \
              프로젝트에 메인 체크아웃 쓰기를 차단하는 훅을 추가하지 말라.",
-            root.display()
+            role_dir = role_dir_name(role),
+            root = root.display()
         ));
     }
     hint
@@ -214,7 +262,7 @@ fn role_from_str(role: &str) -> Option<Role> {
 /// Canonical role order (contracts-m7.md §E1's `ROLE_ORDER`, mirrored here
 /// since `crew-run` has no access to `crew-lead::plan`'s private constant)
 /// — `crew_agents`' sort key.
-const ROLE_ORDER: [Role; 5] = [Role::Pm, Role::Designer, Role::Publisher, Role::Developer, Role::Qa];
+pub(crate) const ROLE_ORDER: [Role; 5] = [Role::Pm, Role::Designer, Role::Publisher, Role::Developer, Role::Qa];
 
 /// Non-lead roster slots with a recognized role, sorted into canonical role
 /// order (contracts-m7.md §E4 verbatim) — the vary-roster replacement for
@@ -324,6 +372,18 @@ struct SnapshotState {
     last_seq: i64,
 }
 
+/// One spawned worker's control-channel identity, handed back so the caller
+/// can attach a [`reap_controls_entry`] reaper once the shared
+/// [`LiveHandles`] exists (it does not yet when `spawn_sprint` runs — the
+/// struct needs this sprint's `lead_task` abort handle to be built at all).
+struct WorkerTask {
+    agent_id: String,
+    /// This worker's own sender — the same clone that went into `controls`,
+    /// so the reaper can prove the entry it is about to drop is still its own.
+    ctrl_tx: mpsc::Sender<AgentControl>,
+    task: JoinHandle<Result<(), RunnerError>>,
+}
+
 /// One sprint's just-spawned workers/lead (plan D1/D5/D6), plus this
 /// sprint's worker control-channel registry (t-swap plan D1/D2:
 /// `agent_id` -> the `mpsc::Sender` `AgentRunner::run_with_control` reads
@@ -332,6 +392,9 @@ struct SpawnedSprint {
     worker_aborts: Vec<AbortHandle>,
     lead_task: JoinHandle<Result<(), RunnerError>>,
     controls: HashMap<String, mpsc::Sender<AgentControl>>,
+    /// Every worker's `(agent_id, own sender, JoinHandle)`, in spawn order —
+    /// consumed by the caller to arm one reaper per worker.
+    worker_tasks: Vec<WorkerTask>,
     /// Every bus id this sprint registered, in connect order — the exact set
     /// the next sprint re-connects, so the sprint boundary knows what it
     /// must see unregistered before spawning again.
@@ -369,6 +432,7 @@ async fn spawn_sprint(
     let mut worker_aborts = Vec::new();
     let mut agent_ids: Vec<String> = Vec::new();
     let mut controls: HashMap<String, mpsc::Sender<AgentControl>> = HashMap::new();
+    let mut worker_tasks: Vec<WorkerTask> = Vec::new();
     // Vary-roster spawn/routing (contracts-m7.md §E4): `crew` replaces the
     // fixed `roles_all()` here and feeds `LeadBehavior`'s routing table
     // below, so both reflect exactly this roster's non-lead, recognized-role
@@ -394,7 +458,8 @@ async fn spawn_sprint(
                 let member = ScriptedCrewMember::new(agent_id, role, planted);
                 let task = tokio::spawn(AgentRunner::run_with_control(conn, member, ctrl_rx));
                 worker_aborts.push(task.abort_handle());
-                controls.insert(agent_id.to_string(), ctrl_tx);
+                controls.insert(agent_id.to_string(), ctrl_tx.clone());
+                worker_tasks.push(WorkerTask { agent_id: agent_id.to_string(), ctrl_tx, task });
             }
             RunMode::RealCli => {
                 let harness_id = harness_id_for(roster, agent_id);
@@ -407,10 +472,7 @@ async fn spawn_sprint(
                     );
                     continue;
                 };
-                let harness_cfg = HarnessAgentCfg {
-                    cwd: role_cli_cwd(role_worktrees, data_dir, role),
-                    model: None,
-                };
+                let harness_cfg = role_harness_cfg(role_worktrees, data_dir, role, &harness_id);
                 let system_hint = role_system_hint(role, goal, project_root);
                 // Permit is scoped to each CLI interaction (turn), not the
                 // runner's lifetime (contracts-m6.md §D2d) — a runner-
@@ -428,7 +490,8 @@ async fn spawn_sprint(
                 }
                 let task = tokio::spawn(AgentRunner::run_with_control(conn, behavior, ctrl_rx));
                 worker_aborts.push(task.abort_handle());
-                controls.insert(agent_id.to_string(), ctrl_tx);
+                controls.insert(agent_id.to_string(), ctrl_tx.clone());
+                worker_tasks.push(WorkerTask { agent_id: agent_id.to_string(), ctrl_tx, task });
             }
         }
     }
@@ -472,7 +535,7 @@ async fn spawn_sprint(
     // D6, pitfall 14) — lead swaps stay M5 boundary-only via `AgentRunner::run`.
     let lead_task = tokio::spawn(AgentRunner::run(lead_conn, observing));
 
-    Ok(SpawnedSprint { worker_aborts, lead_task, controls, agent_ids })
+    Ok(SpawnedSprint { worker_aborts, lead_task, controls, agent_ids, worker_tasks })
 }
 
 /// The abort handles for whichever sprint's workers/lead are currently
@@ -492,6 +555,66 @@ struct LiveHandles {
     /// runtime's cancellation instead of cleanly falling back to the
     /// sender-absent path (contracts-m6.md §D2b step 3's "sender 부재" case).
     controls: HashMap<String, mpsc::Sender<AgentControl>>,
+}
+
+/// Removes one worker's entry from [`LiveHandles::controls`] once that
+/// worker's own task has ended, whatever ended it — a return, an error
+/// return, or an abort — because a resolved `JoinHandle` covers all three.
+///
+/// Why per-worker, and not only the sprint-boundary batch `.controls.clear()`:
+/// that clear runs only after the *lead* task joins (the finisher's
+/// `(&mut current_lead_task).await`), and a worker's `ctrl_rx` can be gone
+/// long before then. Measured, under 8 concurrent `m5_swap` binaries: on a
+/// failing run a probe recorded `swap_harness`'s step-3 lookup finding the
+/// entry **present** while the very next `tx.send(ctrl)` **failed**, which
+/// `send_swap_control` reports only when the receiver is already dropped. So
+/// `controls` advertised a dead worker mid-sprint, and the run failed with
+/// `RunError::SwapIncomplete` — either `"worker control channel closed"` (the
+/// send itself failed) or `"worker dropped ack"` (the send landed in the
+/// buffer of a receiver dropped before draining it) — instead of taking §D2b
+/// step 3's sender-absent `Ok` fallback. The boundary clear stays where it
+/// is, because `abort()` is itself asynchronous and that clear is the only
+/// *synchronous* guarantee at the boundary.
+///
+/// Which exit path ends that worker early is deliberately NOT asserted here,
+/// and this reaper does not depend on it: it keys off `JoinHandle`
+/// resolution. What IS established by grep at this HEAD is only a negative —
+/// it is not the `is_done()` path. `is_done()` is a constant `false` in every
+/// behavior `crew-run` spawns as a worker (`crew-agent`'s crew_member.rs:163
+/// for `ScriptedCrewMember`, harness_behavior.rs:300 and :593 for
+/// `RoleHarnessBehavior`), so `AgentRunner::run_with_control`'s four
+/// `return Ok(())` sites (runner.rs:141/:178/:206/:216) are unreachable from
+/// here; what remains is the `?` on `conn.send` (:138/:175/:203/:213),
+/// `RunnerError::Fatal` (:183), `RunnerError::ConnectionClosed` (:187), and
+/// the boundary's own `abort()`. Naming which one fires is task t3b's first
+/// step, via a probe that logs the worker task's `Result`.
+///
+/// This narrows the window from "the rest of the sprint" to "the scheduling
+/// gap between the worker task ending and this reaper taking the mutex"; it
+/// does NOT close it, and cannot. The only authority on "this worker will
+/// never serve another control message" is the worker task itself, and it
+/// announces that by dropping `ctrl_rx` — an event `crew-run` can only
+/// observe after the fact. Fully closing it needs the worker side to drain
+/// and ack (or refuse) pending controls before it ends, in `crew-agent`
+/// (task t3b). Run-specific failure counts for this change live in that
+/// task's DoD evidence, not in this comment.
+///
+/// `own_tx` is this worker's own sender: the removal happens only while the
+/// registered entry is still the very channel this reaper armed, so a reaper
+/// from sprint N that is scheduled late can never evict the entry sprint N+1
+/// just registered for the same `agent_id`.
+async fn reap_controls_entry(
+    live: Arc<Mutex<LiveHandles>>,
+    agent_id: String,
+    own_tx: mpsc::Sender<AgentControl>,
+    task: JoinHandle<Result<(), RunnerError>>,
+) {
+    let _ = task.await;
+    let mut guard = live.lock().expect("live handles mutex poisoned");
+    let still_ours = matches!(guard.controls.get(&agent_id), Some(current) if current.same_channel(&own_tx));
+    if still_ours {
+        guard.controls.remove(&agent_id);
+    }
 }
 
 /// Drains the subscription loop's already-buffered bus-event backlog
@@ -675,6 +798,18 @@ pub struct RunController;
 
 impl RunController {
     pub async fn start(cfg: RunConfig) -> Result<RunHandle, RunError> {
+        Self::start_inner(cfg, None).await
+    }
+
+    /// `start` with the role worktrees placed under `worktrees_base` instead
+    /// of `~/.linkly-crew/projects/...` (t7 design D16) — a test seam so a
+    /// suite running the git flow never writes under the real `$HOME`.
+    #[doc(hidden)]
+    pub async fn start_with_worktrees_base(cfg: RunConfig, worktrees_base: PathBuf) -> Result<RunHandle, RunError> {
+        Self::start_inner(cfg, Some(worktrees_base)).await
+    }
+
+    async fn start_inner(cfg: RunConfig, worktrees_base_override: Option<PathBuf>) -> Result<RunHandle, RunError> {
         // Validated before anything else (M13 turn-recovery fix D4) — `0`
         // would make every turn instantly time out; a misconfiguration must
         // not silently become that.
@@ -711,6 +846,14 @@ impl RunController {
             }
         };
 
+        // Generated before the worktrees so the run lock can name this run.
+        let run_id = uuid::Uuid::new_v4().to_string();
+        // The per-project-root run lock (t7 design D21): taken after the
+        // root is validated and before any worktree is touched, released by
+        // the finisher right before RunFinished (or by shutdown). A later
+        // `?` in start drops the slot and so releases it.
+        let lock_slot: gitflow::LockSlot = Arc::new(Mutex::new(None));
+
         // Plan D1-D3 (HANDOFF pitfall 30): pre-create every canonical
         // role's out-of-repo worktree once, up front — role_cli_cwd (both
         // the agent CLI cwd and the Cmd DoD exec cwd call sites) then does
@@ -723,10 +866,27 @@ impl RunController {
             None => None,
             Some(root) => {
                 worktree::check_artifacts_not_ignored(root).map_err(RunError::ProjectRootInvalid)?;
-                let worktrees_base = worktree::project_worktrees_base(root);
+                let worktrees_base = worktrees_base_override
+                    .clone()
+                    .unwrap_or_else(|| worktree::project_worktrees_base(root));
+                std::fs::create_dir_all(&worktrees_base).map_err(|e| {
+                    RunError::ProjectRootInvalid(format!("cannot create {}: {e}", worktrees_base.display()))
+                })?;
+                let lock = gitflow::RunLock::acquire(&worktrees_base.join(".crew-run.lock"), &run_id)
+                    .map_err(RunError::ProjectRootInvalid)?;
+                *lock_slot.lock().expect("lock slot mutex poisoned") = Some(lock);
                 Some(resolve_role_worktrees(root, &worktrees_base).map_err(RunError::ProjectRootInvalid)?)
             }
         };
+        let has_role_worktrees = role_worktrees.is_some();
+        // None — and so no git command for the whole run — unless both are
+        // present (t7 design D12).
+        let gitflow: Option<Arc<GitFlowCtx>> = GitFlowCtx::for_run(
+            project_root.as_deref(),
+            role_worktrees.as_deref(),
+            browser_wiring_enabled(project_root.as_deref(), cfg.browser_binary.as_deref()),
+        )
+        .map(Arc::new);
 
         // Validated before any spec/dag/ledger/spawn work (contracts-m7.md
         // §E4 plan D5) — a rejected roster leaves zero partial run state.
@@ -787,7 +947,6 @@ impl RunController {
         let sprints = SprintSlicer::slice(&dag, effective_max)?;
         let full_order: Vec<String> = sprints.iter().flatten().cloned().collect();
 
-        let run_id = uuid::Uuid::new_v4().to_string();
         let token = uuid::Uuid::new_v4().to_string();
 
         // Created together with its "genesis" receiver, which never misses
@@ -893,7 +1052,7 @@ impl RunController {
             ts: now_ts(),
         });
         let roster_snapshot0 = roster.lock().expect("roster mutex poisoned").clone();
-        let spawned0 = spawn_sprint(
+        let mut spawned0 = spawn_sprint(
             &url,
             &token,
             &cfg.mode,
@@ -919,6 +1078,16 @@ impl RunController {
             lead_abort: spawned0.lead_task.abort_handle(),
             controls: spawned0.controls.clone(),
         }));
+        // One reaper per worker, armed the moment `live` exists: each
+        // `controls` entry now lives exactly as long as its worker's task.
+        for worker in std::mem::take(&mut spawned0.worker_tasks) {
+            tokio::spawn(reap_controls_entry(
+                live.clone(),
+                worker.agent_id,
+                worker.ctrl_tx,
+                worker.task,
+            ));
+        }
 
         // Controller is the single `RunEvent` emission point (plan D4):
         // `ObservingLead` only sends to the relay's mpsc channel, never
@@ -935,7 +1104,15 @@ impl RunController {
         let escalation_timeout_ms = cfg.escalation_timeout_ms;
         let finisher_live = live.clone();
         let finisher_shared_summaries = shared_summaries.clone();
+        let finisher_gitflow = gitflow.clone();
+        let finisher_lock_slot = lock_slot.clone();
         let finisher: JoinHandle<RunOutcomeDto> = tokio::spawn(async move {
+            // Releases the run lock if anything below panics (t7 design D21).
+            let _lock_release = gitflow::LockRelease(finisher_lock_slot.clone());
+            // Commit/merge phase results folded across sprints (D10).
+            let mut git_failures: usize = 0;
+            let mut merged_any = false;
+            let mut not_landed: Option<String> = None;
             let mut current_worker_aborts = spawned0.worker_aborts;
             let mut current_lead_task = spawned0.lead_task;
             let mut current_agent_ids = spawned0.agent_ids;
@@ -976,14 +1153,32 @@ impl RunController {
                     .await
                     {
                         Ok(spawned) => {
+                            let SpawnedSprint {
+                                worker_aborts,
+                                lead_task,
+                                controls,
+                                agent_ids,
+                                worker_tasks,
+                            } = spawned;
                             *finisher_live.lock().expect("live handles mutex poisoned") = LiveHandles {
-                                worker_aborts: spawned.worker_aborts.clone(),
-                                lead_abort: spawned.lead_task.abort_handle(),
-                                controls: spawned.controls,
+                                worker_aborts: worker_aborts.clone(),
+                                lead_abort: lead_task.abort_handle(),
+                                controls,
                             };
-                            current_worker_aborts = spawned.worker_aborts;
-                            current_lead_task = spawned.lead_task;
-                            current_agent_ids = spawned.agent_ids;
+                            // Arm this sprint's reapers only after its map is
+                            // installed, so each one is matched against the
+                            // entry it actually registered.
+                            for worker in worker_tasks {
+                                tokio::spawn(reap_controls_entry(
+                                    finisher_live.clone(),
+                                    worker.agent_id,
+                                    worker.ctrl_tx,
+                                    worker.task,
+                                ));
+                            }
+                            current_worker_aborts = worker_aborts;
+                            current_lead_task = lead_task;
+                            current_agent_ids = agent_ids;
                         }
                         Err(err) => {
                             tracing::error!(error = %err, index, "failed to spawn sprint; ending run early");
@@ -1058,6 +1253,44 @@ impl RunController {
                 });
 
                 let sprint_ok = matches!(lead_result, Ok(Ok(())));
+                // Commit each accepted task, then merge the sprint (t7 design
+                // D2/D19): the lead resolved and its workers were aborted
+                // above, so every role worktree is settled.
+                if let Some(ctx) = &finisher_gitflow {
+                    let accepted: Vec<TaskSpec> = sprint_tasks
+                        .iter()
+                        .filter(|id| states_snapshot.get(*id) == Some(&TaskState::Accepted))
+                        .filter_map(|id| dag.tasks.iter().find(|t| &t.id == id).cloned())
+                        .collect();
+                    let guard = ctx.phase.clone().lock_owned().await;
+                    let (phase_ctx, phase_tx, sprint_index) = (ctx.clone(), finisher_run_tx.clone(), index as u32);
+                    let phase = tokio::task::spawn_blocking(move || {
+                        let _guard = guard;
+                        let commit_failures = accepted.iter().filter(|task| phase_ctx.commit_accepted(task, &phase_tx)).count();
+                        (commit_failures, phase_ctx.merge_sprint(sprint_index, sprint_ok, &phase_tx))
+                    })
+                    .await;
+                    match phase {
+                        Ok((commit_failures, report)) => {
+                            git_failures += commit_failures + report.failures;
+                            merged_any |= report.merged_any;
+                            if not_landed.is_none() {
+                                not_landed = report.not_landed;
+                            }
+                        }
+                        Err(e) => {
+                            git_failures += 1;
+                            let _ = finisher_run_tx.send(gitflow::event(
+                                GitFlowKindDto::Error,
+                                None,
+                                None,
+                                None,
+                                None,
+                                format!("sprint {index} git phase did not finish: {e}"),
+                            ));
+                        }
+                    }
+                }
                 if !sprint_ok {
                     outcome = RunOutcomeDto::Failed;
                     break;
@@ -1072,6 +1305,47 @@ impl RunController {
             // before `RunFinished`.
             drop(ts_tx);
             let _ = relay_task.await;
+
+            // End of run (t7 design D8/D10): the Completed gate, then the
+            // guarded push — both only with a project_root.
+            if let Some(ctx) = &finisher_gitflow {
+                if outcome == RunOutcomeDto::Completed {
+                    let states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
+                    let mut causes = Vec::new();
+                    if !gitflow::completed_gate_met(&dag, &states, ctx.browser_wired()) {
+                        causes.push("no accepted task carried an executed cmd or browser DoD check".to_string());
+                    }
+                    if git_failures > 0 {
+                        causes.push(format!("git flow reported {git_failures} conflict/error event(s)"));
+                    }
+                    if let Some(reason) = &not_landed {
+                        let main = ctx.main_branch().unwrap_or("the main branch");
+                        causes.push(format!("crew work committed on role branches did not land on {main}: {reason}"));
+                    }
+                    if !causes.is_empty() {
+                        outcome = RunOutcomeDto::Failed;
+                        let _ = finisher_run_tx.send(gitflow::event(GitFlowKindDto::Gate, None, None, None, None, causes.join("; ")));
+                    }
+                }
+                let guard = ctx.phase.clone().lock_owned().await;
+                let (phase_ctx, phase_tx) = (ctx.clone(), finisher_run_tx.clone());
+                let run_completed = outcome == RunOutcomeDto::Completed;
+                let pushed = tokio::task::spawn_blocking(move || {
+                    let _guard = guard;
+                    phase_ctx.push_main(run_completed, merged_any, &phase_tx);
+                })
+                .await;
+                if let Err(e) = pushed {
+                    let _ = finisher_run_tx.send(gitflow::event(
+                        GitFlowKindDto::Error,
+                        None,
+                        None,
+                        None,
+                        None,
+                        format!("push phase did not finish: {e}"),
+                    ));
+                }
+            }
 
             // Run has ended (plan D1: "런 종료(join/shutdown) 경로에서
             // abort") — signal the human proxy to stop *gracefully* (never
@@ -1098,6 +1372,9 @@ impl RunController {
             // trusting the drain alone.
             wait_for_bus_lifecycle(&mut human_unregister_rx, "Unregistered", "agent:human", HUMAN_UNREGISTER_TIMEOUT).await;
 
+            // Every git phase has returned: free the root before RunFinished,
+            // so a finished handle the app keeps never blocks the next run.
+            gitflow::release(&finisher_lock_slot);
             let _ = finisher_run_tx.send(RunEvent::RunFinished {
                 outcome,
                 ts: now_ts(),
@@ -1121,6 +1398,9 @@ impl RunController {
             summaries: summaries_for_handle,
             human_abort,
             gate_tx,
+            gitflow,
+            lock_slot,
+            has_role_worktrees,
         })
     }
 }
@@ -1345,6 +1625,14 @@ pub struct RunHandle {
     /// Sends `resolve_gate` requests to the human proxy task (plan D2) — a
     /// closed receiver (proxy ended) surfaces as `RunError::GateUnavailable`.
     gate_tx: mpsc::Sender<GateCmd>,
+    /// The run's git flow (t7 design D12/D23): its phase mutex and command
+    /// counter; `None` without a project_root.
+    gitflow: Option<Arc<GitFlowCtx>>,
+    /// The run lock's slot (D21) — empty once the finisher released it.
+    lock_slot: gitflow::LockSlot,
+    /// Whether the run has per-role worktrees (`project_root` set) — the
+    /// `swap_harness` side of `harness_gets_tool_use`.
+    has_role_worktrees: bool,
 }
 
 /// One control-channel swap attempt against a specific worker's sender —
@@ -1473,18 +1761,26 @@ impl RunHandle {
     /// steps 1-2's effects are **not** rolled back when that happens; the
     /// same boundary fallback still applies.
     pub async fn swap_harness(&self, agent_id: &str, harness: &str) -> Result<(), RunError> {
-        {
+        let (current_harness, current_role) = {
             let roster = self.roster.lock().expect("roster mutex poisoned");
-            if !roster.agents.iter().any(|a| a.id == agent_id) {
-                return Err(RunError::SwapRejected(format!("unknown agent id: {agent_id}")));
+            match roster.agents.iter().find(|a| a.id == agent_id) {
+                Some(slot) => (slot.harness.clone(), slot.role.clone()),
+                None => return Err(RunError::SwapRejected(format!("unknown agent id: {agent_id}"))),
             }
-        }
+        };
         // D8: keep the built `Arc<dyn Harness>` for step 3 — `make` is only
         // ever called once per swap.
         let harness_arc = match HarnessRegistry::make(harness) {
             Some(h) => h,
             None => return Err(RunError::SwapRejected(format!("unknown harness id: {harness}"))),
         };
+        // Integration review F1 r2: refused before any mutation, so the live
+        // worker keeps its current session. The lead slot never has tool use.
+        if role_from_str(&current_role).is_some() {
+            if let Some(reason) = swap_tool_use_refusal(self.has_role_worktrees, &current_harness, harness) {
+                return Err(RunError::SwapRejected(reason));
+            }
+        }
 
         let (old_harness, role_str) = {
             let mut roster = self.roster.lock().expect("roster mutex poisoned");
@@ -1639,6 +1935,15 @@ impl RunHandle {
     /// sprint boundary, so a single fixed set of handles captured at
     /// `start()` time could no longer describe "what's currently running").
     pub async fn shutdown(self) {
+        self.abort_all();
+        self.bus.shutdown().await;
+    }
+
+    /// `shutdown`'s aborts, shared with `shutdown_and_wait`.
+    fn abort_all(&self) {
+        if let Some(ctx) = &self.gitflow {
+            ctx.cancel();
+        }
         if let Some(finisher) = &self.finisher {
             finisher.abort();
         }
@@ -1652,7 +1957,42 @@ impl RunHandle {
         self.sub_task.abort();
         self.relay_abort.abort();
         self.human_abort.abort();
-        self.bus.shutdown().await;
+        // The run lock is released only after an in-flight git phase ends
+        // (t7 design D19/D21): that phase is a blocking task the aborts above
+        // cannot stop, and the next run on this root must not overlap it.
+        match &self.gitflow {
+            Some(ctx) => gitflow::release_after_phase(ctx.phase.clone(), self.lock_slot.clone()),
+            None => gitflow::release(&self.lock_slot),
+        }
+    }
+
+    /// `shutdown`, then waits (bounded by `SETTLE_TIMEOUT`) until nothing of
+    /// this run still touches the filesystem: the finisher, the subscription
+    /// task and any in-flight git phase (t7 design D23). A test seam: suites
+    /// remove their scratch repos right after it returns.
+    #[doc(hidden)]
+    pub async fn shutdown_and_wait(self) {
+        self.abort_all();
+        let RunHandle { finisher, sub_task, bus, gitflow, lock_slot, .. } = self;
+        bus.shutdown().await;
+        let _ = tokio::time::timeout(gitflow::SETTLE_TIMEOUT, async {
+            if let Some(finisher) = finisher {
+                let _ = finisher.await;
+            }
+            let _ = sub_task.await;
+            if let Some(ctx) = &gitflow {
+                let _phase = ctx.phase.lock().await;
+            }
+        })
+        .await;
+        gitflow::release(&lock_slot);
+    }
+
+    /// How many git commands this run's flow issued — 0 without a
+    /// project_root (t7 design D12). A test seam.
+    #[doc(hidden)]
+    pub fn git_commands_issued(&self) -> usize {
+        self.gitflow.as_ref().map_or(0, |ctx| ctx.git_calls())
     }
 }
 
@@ -1730,6 +2070,168 @@ mod send_swap_control_tests {
 }
 
 #[cfg(test)]
+mod controls_reaper_tests {
+    //! Deterministic coverage for [`reap_controls_entry`] — the per-worker
+    //! `LiveHandles.controls` lifecycle: a worker whose own task had already
+    //! ended stayed advertised in `controls` until the sprint-boundary batch
+    //! clear, so `RunHandle::swap_harness` reached a dead channel and returned
+    //! `RunError::SwapIncomplete` instead of §D2b step 3's sender-absent `Ok`
+    //! fallback. These pin the lifecycle invariant itself, which is
+    //! deterministic, rather than the residual timing window the reaper
+    //! narrows but cannot close (see [`reap_controls_entry`]'s own note).
+    //!
+    //! These read the real `LiveHandles.controls` map at the critical moment
+    //! rather than any narration the code emits, and each was watched RED
+    //! under a mutation of the reaper body before being trusted
+    //! (wiki/testing/quality/narration-based-ordering-assertions.md step 2).
+
+    use super::*;
+
+    fn fake_harness() -> Arc<dyn Harness> {
+        Arc::new(crew_harness::claude::ClaudeCodeHarness::with_binary("/bin/false"))
+    }
+
+    /// A `LiveHandles` holding exactly `entries`. `lead_abort` is a real
+    /// abort handle for a trivial task — the field is never read here.
+    fn live_with(entries: Vec<(&str, mpsc::Sender<AgentControl>)>) -> Arc<Mutex<LiveHandles>> {
+        let lead_abort = tokio::spawn(async {}).abort_handle();
+        let mut controls: HashMap<String, mpsc::Sender<AgentControl>> = HashMap::new();
+        for (agent_id, tx) in entries {
+            controls.insert(agent_id.to_string(), tx);
+        }
+        Arc::new(Mutex::new(LiveHandles { worker_aborts: Vec::new(), lead_abort, controls }))
+    }
+
+    fn registered(live: &Arc<Mutex<LiveHandles>>) -> Vec<String> {
+        let guard = live.lock().expect("live handles mutex poisoned");
+        let mut keys: Vec<String> = guard.controls.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    fn registered_sender(live: &Arc<Mutex<LiveHandles>>, agent_id: &str) -> Option<mpsc::Sender<AgentControl>> {
+        let guard = live.lock().expect("live handles mutex poisoned");
+        guard.controls.get(agent_id).cloned()
+    }
+
+    /// A worker task that has already ended: it owns `ctrl_rx` and drops it
+    /// on the way out. That is the only property the reaper keys off — which
+    /// arm of `AgentRunner::run_with_control` ended the real worker is not
+    /// asserted here (see [`reap_controls_entry`]).
+    fn finished_worker(rx: mpsc::Receiver<AgentControl>) -> JoinHandle<Result<(), RunnerError>> {
+        tokio::spawn(async move {
+            drop(rx);
+            Ok::<(), RunnerError>(())
+        })
+    }
+
+    /// Error/regression case (the flake): once a worker's own task has ended,
+    /// its control entry must be gone, so `swap_harness` takes the
+    /// sender-absent `Ok` fallback instead of sending into a dead channel.
+    /// RED before the reaper removed anything; GREEN after.
+    #[tokio::test]
+    async fn a_finished_workers_control_entry_is_removed_when_its_task_ends() {
+        let (tx, rx) = mpsc::channel::<AgentControl>(4);
+        let live = live_with(vec![("agent:designer", tx.clone())]);
+        let task = finished_worker(rx);
+
+        reap_controls_entry(live.clone(), "agent:designer".to_string(), tx, task).await;
+
+        assert_eq!(
+            registered(&live),
+            Vec::<String>::new(),
+            "a worker whose task has ended must not stay advertised in LiveHandles.controls"
+        );
+    }
+
+    /// Normal case: a worker that is still running keeps its entry, and that
+    /// entry is a genuinely reachable control channel — the reaper must not
+    /// evict a live worker.
+    #[tokio::test]
+    async fn a_still_running_workers_entry_stays_registered_and_reachable() {
+        let (tx, mut rx) = mpsc::channel::<AgentControl>(4);
+        let live = live_with(vec![("agent:designer", tx.clone())]);
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let task: JoinHandle<Result<(), RunnerError>> = tokio::spawn(async move {
+            if let Some(AgentControl::Swap { ack, harness_id, .. }) = rx.recv().await {
+                let _ = ack.send(Ok(HandoffSnapshot {
+                    harness: harness_id,
+                    session_id: "s-live".to_string(),
+                    notes: "still working".to_string(),
+                }));
+            }
+            let _ = release_rx.await;
+            Ok(())
+        });
+        let reaper = tokio::spawn(reap_controls_entry(
+            live.clone(),
+            "agent:designer".to_string(),
+            tx,
+            task,
+        ));
+
+        let sender = registered_sender(&live, "agent:designer")
+            .expect("a worker whose task is still running must stay registered");
+        let snapshot = send_swap_control(&sender, fake_harness(), "claude-code".to_string(), "ctx".to_string())
+            .await
+            .expect("a live worker's registered sender must complete the control round-trip");
+        assert_eq!(snapshot.session_id, "s-live");
+
+        let _ = release_tx.send(());
+        reaper.await.expect("the reaper task must not panic");
+    }
+
+    /// Boundary case: a reaper scheduled late must not evict the entry the
+    /// *next* sprint registered for the same `agent_id` — the whole point of
+    /// matching on the channel identity rather than the key alone.
+    #[tokio::test]
+    async fn a_late_reaper_leaves_the_next_sprints_entry_for_the_same_agent_id_alone() {
+        let (old_tx, old_rx) = mpsc::channel::<AgentControl>(4);
+        let (new_tx, _new_rx) = mpsc::channel::<AgentControl>(4);
+        let live = live_with(vec![("agent:designer", old_tx.clone())]);
+        let task = finished_worker(old_rx);
+        {
+            let mut guard = live.lock().expect("live handles mutex poisoned");
+            guard.controls.insert("agent:designer".to_string(), new_tx.clone());
+        }
+
+        reap_controls_entry(live.clone(), "agent:designer".to_string(), old_tx, task).await;
+
+        let survivor = registered_sender(&live, "agent:designer")
+            .expect("the re-registered live entry must survive the previous sprint's reaper");
+        assert!(
+            survivor.same_channel(&new_tx),
+            "the surviving entry must still be the NEW sprint's channel, not a resurrected old one"
+        );
+    }
+
+    /// Boundary case: the sprint-boundary batch clear (this function's
+    /// co-worker, which stays because `abort()` is asynchronous) can empty the
+    /// map first. A reaper that finds its entry already gone must be a no-op,
+    /// not a panic and not a removal of somebody else's key.
+    #[tokio::test]
+    async fn a_reaper_whose_entry_was_already_cleared_is_a_no_op() {
+        let (qa_tx, qa_rx) = mpsc::channel::<AgentControl>(4);
+        let (pm_tx, _pm_rx) = mpsc::channel::<AgentControl>(4);
+        let live = live_with(vec![("agent:qa", qa_tx.clone())]);
+        let task = finished_worker(qa_rx);
+        {
+            let mut guard = live.lock().expect("live handles mutex poisoned");
+            guard.controls.clear();
+            guard.controls.insert("agent:pm".to_string(), pm_tx);
+        }
+
+        reap_controls_entry(live.clone(), "agent:qa".to_string(), qa_tx, task).await;
+
+        assert_eq!(
+            registered(&live),
+            vec!["agent:pm".to_string()],
+            "a reaper whose own entry is already gone must leave every other entry untouched"
+        );
+    }
+}
+
+#[cfg(test)]
 mod live_controls_wiring_tests {
     //! White-box coverage (test-quality-auditor finding on this task): the
     //! integration-level "mid-sprint swap reaches the live worker" test in
@@ -1775,6 +2277,101 @@ mod live_controls_wiring_tests {
             .join(format!("{label}-{}", uuid::Uuid::new_v4()))
     }
 
+    /// Owns one test's data directory and removes it when the test ends —
+    /// pass OR panic (auditor r2: a panicking test skips a trailing
+    /// `remove_dir_all`, and `.crew-test/` is not covered by any ignore rule,
+    /// so the leftover `ledger.sqlite` shows up as untracked). `Drop` removes
+    /// exactly the one path this guard owns; never a glob, never its parent.
+    ///
+    /// `Drop` alone is the panic-safety net, not the primary teardown: it is
+    /// synchronous, so it cannot wait for the run's tasks, and a task that is
+    /// merely *aborted* gets one more poll in which `role_cli_cwd`'s
+    /// `create_dir_all` (controller.rs:142) can re-create the path right after
+    /// the removal. Measured before the fix below: 1 of 3 full
+    /// `cargo test -p crew-run` runs left `live-controls-reaper-finisher-<uuid>`
+    /// behind. The deterministic path is [`shutdown_and_settle`]; every test
+    /// here calls it, and `Drop` only has work left to do on a panic.
+    struct TestDataDir(std::path::PathBuf);
+
+    impl TestDataDir {
+        fn new(label: &str) -> Self {
+            Self(test_data_dir(label))
+        }
+
+        fn to_path_buf(&self) -> std::path::PathBuf {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for TestDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Shuts a run down and does not return until its data directory is gone
+    /// and stays gone (auditor r3).
+    ///
+    /// Every test here calls this on the ONLY path out of its body, and none of
+    /// them panics while a run is still live: each observes into a value, tears
+    /// down, and asserts afterwards (auditor r3 round 2 — a test that panicked
+    /// mid-body skipped this entirely and fell back to `TestDataDir`'s `Drop`,
+    /// which is racy by construction, and the directory reappeared in 2/3 and
+    /// 3/3 of the auditor's mutation runs). The only panics left ahead of a
+    /// teardown are `RunController::start`'s own `expect` — where the run never
+    /// started, so no background task exists to re-create anything — and a
+    /// poisoned `LiveHandles` mutex, which already means another task panicked.
+    /// Nothing else indexes or unwraps while a run is live: the `worker_aborts`
+    /// lookups go through `.get()` and report an index/alignment mismatch as an
+    /// observation error rather than an index panic (auditor r3 second pass
+    /// named that site; `spawn_sprint` keeps the vector aligned with
+    /// `crew_agents`, so this is a guard, not an expected path).
+    ///
+    /// `RunHandle::shutdown` aborts every task but awaits only the bus, so the
+    /// finisher and the subscription loop are merely *asked* to stop. Both can
+    /// still be polled afterwards — the finisher through `spawn_sprint`, which
+    /// reaches `role_cli_cwd`'s `create_dir_all`, and the ledger through the
+    /// subscription loop — which is how an emptied directory reappeared after
+    /// the guard had removed it. So this takes those two `JoinHandle`s out of
+    /// the handle, aborts them, lets `shutdown` abort the rest, and then JOINS
+    /// them: once both have resolved, neither can touch the path again.
+    ///
+    /// The lead and the per-worker tasks expose only `AbortHandle`s
+    /// (`LiveHandles`), so they cannot be joined from here; that is what the
+    /// bounded loop is for. It is cooperative (`yield_now`) and never sleeps:
+    /// each turn removes the directory, yields so any task still being
+    /// cancelled takes its final poll, and only returns once the path is still
+    /// absent after that yield.
+    async fn shutdown_and_settle(mut handle: RunHandle, data_dir: &TestDataDir) {
+        let finisher = handle.finisher.take();
+        let sub_task = std::mem::replace(&mut handle.sub_task, tokio::spawn(async {}));
+        if let Some(task) = &finisher {
+            task.abort();
+        }
+        sub_task.abort();
+
+        // Aborts the rest — workers, lead, relay, human proxy — and awaits the bus.
+        RunHandle::shutdown(handle).await;
+
+        if let Some(task) = finisher {
+            let _ = task.await;
+        }
+        let _ = sub_task.await;
+
+        let path = data_dir.to_path_buf();
+        tokio::time::timeout(JOIN_TIMEOUT, async {
+            loop {
+                let _ = std::fs::remove_dir_all(&path);
+                tokio::task::yield_now().await;
+                if !path.exists() {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the run's data directory must stop being re-created once its tasks are joined: {path:?}"))
+    }
+
     /// Default (D5, contracts-m10.md §H1h.3): the existing helper's
     /// `RunConfig` carries no cmd DoD checks unless a test opts in.
     #[test]
@@ -1790,8 +2387,8 @@ mod live_controls_wiring_tests {
     /// `roles_all()` and the roster.
     #[tokio::test(flavor = "multi_thread")]
     async fn every_non_lead_role_is_registered_in_live_controls_lead_is_not() {
-        let data_dir = test_data_dir("live-controls-wiring");
-        let handle = RunController::start(scripted_config(data_dir.clone()))
+        let data_dir = TestDataDir::new("live-controls-wiring");
+        let handle = RunController::start(scripted_config(data_dir.to_path_buf()))
             .await
             .expect("start must succeed");
 
@@ -1800,6 +2397,8 @@ mod live_controls_wiring_tests {
             live.controls.keys().cloned().collect()
         };
 
+        shutdown_and_settle(handle, &data_dir).await;
+
         for id in ["agent:pm", "agent:designer", "agent:publisher", "agent:developer", "agent:qa"] {
             assert!(registered.contains(id), "{id} must be registered in live controls: {registered:?}");
         }
@@ -1807,9 +2406,6 @@ mod live_controls_wiring_tests {
             !registered.contains("agent:lead"),
             "the lead slot must never be registered (§D2a): {registered:?}"
         );
-
-        handle.shutdown().await;
-        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1824,34 +2420,346 @@ mod live_controls_wiring_tests {
     /// wrongly see `Ok(())` and fail.
     #[tokio::test(flavor = "multi_thread")]
     async fn swap_harness_uses_a_present_sender_and_reports_incomplete_when_it_is_dead() {
-        let data_dir = test_data_dir("live-controls-dead-sender");
-        let mut handle = RunController::start(scripted_config(data_dir.clone()))
+        let data_dir = TestDataDir::new("live-controls-dead-sender");
+        let mut handle = RunController::start(scripted_config(data_dir.to_path_buf()))
             .await
             .expect("start must succeed");
 
-        // The finisher clears `controls` at every sprint boundary; waiting
-        // for it to finish first keeps that clear from wiping the dead
-        // sender inserted below (issue #19).
-        tokio::time::timeout(JOIN_TIMEOUT, handle.join())
-            .await
-            .expect("join must finish within the deterministic budget")
-            .expect("lead runner must complete cleanly");
+        // Observation phase — returns instead of panicking, so the teardown
+        // below is reached on every path.
+        let observed: Result<Result<(), RunError>, String> = async {
+            // The finisher clears `controls` at every sprint boundary; waiting
+            // for it to finish first keeps that clear from wiping the dead
+            // sender inserted below (issue #19).
+            tokio::time::timeout(JOIN_TIMEOUT, handle.join())
+                .await
+                .map_err(|_| "join must finish within the deterministic budget".to_string())?
+                .map_err(|e| format!("lead runner must complete cleanly: {e}"))?;
 
-        {
-            let (dead_tx, dead_rx) = mpsc::channel::<AgentControl>(4);
-            drop(dead_rx);
-            let mut live = handle.live.lock().expect("live handles mutex poisoned");
-            live.controls.insert("agent:designer".to_string(), dead_tx);
+            {
+                let (dead_tx, dead_rx) = mpsc::channel::<AgentControl>(4);
+                drop(dead_rx);
+                let mut live = handle.live.lock().expect("live handles mutex poisoned");
+                live.controls.insert("agent:designer".to_string(), dead_tx);
+            }
+
+            Ok(handle.swap_harness("agent:designer", "opencode").await)
         }
+        .await;
 
-        let result = handle.swap_harness("agent:designer", "opencode").await;
+        shutdown_and_settle(handle, &data_dir).await;
+
+        let result = observed.unwrap_or_else(|e| panic!("{e}"));
         assert!(
             matches!(result, Err(RunError::SwapIncomplete(_))),
             "a present-but-dead sender must produce SwapIncomplete, not the sender-absent Ok fallback: {result:?}"
         );
+    }
 
-        handle.shutdown().await;
-        let _ = std::fs::remove_dir_all(&data_dir);
+    /// The escalation park (m7_gate.rs's fixture, contracts-m7.md §E5): a
+    /// planted Designer violation with `max_rework = 0` escalates `t-design`
+    /// on its first attempt, and `escalation_timeout_ms = 0` disables
+    /// `LeadBehavior`'s tick branch (crew-lead/src/dispatch.rs:576), so
+    /// nothing except `resolve_gate` can un-park the run. That holds the lead
+    /// task open, and the finisher's sprint-boundary `.controls.clear()` runs
+    /// only after the lead task joins — so for the whole of the test below,
+    /// the batch clear provably cannot fire. No sleep, no retry, no raised
+    /// timeout: the park is a state of the run, not a delay.
+    fn escalating_config(data_dir: std::path::PathBuf) -> RunConfig {
+        RunConfig {
+            mode: RunMode::Scripted {
+                planted_violations: vec![(Role::Designer, vec!["REQ-2".to_string()])],
+            },
+            max_rework: 0,
+            ..scripted_config(data_dir)
+        }
+    }
+
+    fn registered_keys(handle: &RunHandle) -> std::collections::HashSet<String> {
+        let live = handle.live.lock().expect("live handles mutex poisoned");
+        live.controls.keys().cloned().collect()
+    }
+
+    fn registered_sender(handle: &RunHandle, agent_id: &str) -> Option<mpsc::Sender<AgentControl>> {
+        let live = handle.live.lock().expect("live handles mutex poisoned");
+        live.controls.get(agent_id).cloned()
+    }
+
+    /// Waits (bounded) for one `TaskStateChanged`, the signal both wiring
+    /// tests use to know the run has reached its escalation park.
+    ///
+    /// Returns an error instead of panicking, so a caller can still reach its
+    /// teardown before reporting the failure (see the module note on why no
+    /// wiring test panics while a run is still live).
+    async fn wait_for_task_state(
+        rx: &mut broadcast::Receiver<RunEvent>,
+        task_id: &str,
+        state: TaskStateDto,
+    ) -> Result<(), String> {
+        tokio::time::timeout(JOIN_TIMEOUT, async {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        let matched = matches!(
+                            &ev,
+                            RunEvent::TaskStateChanged { task_id: t, state: s, .. }
+                                if t == task_id && *s == state
+                        );
+                        if matched {
+                            return Ok(());
+                        }
+                    }
+                    Err(err) => return Err(format!("the run's event stream closed or lagged: {err}")),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(format!("{task_id} must reach {state:?} within the deterministic budget")))
+    }
+
+    /// (c) Production wiring, SPRINT 0's arming site only (review r1 F2,
+    /// scope narrowed per auditor r2). [`reap_controls_entry`] has exactly two
+    /// production call sites, and this test covers the first one:
+    /// `RunController::start`'s loop, which arms reapers for sprint 0's
+    /// workers. Mutating that site to `drop((` makes this test RED; the
+    /// finisher's next-sprint site is NOT exercised here, because
+    /// `max_per_sprint = 0` keeps the whole run in sprint 0 — see
+    /// `the_finishers_next_sprint_install_arms_reapers_for_that_sprints_workers`
+    /// for that one. `controls_reaper_tests` stays GREEN under either
+    /// mutation, since those call the helper directly.
+    ///
+    /// The run is parked at `t-design`'s unresolved escalation, so the
+    /// sprint-0 boundary `.controls.clear()` cannot run and a reaper is the
+    /// only thing that can remove the aborted worker's key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_spawn_path_arms_a_reaper_that_removes_one_ended_workers_entry_mid_sprint() {
+        let data_dir = TestDataDir::new("live-controls-reaper-wiring");
+        let handle = RunController::start(escalating_config(data_dir.to_path_buf()))
+            .await
+            .expect("start must succeed");
+        let mut rx = handle.subscribe();
+        const VICTIM: &str = "agent:qa";
+
+        // Observation phase — returns instead of panicking, so the teardown
+        // below is reached on every path.
+        type Observed = (std::collections::HashSet<String>, std::collections::HashSet<String>);
+        let observed: Result<Observed, String> = async {
+            wait_for_task_state(&mut rx, "t-design", TaskStateDto::Escalated).await?;
+
+            // `spawn_sprint` pushes `worker_aborts` inside the same
+            // `for (agent_id, role) in &crew` loop that inserts each `controls`
+            // entry, so index `i` is `crew[i]`'s worker. If that alignment ever
+            // breaks, the wrong worker is aborted, `VICTIM` stays registered and
+            // the bounded wait below fails loudly — it cannot pass vacuously.
+            let crew = crew_agents(&default_roster());
+            let victim_index = crew
+                .iter()
+                .position(|(id, _)| id == VICTIM)
+                .ok_or_else(|| "the default roster must carry the QA slot".to_string())?;
+
+            let before = registered_keys(&handle);
+            {
+                let live = handle.live.lock().expect("live handles mutex poisoned");
+                live.worker_aborts
+                    .get(victim_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "worker_aborts must be index-aligned with crew_agents: no entry {victim_index} in {} handles",
+                            live.worker_aborts.len()
+                        )
+                    })?
+                    .abort();
+            }
+
+            // Bounded and cooperative — `yield_now`, never a sleep: the reaper
+            // removes the key once the aborted `JoinHandle` resolves.
+            let after = tokio::time::timeout(JOIN_TIMEOUT, async {
+                loop {
+                    let keys = registered_keys(&handle);
+                    if !keys.contains(VICTIM) {
+                        return keys;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                "a reaper armed by the spawn path must remove an ended worker's control entry mid-sprint"
+                    .to_string()
+            })?;
+
+            Ok((before, after))
+        }
+        .await;
+
+        shutdown_and_settle(handle, &data_dir).await;
+
+        let (before, after) = observed.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            before.contains(VICTIM) && before.len() >= 2,
+            "the parked run must still advertise {VICTIM} plus at least one other worker: {before:?}"
+        );
+        assert!(
+            !after.is_empty(),
+            "removal must be per-worker: an emptied map would mean the sprint-boundary batch clear ran, \
+             which the unresolved escalation makes unreachable here: {after:?}"
+        );
+        assert!(
+            after.iter().all(|id| before.contains(id)),
+            "a reaper only removes its own key and must never add one: {after:?} vs {before:?}"
+        );
+    }
+
+    /// (d) Production wiring, the FINISHER's arming site (auditor r2,
+    /// BLOCKING). `RunController::start`'s loop covers sprint 0 only; every
+    /// later sprint's reapers are armed by a second loop inside the finisher,
+    /// right after that sprint's `controls` map is installed. Mutating that
+    /// second site alone survived the entire `crew-run` suite (lib 70/70,
+    /// m5_swap 8 passed) — this test is what makes it RED.
+    ///
+    /// Fixture. `max_per_sprint = 2` slices the linear DAG
+    /// (t-pm → t-design → t-publish → t-dev → t-qa) into
+    /// [t-pm, t-design] / [t-publish, t-dev] / [t-qa], which
+    /// m5_multisprint.rs pins. Nothing is planted for Pm or Designer, so
+    /// sprint 0 completes and the finisher really does spawn sprint 1. The
+    /// planted *Publisher* violation with `max_rework = 0` then escalates
+    /// `t-publish` inside sprint 1, and `t-dev` — which depends on it — stays
+    /// `Pending`, so `LeadBehavior::is_done()` never turns true and sprint 1's
+    /// own boundary `.controls.clear()` is unreachable for the rest of the
+    /// test. (Measured with this fixture: the run does not join within 5s and
+    /// all five entries are still registered. An in-sprint escalation does
+    /// NOT cascade dependents to `Blocked` — that only happens through the
+    /// next sprint's `prior_states`, which is why m5_multisprint's cascade
+    /// test needs `max_per_sprint = 2` to observe it.)
+    ///
+    /// Why `agent:designer` is the victim: it has no task in sprint 1 or
+    /// sprint 2, so aborting it cannot disturb the lead's dispatch or make the
+    /// bus report an undeliverable envelope.
+    ///
+    /// Why "sprint 1 is installed" is decided on channel identity rather than
+    /// on the `SprintStarted` event: the finisher emits `SprintStarted` BEFORE
+    /// it calls `spawn_sprint`, so that event proves nothing about the map. The
+    /// wait below instead requires the victim's registered entry to be a
+    /// DIFFERENT channel from the one sprint 0 registered, and reads the abort
+    /// handle under the same lock acquisition, so the map and the handle cannot
+    /// come from two different sprints.
+    ///
+    /// Why the peer check is what makes this exact: a boundary clear plus the
+    /// next sprint's install would replace `agent:pm`'s entry with a fresh
+    /// channel (or leave it briefly absent). Requiring it to still be sprint
+    /// 1's OWN channel means a boundary win can only ever fail this test, never
+    /// pass it for the wrong reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_finishers_next_sprint_install_arms_reapers_for_that_sprints_workers() {
+        const VICTIM: &str = "agent:designer";
+        const PEER: &str = "agent:pm";
+
+        let data_dir = TestDataDir::new("live-controls-reaper-finisher");
+        let handle = RunController::start(RunConfig {
+            mode: RunMode::Scripted {
+                planted_violations: vec![(Role::Publisher, vec!["REQ-2".to_string()])],
+            },
+            max_rework: 0,
+            max_per_sprint: 2,
+            ..scripted_config(data_dir.to_path_buf())
+        })
+        .await
+        .expect("start must succeed");
+        let mut rx = handle.subscribe();
+
+        // Observation phase — returns instead of panicking, so the teardown
+        // below is reached on every path.
+        type Observed = (
+            Option<mpsc::Sender<AgentControl>>,
+            Option<mpsc::Sender<AgentControl>>,
+            mpsc::Sender<AgentControl>,
+            Vec<String>,
+        );
+        let observed: Result<Observed, String> = async {
+            let sprint0_victim_tx = registered_sender(&handle, VICTIM)
+                .ok_or_else(|| "the victim must be registered in sprint 0".to_string())?;
+
+            wait_for_task_state(&mut rx, "t-publish", TaskStateDto::Escalated).await?;
+
+            // `spawn_sprint` pushes `worker_aborts` inside the same
+            // `for (agent_id, role) in &crew` loop that inserts each `controls`
+            // entry, so index `i` is `crew[i]`'s worker.
+            let crew = crew_agents(&default_roster());
+            let victim_index = crew
+                .iter()
+                .position(|(id, _)| id == VICTIM)
+                .ok_or_else(|| "the default roster must carry the Designer slot".to_string())?;
+
+            let (victim_tx, peer_tx, victim_abort) = tokio::time::timeout(JOIN_TIMEOUT, async {
+                loop {
+                    let installed = {
+                        let live = handle.live.lock().expect("live handles mutex poisoned");
+                        match (
+                            live.controls.get(VICTIM).cloned(),
+                            live.controls.get(PEER).cloned(),
+                            live.worker_aborts.get(victim_index).cloned(),
+                        ) {
+                            (Some(victim), Some(peer), Some(abort))
+                                if !victim.same_channel(&sprint0_victim_tx) =>
+                            {
+                                Some((victim, peer, abort))
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(found) = installed {
+                        return found;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| "the finisher must install a later sprint's controls map".to_string())?;
+
+            victim_abort.abort();
+
+            // Bounded and cooperative — `yield_now`, never a sleep.
+            tokio::time::timeout(JOIN_TIMEOUT, async {
+                loop {
+                    let gone = {
+                        let live = handle.live.lock().expect("live handles mutex poisoned");
+                        !live.controls.get(VICTIM).is_some_and(|tx| tx.same_channel(&victim_tx))
+                    };
+                    if gone {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                "a reaper armed by the FINISHER's next-sprint install must remove an ended worker's \
+                 control entry"
+                    .to_string()
+            })?;
+
+            let (victim_now, peer_now, keys) = {
+                let live = handle.live.lock().expect("live handles mutex poisoned");
+                let mut keys: Vec<String> = live.controls.keys().cloned().collect();
+                keys.sort();
+                (live.controls.get(VICTIM).cloned(), live.controls.get(PEER).cloned(), keys)
+            };
+            Ok((victim_now, peer_now, peer_tx, keys))
+        }
+        .await;
+
+        shutdown_and_settle(handle, &data_dir).await;
+
+        let (victim_now, peer_now, peer_tx, keys) = observed.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            victim_now.is_none(),
+            "the ended worker's entry must be REMOVED, not replaced by a later sprint's channel: {keys:?}"
+        );
+        assert!(
+            peer_now.is_some_and(|tx| tx.same_channel(&peer_tx)),
+            "the peer must still hold the very channel this sprint registered — anything else means the \
+             sprint boundary replaced the map instead of a reaper removing one key: {keys:?}"
+        );
     }
 }
 
@@ -2090,7 +2998,7 @@ mod role_system_hint_tests {
         assert_eq!(hint, "You are the Developer of a crew building: goal");
     }
 
-    /// Normal/D4: `project_root: Some` injects the absolute path plus the
+    /// Normal/D4: `project_root: Some` injects the role's cwd-relative artifacts dir plus the
     /// no-concurrent-edit and no-hook-addition clauses.
     #[test]
     fn some_project_root_injects_the_artifacts_convention() {
@@ -2099,11 +3007,177 @@ mod role_system_hint_tests {
 
         assert!(hint.starts_with("You are the Qa of a crew building: goal"));
         assert!(
-            hint.contains(&format!("{}/.crew/artifacts", root.display())),
-            "must include the absolute artifacts path: {hint}"
+            hint.contains(".crew/artifacts/qa/"),
+            "must include the role's cwd-relative artifacts dir: {hint}"
         );
         assert!(hint.contains("동시에 편집하지"), "must include the no-concurrent-edit clause: {hint}");
         assert!(hint.contains("훅을 추가하지"), "must include the no-hook-addition clause: {hint}");
+    }
+
+    /// t7 design D18 / ruling C5: under tool_use the agent can only write
+    /// inside its own cwd (the role worktree), so the hint names the
+    /// cwd-relative write dir and mentions the project root exactly once —
+    /// as the READ-ONLY place merged artifacts appear, never as a write
+    /// target.
+    #[test]
+    fn some_project_root_hint_never_tells_the_agent_to_write_to_the_root() {
+        let root = std::path::Path::new("/fake/root");
+        let hint = role_system_hint(Role::Developer, "goal", Some(root));
+
+        for needle in [".crew/artifacts/developer/", "현재 디렉터리", "읽기 전용", "그곳에는 쓰지 않는다", "역할별 파일로 분리"] {
+            assert!(hint.contains(needle), "hint must contain {needle:?}: {hint}");
+        }
+        assert_eq!(
+            hint.matches("/fake/root").count(),
+            1,
+            "the project root must appear exactly once: {hint}"
+        );
+        let at = hint.find("/fake/root").unwrap();
+        assert!(
+            hint[at + "/fake/root".len()..].starts_with("/.crew/artifacts 에서 읽기 전용"),
+            "the only root mention must be the read-only merged-artifacts location: {hint}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod role_harness_cfg_tests {
+    //! t7 design D1: RealCli workers get `tool_use` exactly when the run has
+    //! per-role worktrees (`project_root` Some) — the only case where the
+    //! write-confining cwd is the role's own git worktree — and only on
+    //! claude-code, the one harness that confines writes (integration
+    //! review F1).
+
+    use super::*;
+
+    const CLAUDE: &str = crew_harness::claude::HARNESS_ID.0;
+
+    /// Removes the per-test data dir even when an assertion panics, so a
+    /// failing run leaves no `.crew-test/` leftover.
+    struct DirGuard(PathBuf);
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Normal: resolved worktrees turn tool use on and point the CLI at the
+    /// role's worktree.
+    #[test]
+    fn some_worktrees_turn_tool_use_on_and_use_the_worktree() {
+        let worktree = PathBuf::from("/abs/worktrees/developer");
+        let worktrees = [(Role::Developer, worktree.clone())];
+
+        let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Developer, CLAUDE);
+
+        assert!(cfg.tool_use, "a role with a worktree must get tool_use");
+        assert_eq!(cfg.cwd, worktree);
+        assert_eq!(cfg.model, None);
+    }
+
+    /// Normal: with every canonical role resolved, each role gets its OWN
+    /// worktree (never another role's) and tool use — the lookup must key on
+    /// the `role` argument, not on a fixed role.
+    #[test]
+    fn each_role_gets_its_own_worktree_and_tool_use() {
+        let worktrees: Vec<(Role, PathBuf)> = ROLE_ORDER
+            .iter()
+            .map(|&r| (r, PathBuf::from("/abs/worktrees").join(role_dir_name(r))))
+            .collect();
+        assert!(worktrees.len() >= 2, "test setup: needs at least two roles");
+
+        for (role, expected) in &worktrees {
+            let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), *role, CLAUDE);
+
+            assert_eq!(&cfg.cwd, expected, "{role:?} must run in its own worktree");
+            assert!(cfg.tool_use, "{role:?} with a worktree must get tool_use");
+            assert_eq!(cfg.model, None);
+        }
+        let qa = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Qa, CLAUDE);
+        assert_eq!(qa.cwd, PathBuf::from("/abs/worktrees/qa"));
+    }
+
+    /// Normal (the default path): no worktrees keep tool use off and use the
+    /// scratch cwd under data_dir.
+    #[test]
+    fn no_worktrees_keep_tool_use_off_and_use_the_scratch_cwd() {
+        let data_dir = std::env::current_dir()
+            .unwrap()
+            .join(".crew-test")
+            .join(format!("rhc-{}", uuid::Uuid::new_v4()));
+        let _guard = DirGuard(data_dir.clone());
+
+        let cfg = role_harness_cfg(None, &data_dir, Role::Developer, CLAUDE);
+
+        assert!(!cfg.tool_use, "no worktree must keep tool_use off");
+        assert_eq!(cfg.cwd, data_dir.join("cli-cwd").join("developer"));
+        assert_eq!(cfg.model, None);
+    }
+
+    /// Normal: pi cannot confine writes, so a pi role keeps tool use off even
+    /// with a worktree — it still runs in that worktree.
+    #[test]
+    fn pi_with_worktrees_keeps_tool_use_off() {
+        let worktree = PathBuf::from("/abs/worktrees/developer");
+        let worktrees = [(Role::Developer, worktree.clone())];
+        let pi = crew_harness::pi::PiHarness::new().id().0;
+
+        let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Developer, pi);
+
+        assert!(!cfg.tool_use, "a pi role must never get tool_use");
+        assert_eq!(cfg.cwd, worktree);
+    }
+
+    /// Boundary: an unknown harness id with worktrees keeps tool use off.
+    #[test]
+    fn unknown_harness_with_worktrees_keeps_tool_use_off() {
+        let worktrees = [(Role::Developer, PathBuf::from("/abs/worktrees/developer"))];
+
+        let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Developer, "");
+
+        assert!(!cfg.tool_use, "only claude-code may get tool_use");
+    }
+
+    /// Error (F1 r2): a tool-using claude-code role swapped to pi is refused,
+    /// and the message names the target and why.
+    #[test]
+    fn swap_from_tool_using_claude_to_pi_is_refused() {
+        let pi = crew_harness::pi::PiHarness::new().id().0;
+
+        let reason = swap_tool_use_refusal(true, CLAUDE, pi).expect("the swap must be refused");
+
+        assert!(reason.contains("pi"), "must name the target harness: {reason}");
+        assert!(reason.contains("cannot confine writes to the worktree"), "must say why: {reason}");
+    }
+
+    /// Normal: every swap that keeps the role's tool use consistent proceeds —
+    /// claude-code -> claude-code under worktrees, anything without worktrees,
+    /// and a role that already runs tool-less (pi -> claude-code keeps the
+    /// live cfg's tool_use=false).
+    #[test]
+    fn swaps_that_keep_tool_use_consistent_proceed() {
+        let pi = crew_harness::pi::PiHarness::new().id().0;
+
+        assert_eq!(swap_tool_use_refusal(true, CLAUDE, CLAUDE), None);
+        assert_eq!(swap_tool_use_refusal(false, CLAUDE, pi), None);
+        assert_eq!(swap_tool_use_refusal(true, pi, CLAUDE), None);
+        assert_eq!(swap_tool_use_refusal(true, pi, pi), None);
+    }
+
+    /// Boundary: an empty target id is refused too — only claude-code keeps
+    /// tool use.
+    #[test]
+    fn swap_from_tool_using_claude_to_an_empty_id_is_refused() {
+        assert!(swap_tool_use_refusal(true, CLAUDE, "").is_some());
+    }
+
+    /// Error/boundary: an empty worktree slice is a lookup bug and still
+    /// panics — `tool_use` must never mask it.
+    #[test]
+    #[should_panic(expected = "no precomputed worktree")]
+    fn empty_worktrees_still_panic() {
+        let _ = role_harness_cfg(Some(&[]), Path::new("/abs/data-unused"), Role::Developer, CLAUDE);
     }
 }
 

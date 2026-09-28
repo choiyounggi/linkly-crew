@@ -18,12 +18,49 @@ use crate::{
     Session, TurnOutcome, UserTurn,
 };
 
-const HARNESS_ID: HarnessId = HarnessId("claude-code");
+pub const HARNESS_ID: HarnessId = HarnessId("claude-code");
 const EVENTS_CHANNEL_CAPACITY: usize = 64;
 const TURN_CHANNEL_CAPACITY: usize = 8;
 const DEFAULT_SETTING_SOURCES: &str = "project,local";
 const AUTO_MEMORY_DISABLE_ENV: &str = "CLAUDE_CODE_DISABLE_AUTO_MEMORY";
 const AUTO_MEMORY_DISABLE_VALUE: &str = "1";
+
+/// Flags for [`AgentCfg::tool_use`] (issue #31). Requires `claude` >= 2.1.283
+/// (measured 2026-09-28; `--permission-prompts` is a recent flag — an older CLI
+/// hard-errors on it). acceptEdits auto-approves edits inside cwd; an out-of-cwd
+/// write needs a prompt, `--permission-prompts none` denies it instead of asking
+/// the stream-json host (which this adapter never answers); Bash is denied
+/// outright. READS are NOT confined by any of these flags — see
+/// [`AgentCfg::tool_use`] for what that exposes. Real-CLI evidence:
+/// tests/real_claude.rs `tool_use_writes_inside_cwd_and_is_denied_outside`.
+const TOOL_USE_PERMISSION_MODE: &str = "acceptEdits";
+const TOOL_USE_PERMISSION_PROMPTS: &str = "none";
+const TOOL_USE_DISALLOWED_TOOLS: &str = "Bash";
+
+/// The 6 permission-flag argv elements when `cfg.tool_use`, else empty (D1).
+/// Appended after the `--setting-sources` pair in both spawn paths.
+///
+/// Keep `--disallowedTools Bash` LAST, and append nothing after it: the flag is
+/// variadic (`claude --help`: `--disallowedTools, --disallowed-tools
+/// <tools...>`), so a later argv element would be swallowed as another tool
+/// name instead of being parsed as its own flag. Nothing is swallowed today
+/// because this is the final group and the prompt travels over stdin, and the
+/// full-argv tests would NOT catch it (the fake CLI records argv without
+/// parsing it).
+fn tool_use_args(cfg: &AgentCfg) -> Vec<String> {
+    if cfg.tool_use {
+        vec![
+            "--permission-mode".to_string(),
+            TOOL_USE_PERMISSION_MODE.to_string(),
+            "--permission-prompts".to_string(),
+            TOOL_USE_PERMISSION_PROMPTS.to_string(),
+            "--disallowedTools".to_string(),
+            TOOL_USE_DISALLOWED_TOOLS.to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
 
 /// Adapter for a `claude` CLI on `$PATH` (or another binary of the same
 /// stream-json protocol, for fake-CLI-driven tests — see `with_binary`).
@@ -131,6 +168,8 @@ impl ClaudeCodeHarness {
             "--verbose".to_string(),
         ];
         args.extend(self.setting_sources_args());
+        // Must stay the LAST argv group — see `tool_use_args` (N1).
+        args.extend(tool_use_args(cfg));
         self.spawn_with_args(cfg, &args, session_id).await
     }
 
@@ -206,6 +245,8 @@ impl Harness for ClaudeCodeHarness {
             session_id.to_string(),
         ];
         args.extend(self.setting_sources_args());
+        // Must stay the LAST argv group — see `tool_use_args` (N1).
+        args.extend(tool_use_args(cfg));
         self.spawn_with_args(cfg, &args, session_id).await
     }
 

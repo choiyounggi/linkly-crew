@@ -218,6 +218,8 @@ describe("NewTaskModal — 기존 선택 모드 (t2-fe-picker R5/R6/R7/R8/D5)", 
     fireEvent.click(screen.getByRole("button", { name: "기존 선택" }));
 
     await screen.findByText("demo");
+    expect(document.querySelectorAll(".new-task-modal__project-item")).toHaveLength(1);
+    expect(document.querySelector(".new-task-modal__actions")).not.toBeNull();
     fireEvent.click(screen.getByLabelText("demo"));
     fireEvent.change(screen.getByLabelText("작업 내용"), { target: { value: "goal" } });
     fireEvent.click(screen.getByRole("button", { name: "시작" }));
@@ -241,6 +243,7 @@ describe("NewTaskModal — 기존 선택 모드 (t2-fe-picker R5/R6/R7/R8/D5)", 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("워크스페이스 경로를 확인해 주세요");
     expect(screen.queryByText(/기존 프로젝트가 없습니다/)).not.toBeInTheDocument();
+    expect(document.querySelector(".new-task-modal__actions")).not.toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "다시 시도" }));
 
@@ -257,6 +260,7 @@ describe("NewTaskModal — 기존 선택 모드 (t2-fe-picker R5/R6/R7/R8/D5)", 
 
     expect(await screen.findByText(/기존 프로젝트가 없습니다/)).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(document.querySelector(".new-task-modal__actions")).not.toBeNull();
   });
 
   it("R8: submitting with nothing selected shows an inline error and never calls startChannel", async () => {
@@ -286,6 +290,23 @@ describe("NewTaskModal — 기존 선택 모드 (t2-fe-picker R5/R6/R7/R8/D5)", 
     expect(screen.queryByRole("button", { name: "기존 선택" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "새로 만들기" })).not.toBeInTheDocument();
     expect(screen.getByLabelText("프로젝트명")).toBeInTheDocument();
+  });
+
+  it("boundary: 20 existing projects still render one project-list and keep actions/roster mounted", async () => {
+    const listProjects = vi.fn(async () =>
+      Array.from({ length: 20 }, (_, i) => ({ name: `p${i}`, path: `/ws/p${i}` })),
+    );
+    const source = fakeSource({ listProjects });
+
+    render(<NewTaskModal onClose={() => {}} source={source} />);
+    fireEvent.click(screen.getByRole("button", { name: "기존 선택" }));
+
+    await screen.findByText("p0");
+
+    expect(document.querySelectorAll(".new-task-modal__project-list")).toHaveLength(1);
+    expect(document.querySelectorAll(".new-task-modal__project-item")).toHaveLength(20);
+    expect(document.querySelector(".new-task-modal__actions")).not.toBeNull();
+    expect(document.querySelector(".new-task-modal .panel--roster")).not.toBeNull();
   });
 });
 

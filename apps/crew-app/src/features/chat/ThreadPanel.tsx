@@ -11,8 +11,9 @@ import { createPortal } from "react-dom";
 
 import { useRunStore } from "../../lib/store";
 import { parseHumanGateBody } from "./body";
-import { gateResolutions } from "./derive";
-import { EMPTY_MESSAGES, EMPTY_READ_RECEIPTS, EMPTY_READERS } from "./empty";
+import Composer from "./Composer";
+import { ackReaders, findActiveGate, gateResolutions, readersFor } from "./derive";
+import { EMPTY_MESSAGES, EMPTY_READ_RECEIPTS } from "./empty";
 import MessageRow from "./MessageRow";
 
 const SIDE_PANEL_TARGET_ID = "channel-side-panel";
@@ -27,7 +28,12 @@ function ThreadPanelContent({ runId, threadId, onClose, mounted }: ThreadPanelPr
   const messages = useRunStore((s) => s.channels[runId]?.messages ?? EMPTY_MESSAGES);
   const readReceipts = useRunStore((s) => s.channels[runId]?.readReceipts ?? EMPTY_READ_RECEIPTS);
   const items = messages.filter(({ envelope }) => envelope.thread === threadId);
-  const resolutions = gateResolutions(items);
+  // integ-fix F2: resolved-by / active-gate must see the whole run, not just
+  // this thread — the real backend posts human.gate and human.response on
+  // different threads (derive.ts findActiveGate/gateResolutions doc).
+  const resolutions = gateResolutions(messages);
+  const ackMap = ackReaders(items);
+  const activeGate = findActiveGate(items, messages);
 
   return (
     <div className="thread-panel" aria-label="스레드 패널" data-portal-mounted={mounted || undefined}>
@@ -49,13 +55,14 @@ function ThreadPanelContent({ runId, threadId, onClose, mounted }: ThreadPanelPr
                 runId={runId}
                 envelope={envelope}
                 replyCount={0}
-                readers={readReceipts[envelope.id] ?? EMPTY_READERS}
+                readers={readersFor(envelope.id, readReceipts, ackMap)}
                 gateResolution={gateTaskId ? (resolutions.get(gateTaskId) ?? null) : null}
               />
             );
           })}
         </ul>
       )}
+      {activeGate && <Composer runId={runId} activeGate={activeGate} />}
     </div>
   );
 }

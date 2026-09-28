@@ -5,7 +5,7 @@
 //! rest of the DAG keeps moving (§4.4).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,10 +13,10 @@ use crew_agent::RoleBehavior;
 use crew_proto::{Envelope, MessageKind, Role, TaskDag, TaskSpec};
 use serde_json::{json, Value};
 
-use crate::accept::{AcceptDecision, AcceptanceLoop};
+use crate::accept::{AcceptDecision, AcceptanceLoop, dod_violation_strings};
 use crate::browser_exec::{self, BrowserOutcome, BrowserPolicy};
 use crate::cmd_exec::{self, CmdOutcome, CmdPolicy};
-use crate::dod_exec::{self, DodVerdict};
+use crate::dod_exec;
 
 const DEADLINE_MS: u64 = 900_000;
 const SPRINT_LABEL: &str = "sp-m3";
@@ -362,8 +362,15 @@ impl LeadBehavior {
         task: TaskSpec,
         cmd_outcomes: &[CmdOutcome],
         browser_outcomes: &[BrowserOutcome],
+        artifact_cwd: Option<&Path>,
     ) -> Vec<Envelope> {
-        let verdict = dod_exec::judge(&task, &env.body, cmd_outcomes, browser_outcomes);
+        let verdict = dod_exec::judge(
+            &task,
+            &env.body,
+            cmd_outcomes,
+            browser_outcomes,
+            artifact_cwd,
+        );
         let loop_ = self
             .loops
             .entry(task_id.clone())
@@ -390,7 +397,7 @@ impl LeadBehavior {
             AcceptDecision::Escalate { reason } => {
                 self.states.insert(task_id.clone(), TaskState::Escalated);
                 self.track_pending_escalation(&task_id);
-                vec![self.human_gate(&task_id, &reason, &env.corr, violation_strings(&verdict))]
+                vec![self.human_gate(&task_id, &reason, &env.corr, dod_violation_strings(&verdict))]
             }
         }
     }
@@ -509,24 +516,6 @@ impl LeadBehavior {
     }
 }
 
-/// Same violation-string shape as `accept::AcceptanceLoop::decide`'s
-/// `Rework` arm (`"REQ-x"` / `"artifact:name"`), rebuilt here because
-/// `AcceptDecision::Escalate` (plan D3) carries only a `reason`, not the
-/// verdict's violations — and `human.gate`'s body still needs them.
-fn violation_strings(verdict: &DodVerdict) -> Vec<String> {
-    verdict
-        .uncovered
-        .iter()
-        .cloned()
-        .chain(
-            verdict
-                .missing_artifacts
-                .iter()
-                .map(|name| format!("artifact:{name}")),
-        )
-        .collect()
-}
-
 #[async_trait]
 impl RoleBehavior for LeadBehavior {
     async fn on_start(&mut self) -> Vec<Envelope> {
@@ -537,10 +526,18 @@ impl RoleBehavior for LeadBehavior {
         match env.kind {
             MessageKind::TaskResult => match self.resolve_task_result(&env) {
                 Some((task_id, task)) => {
-                    let outcomes = match &self.cmd_exec_cwd_for_role {
-                        Some(resolve) => {
-                            let cwd = resolve(task.role);
-                            cmd_exec::execute_cmd_checks(&task, &cwd, &self.cmd_policy).await
+                    // plan D8: resolve the role worktree ONCE and reuse it for
+                    // the Cmd DoD executor and for the judge's on-disk artifact
+                    // check (issue #31b) — a second resolve call would break
+                    // `cmd_wiring_resolves_cwd_per_task_role` and re-run the
+                    // resolver's directory creation.
+                    let role_cwd: Option<PathBuf> = self
+                        .cmd_exec_cwd_for_role
+                        .as_ref()
+                        .map(|resolve| resolve(task.role));
+                    let outcomes = match &role_cwd {
+                        Some(cwd) => {
+                            cmd_exec::execute_cmd_checks(&task, cwd, &self.cmd_policy).await
                         }
                         None => Vec::new(),
                     };
@@ -551,7 +548,14 @@ impl RoleBehavior for LeadBehavior {
                         }
                         None => Vec::new(),
                     };
-                    self.handle_task_result(env, task_id, task, &outcomes, &browser_outcomes)
+                    self.handle_task_result(
+                        env,
+                        task_id,
+                        task,
+                        &outcomes,
+                        &browser_outcomes,
+                        role_cwd.as_deref(),
+                    )
                 }
                 None => vec![],
             },
@@ -1073,6 +1077,110 @@ mod tests {
         json!({"covered_req_ids": [], "artifacts": []})
     }
 
+    /// A task whose only DoD is one expected artifact contract (issue #31b).
+    fn artifact_task(id: &str, role: Role, name: &str) -> TaskSpec {
+        TaskSpec {
+            id: id.to_string(),
+            role,
+            title: "title".to_string(),
+            brief: "brief".to_string(),
+            dod: vec![],
+            deps: vec![],
+            artifacts_expected: vec![crew_proto::ArtifactContract {
+                name: name.to_string(),
+                kind: "doc".to_string(),
+                req_ids: vec![],
+            }],
+        }
+    }
+
+    /// A `task.result` body reporting one artifact BY PATH (no `content`).
+    fn path_artifact_body(name: &str, path: &str) -> Value {
+        json!({
+            "covered_req_ids": [],
+            "artifacts": [{"name": name, "kind": "doc", "req_ids": [], "path": path}],
+        })
+    }
+
+    #[tokio::test]
+    async fn artifact_path_file_on_disk_in_role_cwd_accepts_the_task() {
+        let scratch = crate::dod_exec::test_scratch::ScratchDir::new("dispatch-accept");
+        scratch.write("out/report.md", b"x");
+        let cwd = scratch.path().to_path_buf();
+        let mut lead = lead_for_tasks(
+            vec![artifact_task("t-art", Role::Pm, "report")],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        )
+        .with_cmd_exec(Arc::new(move |_role| cwd.clone()));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(
+            &assign,
+            "agent:pm",
+            path_artifact_body("report", "out/report.md"),
+        );
+        let _ = lead.on_envelope(result).await;
+
+        assert_eq!(lead.state_of("t-art"), Some(TaskState::Accepted));
+    }
+
+    #[tokio::test]
+    async fn artifact_path_file_absent_in_role_cwd_sends_change_request_naming_it() {
+        let scratch = crate::dod_exec::test_scratch::ScratchDir::new("dispatch-absent");
+        let cwd = scratch.path().to_path_buf();
+        let mut lead = lead_for_tasks(
+            vec![artifact_task("t-art", Role::Pm, "report")],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        )
+        .with_cmd_exec(Arc::new(move |_role| cwd.clone()));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(
+            &assign,
+            "agent:pm",
+            path_artifact_body("report", "out/report.md"),
+        );
+        let replies = lead.on_envelope(result).await;
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].kind, MessageKind::ChangeRequest);
+        assert_eq!(
+            replies[0].body["violations"],
+            json!(["artifact:report (file not found)"]),
+            "the reason must survive accept.rs's dod_violation_strings"
+        );
+        assert_eq!(lead.state_of("t-art"), Some(TaskState::Assigned));
+    }
+
+    #[tokio::test]
+    async fn artifact_path_without_cwd_resolver_is_missing_with_no_cwd_reason() {
+        // No `with_cmd_exec`: a path cannot be verified without a role
+        // worktree, and an unverifiable claim is not evidence (plan D7).
+        let mut lead = lead_for_tasks(
+            vec![artifact_task("t-art", Role::Pm, "report")],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        );
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(
+            &assign,
+            "agent:pm",
+            path_artifact_body("report", "out/report.md"),
+        );
+        let replies = lead.on_envelope(result).await;
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].kind, MessageKind::ChangeRequest);
+        assert_eq!(
+            replies[0].body["violations"],
+            json!(["artifact:report (path not verifiable: no role worktree)"])
+        );
+        assert_eq!(lead.state_of("t-art"), Some(TaskState::Assigned));
+    }
+
     #[tokio::test]
     async fn cmd_wiring_off_by_default_leaves_a_cmd_check_skipped_same_as_m3() {
         // `/usr/bin/false` would fail `expect "exit 0"` if actually run —
@@ -1142,6 +1250,32 @@ mod tests {
         let violations = replies[0].body["violations"].as_array().unwrap();
         assert!(violations.iter().any(|v| v.as_str().unwrap().starts_with("cmd:")));
         assert_eq!(lead.state_of("t-cmd"), Some(TaskState::Assigned));
+    }
+
+    #[tokio::test]
+    async fn cmd_wiring_on_nonzero_exit_with_budget_exhausted_surfaces_cmd_in_human_gate() {
+        let cmd_check = crew_proto::DodCheck::Cmd {
+            run: "/usr/bin/false".to_string(),
+            expect: "exit 0".to_string(),
+        };
+        let policy = CmdPolicy::default_allowlist().allow(&["/usr/bin/false"]);
+        let mut lead = lead_for_tasks(
+            vec![cmd_task("t-cmd", Role::Pm, vec![cmd_check])],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            0,
+        )
+        .with_cmd_policy(policy)
+        .with_cmd_exec(Arc::new(|_role| cmd_test_cwd()));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(&assign, "agent:pm", empty_result_body());
+        let replies = lead.on_envelope(result).await;
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].kind, MessageKind::HumanGate);
+        let violations = replies[0].body["violations"].as_array().unwrap();
+        assert!(violations.iter().any(|v| v.as_str().unwrap().starts_with("cmd:")));
+        assert_eq!(lead.state_of("t-cmd"), Some(TaskState::Escalated));
     }
 
     #[tokio::test]

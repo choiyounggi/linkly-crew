@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import ThreadPanel from "./ThreadPanel";
@@ -99,5 +99,308 @@ describe("ThreadPanel — timeline filtering (normal/boundary)", () => {
     render(<ThreadPanel runId={RUN_ID} threadId="t-ghost" onClose={() => {}} />);
 
     expect(screen.getByText("메시지가 없습니다")).toBeInTheDocument();
+    expect(document.querySelector(".thread-panel__list")).toBeNull();
+  });
+});
+
+describe("ThreadPanel — thread-side answer composer (normal/boundary, D3d)", () => {
+  it("shows an enabled 게이트 응답 composer when the thread has an unresolved human.gate", () => {
+    setChannel({
+      messages: [
+        { seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-qa", body: {} }) },
+        {
+          seq: 2,
+          envelope: envelope({
+            id: "e2",
+            kind: "human.gate",
+            thread: "t-qa",
+            body: { task_id: "t-qa", reason: "why" },
+          }),
+        },
+      ],
+    });
+
+    render(<ThreadPanel runId={RUN_ID} threadId="t-qa" onClose={() => {}} />);
+
+    const composer = screen.getByLabelText("게이트 응답");
+    expect(composer).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "승인" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "반려" })).not.toBeDisabled();
+  });
+
+  it("shows no composer once a matching human.response has resolved the gate", () => {
+    setChannel({
+      messages: [
+        { seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-qa", body: {} }) },
+        {
+          seq: 2,
+          envelope: envelope({
+            id: "e2",
+            kind: "human.gate",
+            thread: "t-qa",
+            body: { task_id: "t-qa", reason: "why" },
+          }),
+        },
+        {
+          seq: 3,
+          envelope: envelope({
+            id: "e3",
+            kind: "human.response",
+            thread: "t-qa",
+            body: { task_id: "t-qa", decision: "approve", reason: "ok" },
+          }),
+        },
+      ],
+    });
+
+    render(<ThreadPanel runId={RUN_ID} threadId="t-qa" onClose={() => {}} />);
+
+    expect(screen.queryByLabelText("게이트 응답")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "승인" })).not.toBeInTheDocument();
+  });
+
+  it("shows no composer for a thread with no gate at all (boundary)", () => {
+    setChannel({
+      messages: [{ seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-pm", body: {} }) }],
+    });
+
+    render(<ThreadPanel runId={RUN_ID} threadId="t-pm" onClose={() => {}} />);
+
+    expect(screen.queryByLabelText("게이트 응답")).not.toBeInTheDocument();
+  });
+});
+
+describe("ThreadPanel — cross-thread gate resolution (integ-fix F2, real backend thread ids: gate on th-agent:lead, response on th-gate-<task_id>)", () => {
+  const LEAD_THREAD = "th-agent:lead";
+
+  it("still shows an enabled composer for an unanswered gate on the real lead thread (normal)", () => {
+    setChannel({
+      messages: [
+        {
+          seq: 1,
+          envelope: envelope({
+            id: "e1",
+            kind: "human.gate",
+            thread: LEAD_THREAD,
+            body: { task_id: "t-qa", reason: "why" },
+          }),
+        },
+      ],
+    });
+
+    render(<ThreadPanel runId={RUN_ID} threadId={LEAD_THREAD} onClose={() => {}} />);
+
+    expect(screen.getByLabelText("게이트 응답")).not.toBeDisabled();
+  });
+
+  it("closes the composer once a human.response on the real th-gate-<task_id> thread resolves it, and shows the resolved line on that thread", () => {
+    setChannel({
+      messages: [
+        {
+          seq: 1,
+          envelope: envelope({
+            id: "e1",
+            kind: "human.gate",
+            thread: LEAD_THREAD,
+            body: { task_id: "t-qa", reason: "why" },
+          }),
+        },
+        {
+          seq: 2,
+          envelope: envelope({
+            id: "e2",
+            kind: "human.response",
+            thread: "th-gate-t-qa",
+            body: { task_id: "t-qa", decision: "approve", reason: "ok" },
+          }),
+        },
+      ],
+    });
+
+    const { unmount } = render(<ThreadPanel runId={RUN_ID} threadId={LEAD_THREAD} onClose={() => {}} />);
+    expect(screen.queryByLabelText("게이트 응답")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "승인" })).not.toBeInTheDocument();
+    unmount();
+
+    render(<ThreadPanel runId={RUN_ID} threadId="th-gate-t-qa" onClose={() => {}} />);
+    expect(screen.getByText(/승인됨/)).toBeInTheDocument();
+  });
+
+  it("with two gates escalated in the lead thread, each is answerable and resolved independently", () => {
+    setChannel({
+      messages: [
+        {
+          seq: 1,
+          envelope: envelope({
+            id: "e1",
+            kind: "human.gate",
+            thread: LEAD_THREAD,
+            body: { task_id: "t-qa", reason: "first" },
+          }),
+        },
+        {
+          seq: 2,
+          envelope: envelope({
+            id: "e2",
+            kind: "human.gate",
+            thread: LEAD_THREAD,
+            body: { task_id: "t-design", reason: "second" },
+          }),
+        },
+      ],
+    });
+
+    const { rerender } = render(<ThreadPanel runId={RUN_ID} threadId={LEAD_THREAD} onClose={() => {}} />);
+    // composer targets the most recently opened gate first (t-design)
+    expect(screen.getByLabelText("게이트 응답")).not.toBeDisabled();
+
+    // resolve the later gate (t-design) on its own real thread
+    act(() => {
+      setChannel({
+        messages: [
+          {
+            seq: 1,
+            envelope: envelope({
+              id: "e1",
+              kind: "human.gate",
+              thread: LEAD_THREAD,
+              body: { task_id: "t-qa", reason: "first" },
+            }),
+          },
+          {
+            seq: 2,
+            envelope: envelope({
+              id: "e2",
+              kind: "human.gate",
+              thread: LEAD_THREAD,
+              body: { task_id: "t-design", reason: "second" },
+            }),
+          },
+          {
+            seq: 3,
+            envelope: envelope({
+              id: "e3",
+              kind: "human.response",
+              thread: "th-gate-t-design",
+              body: { task_id: "t-design", decision: "approve", reason: "ok" },
+            }),
+          },
+        ],
+      });
+    });
+    rerender(<ThreadPanel runId={RUN_ID} threadId={LEAD_THREAD} onClose={() => {}} />);
+    // composer now falls back to the still-open earlier gate (t-qa)
+    expect(screen.getByLabelText("게이트 응답")).not.toBeDisabled();
+
+    // resolve the earlier gate (t-qa) on its own real thread too
+    act(() => {
+      setChannel({
+        messages: [
+          {
+            seq: 1,
+            envelope: envelope({
+              id: "e1",
+              kind: "human.gate",
+              thread: LEAD_THREAD,
+              body: { task_id: "t-qa", reason: "first" },
+            }),
+          },
+          {
+            seq: 2,
+            envelope: envelope({
+              id: "e2",
+              kind: "human.gate",
+              thread: LEAD_THREAD,
+              body: { task_id: "t-design", reason: "second" },
+            }),
+          },
+          {
+            seq: 3,
+            envelope: envelope({
+              id: "e3",
+              kind: "human.response",
+              thread: "th-gate-t-design",
+              body: { task_id: "t-design", decision: "approve", reason: "ok" },
+            }),
+          },
+          {
+            seq: 4,
+            envelope: envelope({
+              id: "e4",
+              kind: "human.response",
+              thread: "th-gate-t-qa",
+              body: { task_id: "t-qa", decision: "reject", reason: "no" },
+            }),
+          },
+        ],
+      });
+    });
+    rerender(<ThreadPanel runId={RUN_ID} threadId={LEAD_THREAD} onClose={() => {}} />);
+    // both gates now resolved -> no composer left
+    expect(screen.queryByLabelText("게이트 응답")).not.toBeInTheDocument();
+  });
+});
+
+describe("ThreadPanel — ack-derived readers (normal, D2)", () => {
+  it("shows the 👀 badge for a message an ack's in_reply_to targets, inside this thread", () => {
+    setChannel({
+      messages: [
+        { seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-pm", body: {} }) },
+        {
+          seq: 2,
+          envelope: envelope({
+            id: "e2",
+            kind: "task.ack",
+            thread: "t-pm",
+            from: "agent:pm",
+            in_reply_to: "e1",
+            body: {},
+          }),
+        },
+      ],
+    });
+
+    render(<ThreadPanel runId={RUN_ID} threadId="t-pm" onClose={() => {}} />);
+
+    expect(screen.getByText("👀 1")).toBeInTheDocument();
+  });
+});
+
+describe("ThreadPanel — list container structure (issue #29 regression pin)", () => {
+  it("renders exactly one .thread-panel__list containing exactly one row (normal)", () => {
+    setChannel({
+      messages: [{ seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-single", body: {} }) }],
+    });
+
+    const { container } = render(<ThreadPanel runId={RUN_ID} threadId="t-single" onClose={() => {}} />);
+
+    expect(container.querySelectorAll(".thread-panel__list")).toHaveLength(1);
+    expect(container.querySelectorAll(".thread-panel__list > li.message-row")).toHaveLength(1);
+  });
+
+  it("renders exactly one .thread-panel__list containing 500 rows, no second scroll wrapper (boundary)", () => {
+    const messages = Array.from({ length: 500 }, (_, i) => ({
+      seq: i + 1,
+      envelope: envelope({ id: `e${i}`, kind: "task.assign", thread: "t-many", body: {} }),
+    }));
+    setChannel({ messages });
+
+    const { container } = render(<ThreadPanel runId={RUN_ID} threadId="t-many" onClose={() => {}} />);
+
+    expect(container.querySelectorAll(".thread-panel__list")).toHaveLength(1);
+    expect(container.querySelectorAll(".thread-panel__list > li.message-row")).toHaveLength(500);
+  });
+
+  it("still renders exactly one .thread-panel__list when a human.gate message has an empty body (error)", () => {
+    setChannel({
+      messages: [
+        { seq: 1, envelope: envelope({ id: "e-gate", kind: "human.gate", thread: "t-gate", body: {} }) },
+      ],
+    });
+
+    expect(() =>
+      render(<ThreadPanel runId={RUN_ID} threadId="t-gate" onClose={() => {}} />),
+    ).not.toThrow();
+    expect(document.querySelectorAll(".thread-panel__list")).toHaveLength(1);
   });
 });

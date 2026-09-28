@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { deriveRoots, findActiveGate, gateResolutions } from "./derive";
+import { ackReaders, deriveRoots, findActiveGate, gateResolutions, readersFor, unresolvedGateThreads } from "./derive";
 import type { Envelope } from "../../lib/types";
 
 function env(overrides: Partial<Envelope>): Envelope {
@@ -70,8 +70,8 @@ describe("deriveRoots — boundary", () => {
   });
 });
 
-describe("deriveRoots — human.gate main-stream exception (D1/R3)", () => {
-  it("promotes a human.gate into its own root while still counting it as a reply on its real thread", () => {
+describe("deriveRoots — human.gate folds into replyCount like any other reply (D3a — REPLACES the old main-stream-promotion exception)", () => {
+  it("a human.gate reply folds into its thread root's replyCount, producing exactly 1 root", () => {
     const messages = [
       { seq: 1, envelope: env({ id: "env_1", thread: "t-qa", kind: "task.assign" }) },
       { seq: 2, envelope: env({ id: "env_2", thread: "t-qa", kind: "blocked" }) },
@@ -83,28 +83,106 @@ describe("deriveRoots — human.gate main-stream exception (D1/R3)", () => {
 
     const roots = deriveRoots(messages);
 
-    expect(roots).toHaveLength(2);
+    expect(roots).toHaveLength(1);
     expect(roots[0].envelope.id).toBe("env_1");
-    expect(roots[0].replyCount).toBe(2); // blocked + human.gate both fold in
-    expect(roots[1].envelope.id).toBe("env_3");
-    expect(roots[1].envelope.kind).toBe("human.gate");
-    expect(roots[1].replyCount).toBe(0);
-    expect(roots[1].parentThread).toBe("t-qa");
+    expect(roots[0].replyCount).toBe(2); // blocked + human.gate both fold in (matches the pre-existing root's own reply count, unaffected by removing the promotion)
+  });
+});
+
+describe("unresolvedGateThreads — normal/boundary (D3b)", () => {
+  it("includes a thread whose human.gate has no matching human.response yet (normal)", () => {
+    const messages = [
+      { seq: 1, envelope: env({ id: "g1", thread: "t-qa", kind: "human.gate", body: { task_id: "t-qa", reason: "why" } }) },
+    ];
+
+    expect(unresolvedGateThreads(messages)).toEqual(new Set(["t-qa"]));
   });
 
-  it("does not duplicate a human.gate that is already its thread's own root (boundary)", () => {
+  it("excludes a thread whose gate has already been resolved (boundary)", () => {
     const messages = [
+      { seq: 1, envelope: env({ id: "g1", thread: "t-qa", kind: "human.gate", body: { task_id: "t-qa", reason: "why" } }) },
       {
-        seq: 1,
-        envelope: env({ id: "env_1", thread: "env_1", kind: "human.gate", body: { task_id: "env_1", reason: "why" } }),
+        seq: 2,
+        envelope: env({
+          id: "r1",
+          thread: "t-qa",
+          kind: "human.response",
+          body: { task_id: "t-qa", decision: "approve", reason: "ok" },
+        }),
       },
     ];
 
-    const roots = deriveRoots(messages);
+    expect(unresolvedGateThreads(messages)).toEqual(new Set());
+  });
 
-    expect(roots).toHaveLength(1);
-    expect(roots[0].envelope.id).toBe("env_1");
-    expect(roots[0].parentThread).toBeUndefined();
+  it("returns an empty set for no messages (boundary)", () => {
+    expect(unresolvedGateThreads([])).toEqual(new Set());
+  });
+
+  it("excludes the gate's thread once resolved by a human.response on a DIFFERENT thread, matched only by task_id (integ-fix F2, real thread ids)", () => {
+    const messages = [
+      { seq: 1, envelope: env({ id: "g1", thread: "th-agent:lead", kind: "human.gate", body: { task_id: "t-qa", reason: "why" } }) },
+      {
+        seq: 2,
+        envelope: env({
+          id: "r1",
+          thread: "th-gate-t-qa",
+          kind: "human.response",
+          body: { task_id: "t-qa", decision: "approve", reason: "ok" },
+        }),
+      },
+    ];
+
+    expect(unresolvedGateThreads(messages)).toEqual(new Set());
+  });
+});
+
+describe("ackReaders — normal/boundary (D2)", () => {
+  it("adds the acker to the readers of the id named by in_reply_to (normal)", () => {
+    const messages = [
+      { seq: 1, envelope: env({ id: "env_1", thread: "t-pm", kind: "task.assign" }) },
+      { seq: 2, envelope: env({ id: "env_2", thread: "t-pm", kind: "task.ack", from: "agent:pm", in_reply_to: "env_1" }) },
+    ];
+
+    expect(ackReaders(messages)).toEqual({ env_1: ["agent:pm"] });
+  });
+
+  it("falls back to the thread's real ROOT ROW id (not the thread id string) when in_reply_to is absent, on a multi-message thread whose root id != thread id (normal/corrected)", () => {
+    const messages = [
+      { seq: 1, envelope: env({ id: "env_1", thread: "t-pm", kind: "task.assign" }) },
+      { seq: 2, envelope: env({ id: "env_2", thread: "t-pm", kind: "blocked" }) },
+      { seq: 3, envelope: env({ id: "env_3", thread: "t-pm", kind: "task.ack", from: "agent:pm" }) },
+    ];
+
+    const readers = ackReaders(messages);
+
+    expect(readers["env_1"]).toEqual(["agent:pm"]);
+    expect(readers["t-pm"]).toBeUndefined();
+  });
+
+  it("records an ack whose in_reply_to matches no message id harmlessly, without throwing (boundary)", () => {
+    const messages = [
+      { seq: 1, envelope: env({ id: "env_1", thread: "t-pm", kind: "task.assign" }) },
+      {
+        seq: 2,
+        envelope: env({ id: "env_2", thread: "t-pm", kind: "task.ack", from: "agent:pm", in_reply_to: "no-such-id" }),
+      },
+    ];
+
+    expect(() => ackReaders(messages)).not.toThrow();
+    expect(ackReaders(messages)).toEqual({ "no-such-id": ["agent:pm"] });
+  });
+});
+
+describe("readersFor — normal/boundary (D2)", () => {
+  it("unions store read receipts and ack-derived readers, deduped (normal)", () => {
+    const readers = readersFor("env_1", { env_1: ["agent:pm"] }, { env_1: ["agent:pm", "agent:qa"] });
+
+    expect(readers.sort()).toEqual(["agent:pm", "agent:qa"]);
+  });
+
+  it("returns an empty array when both sources are empty for that id (boundary)", () => {
+    expect(readersFor("env_1", {}, {})).toEqual([]);
   });
 });
 
@@ -166,5 +244,60 @@ describe("findActiveGate — normal/error/boundary (D6)", () => {
 
     expect(() => findActiveGate(messages)).not.toThrow();
     expect(findActiveGate(messages)).toBeNull();
+  });
+});
+
+describe("findActiveGate — cross-thread resolution (integ-fix F2: gate on th-agent:lead, response on th-gate-<task_id>)", () => {
+  const LEAD_THREAD = "th-agent:lead";
+
+  it("stays open when the run's only human.response is for a different task_id (normal)", () => {
+    const threadMessages = [
+      { seq: 1, envelope: env({ id: "g1", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-qa", reason: "why" } }) },
+    ];
+    const allMessages = [
+      ...threadMessages,
+      { seq: 2, envelope: env({ id: "r1", thread: "th-gate-t-other", kind: "human.response", body: { task_id: "t-other", decision: "approve", reason: "ok" } }) },
+    ];
+
+    expect(findActiveGate(threadMessages, allMessages)).toEqual({ taskId: "t-qa", reason: "why" });
+  });
+
+  it("resolves via a human.response on a DIFFERENT thread than the gate, matched only by task_id (the F2 regression)", () => {
+    const threadMessages = [
+      { seq: 1, envelope: env({ id: "g1", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-qa", reason: "why" } }) },
+    ];
+    const allMessages = [
+      ...threadMessages,
+      { seq: 2, envelope: env({ id: "r1", thread: "th-gate-t-qa", kind: "human.response", body: { task_id: "t-qa", decision: "approve", reason: "ok" } }) },
+    ];
+
+    expect(findActiveGate(threadMessages, allMessages)).toBeNull();
+  });
+
+  it("with two gates in the same thread, falls back to the earlier one once the later one resolves on its own thread (order-aware)", () => {
+    const threadMessages = [
+      { seq: 1, envelope: env({ id: "g1", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-qa", reason: "first" } }) },
+      { seq: 2, envelope: env({ id: "g2", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-design", reason: "second" } }) },
+    ];
+    const allMessages = [
+      ...threadMessages,
+      { seq: 3, envelope: env({ id: "r1", thread: "th-gate-t-design", kind: "human.response", body: { task_id: "t-design", decision: "approve", reason: "ok" } }) },
+    ];
+
+    expect(findActiveGate(threadMessages, allMessages)).toEqual({ taskId: "t-qa", reason: "first" });
+  });
+
+  it("returns null once both gates in the thread are independently resolved on their own threads (boundary)", () => {
+    const threadMessages = [
+      { seq: 1, envelope: env({ id: "g1", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-qa", reason: "first" } }) },
+      { seq: 2, envelope: env({ id: "g2", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-design", reason: "second" } }) },
+    ];
+    const allMessages = [
+      ...threadMessages,
+      { seq: 3, envelope: env({ id: "r1", thread: "th-gate-t-design", kind: "human.response", body: { task_id: "t-design", decision: "approve", reason: "ok" } }) },
+      { seq: 4, envelope: env({ id: "r2", thread: "th-gate-t-qa", kind: "human.response", body: { task_id: "t-qa", decision: "reject", reason: "no" } }) },
+    ];
+
+    expect(findActiveGate(threadMessages, allMessages)).toBeNull();
   });
 });

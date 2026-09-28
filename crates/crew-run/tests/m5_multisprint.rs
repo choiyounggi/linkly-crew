@@ -87,6 +87,7 @@ fn event_type_name(ev: &RunEvent) -> &'static str {
         RunEvent::SprintFinished { .. } => "sprint_finished",
         RunEvent::RosterChanged { .. } => "roster_changed",
         RunEvent::Presence { .. } => "presence",
+        RunEvent::GitFlow { .. } => "git_flow",
     }
 }
 
@@ -98,7 +99,8 @@ fn event_ts(ev: &RunEvent) -> &str {
         | RunEvent::RunFinished { ts, .. }
         | RunEvent::SprintStarted { ts, .. }
         | RunEvent::SprintFinished { ts, .. }
-        | RunEvent::RosterChanged { ts, .. } => ts,
+        | RunEvent::RosterChanged { ts, .. }
+        | RunEvent::GitFlow { ts, .. } => ts,
         RunEvent::Message { envelope, .. } => &envelope.ts,
         RunEvent::BusLifecycle { .. } => {
             // `BusLifecycle` carries no `ts` field (contract §C3) — excluded

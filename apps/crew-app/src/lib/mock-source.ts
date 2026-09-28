@@ -35,6 +35,12 @@ function isValidProjectName(name: string): boolean {
 
 const SPRINT_ID = "sprint-1";
 
+/** integ-fix F2: the real backend's Lead thread id (`format!("th-{agent_id}")`, crew-lead/src/dispatch.rs) — `human.gate` goes out here, never on the task's own thread. */
+const LEAD_THREAD = "th-agent:lead";
+
+/** integ-fix F2: the real backend's per-task gate-response thread id (`format!("th-gate-{}", cmd.task_id)`, crew-run/src/controller.rs human_proxy_loop) — resolveGate's `human.response` lands here, not on LEAD_THREAD or the task's thread. */
+const gateResponseThread = (taskId: string) => `th-gate-${taskId}`;
+
 const REQ_IDS = ["REQ-1", "REQ-2", "REQ-3", "REQ-4", "REQ-5"];
 
 const REQUIREMENTS: Requirement[] = [
@@ -189,7 +195,7 @@ function buildSprintPlans(): SprintPlan[] {
   ];
 }
 
-function buildScenario(goal: string, initialRoster: Roster, allocateSeq: () => number): RunEvent[] {
+function buildScenario(goal: string, initialRoster: Roster, allocateSeq: () => number, showcase: boolean): RunEvent[] {
   const events: RunEvent[] = [];
   let envCounter = 0;
   const nextEnvId = () => `env_${++envCounter}`;
@@ -274,7 +280,7 @@ function buildScenario(goal: string, initialRoster: Roster, allocateSeq: () => n
       events.push({ type: "task_state_changed", task_id: task.id, state: "blocked", ts: PENDING_TS });
 
       const gate = makeEnvelope({
-        thread: task.id,
+        thread: LEAD_THREAD,
         from: "lead",
         to: [],
         kind: "human.gate",
@@ -385,6 +391,48 @@ function buildScenario(goal: string, initialRoster: Roster, allocateSeq: () => n
     }
   }
 
+  if (showcase) {
+    const progress = makeEnvelope({
+      thread: "demo-showcase",
+      from: "agent:developer",
+      to: ["lead"],
+      kind: "task.progress",
+      corr: "demo-showcase",
+      body: { summary: "구현 60% 진행 — REQ-3 CTA 버튼 작업 중" },
+    });
+    pushMessage(progress);
+    const review = makeEnvelope({
+      thread: "demo-showcase",
+      from: "agent:developer",
+      to: ["qa"],
+      kind: "review.request",
+      corr: "demo-showcase",
+      in_reply_to: progress.id,
+      body: {},
+    });
+    pushMessage(review);
+    const question = makeEnvelope({
+      thread: "demo-showcase",
+      from: "agent:qa",
+      to: ["developer"],
+      kind: "question",
+      corr: "demo-showcase",
+      in_reply_to: review.id,
+      body: { text: "REQ-4 반응형 기준이 뭔가요?" },
+    });
+    pushMessage(question);
+    const answer = makeEnvelope({
+      thread: "demo-showcase",
+      from: "agent:developer",
+      to: ["qa"],
+      kind: "answer",
+      corr: "demo-showcase",
+      in_reply_to: question.id,
+      body: { text: "375px 기준 1열입니다" },
+    });
+    pushMessage(answer);
+  }
+
   events.push({ type: "run_finished", outcome: "completed", ts: PENDING_TS });
   return events;
 }
@@ -442,15 +490,15 @@ export class MockEventSource implements RunEventSource {
     this.roster = roster;
   }
 
-  /** `scripted`/`projectRoot` are unused: this source IS the scripted demo regardless of the toggle (it only ever runs outside Tauri), and its scenario replay doesn't vary by project. */
-  async start(goal: string, _scripted: boolean, _projectRoot: string | null): Promise<string> {
+  /** `scripted` (t8 plan D7) gates 4 extra showcase messages (`task.progress`/`review.request`/`question`/`answer`) on their own `"demo-showcase"` thread, appended after the regular 3-sprint loop; `projectRoot` stays unused — this source IS the scripted demo regardless (it only ever runs outside Tauri), and its scenario replay doesn't vary by project. */
+  async start(goal: string, scripted: boolean, _projectRoot: string | null): Promise<string> {
     this.clearTimers();
     this.nextSeq = 1;
     this.deliveredMessages = [];
     this.started = true;
     this.goal = goal;
     const initialRoster = this.roster;
-    const events = buildScenario(goal, initialRoster, () => this.nextSeq++);
+    const events = buildScenario(goal, initialRoster, () => this.nextSeq++, scripted);
     // The scripted scenario always ends with the designer swapped to
     // opencode (plan D4); reflect that on the instance roster right away
     // rather than waiting for the delayed roster_changed to actually
@@ -599,7 +647,7 @@ export class MockEventSource implements RunEventSource {
       id: `env_gate_${++this.gateEnvCounter}`,
       ts: now,
       sprint: SPRINT_ID,
-      thread: taskId,
+      thread: gateResponseThread(taskId),
       from: "human",
       to: ["lead"],
       kind: "human.response",

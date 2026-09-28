@@ -15,3 +15,6 @@ Cargo.lock
 # 디자인 방향 탐색용 생성 아티팩트 (2.2MB) — 로컬 보관, 히스토리 제외
 apps/crew-app/design/crew-app-directions.html
 .orchestration-archive-*/
+
+# crew-run test data dirs (integration tests; empty dirs may linger)
+crates/crew-run/.crew-test/

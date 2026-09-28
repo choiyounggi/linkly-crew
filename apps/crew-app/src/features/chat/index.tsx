@@ -1,16 +1,15 @@
 // contract: t7-fe-chat owns the implementation
 // Stable surface consumed by t6-fe-shell: the channel's center chat pane.
 // Assembles the slack-shaped stream (D1/D2/D8), the typing indicator (D5),
-// the gate-response composer (D6), the right-side thread panel (D1
-// exception, Task 03), and channel search (D9, Task 03).
+// the right-side thread panel (D1 exception, Task 03) — which now also owns
+// the thread-scoped gate-answer composer (t8 plan D3d) — and channel search
+// (D9, Task 03).
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 
 import { useRunStore } from "../../lib/store";
 import ChatStream from "./ChatStream";
-import Composer from "./Composer";
-import { findActiveGate } from "./derive";
-import { EMPTY_MESSAGES, EMPTY_TYPING } from "./empty";
+import { EMPTY_TYPING } from "./empty";
 import SearchOverlay from "./SearchOverlay";
 import ThreadPanel from "./ThreadPanel";
 import "./chat.css";
@@ -41,10 +40,8 @@ function setSelectedThread(runId: string, threadId: string | null) {
 }
 
 export default function ChatPane({ runId }: ChatPaneProps) {
-  const messages = useRunStore((s) => s.channels[runId]?.messages ?? EMPTY_MESSAGES);
   const typing = useRunStore((s) => s.channels[runId]?.typing ?? EMPTY_TYPING);
   const selectedThread = useRunStore((s) => s.channels[runId]?.selectedThread ?? null);
-  const activeGate = useMemo(() => findActiveGate(messages), [messages]);
   const [searchOpen, setSearchOpen] = useState(false);
 
   function openThread(threadId: string) {
@@ -60,7 +57,6 @@ export default function ChatPane({ runId }: ChatPaneProps) {
       </div>
       <ChatStream runId={runId} onOpenThread={openThread} />
       <TypingIndicator typing={typing} />
-      <Composer runId={runId} activeGate={activeGate} />
       {selectedThread && (
         <ThreadPanel runId={runId} threadId={selectedThread} onClose={() => setSelectedThread(runId, null)} />
       )}

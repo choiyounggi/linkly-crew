@@ -53,6 +53,38 @@ pub struct AgentCfg {
     /// Only `PiHarness` reads this (contracts-m8.md §F3); `claude`/`opencode`
     /// ignore it. `None` preserves each adapter's existing default behavior.
     pub model: Option<String>,
+    /// `false` (every production path in this release): today's behaviour — no
+    /// permission flags, and `RoleHarnessBehavior`'s prompt forbids tools.
+    ///
+    /// `true` spawns the claude-code CLI with `--permission-mode acceptEdits
+    /// --permission-prompts none --disallowedTools Bash`. That confines WRITES
+    /// only:
+    /// - A write inside `cwd` is auto-approved; a write outside `cwd` needs a
+    ///   permission prompt nobody may answer, so it is denied automatically
+    ///   (measured on claude 2.1.283 by tests/real_claude.rs
+    ///   `tool_use_writes_inside_cwd_and_is_denied_outside`).
+    /// - Bash is denied outright, so this flag never grants command execution.
+    /// - READS ARE NOT CONFINED. The CLI may read any path the user running it
+    ///   can read: "While Claude Code can read files outside the working
+    ///   directory (useful for accessing system libraries and dependencies),
+    ///   write operations are strictly confined to the project scope"
+    ///   (claude-code `security.md`). An out-of-cwd read needs no prompt, so
+    ///   none of these flags denies it, and no run here has measured otherwise.
+    ///
+    /// The exposure that follows: content read from outside `cwd` (`~/.ssh`,
+    /// `~/.aws/credentials`, an unrelated project) can be written into an
+    /// in-`cwd` artifact and then committed and pushed by the run's git flow.
+    /// Confining reads is a follow-up (sandbox / guardrails — issue #5 and issue
+    /// #31 §범위 메모), not something this flag does.
+    ///
+    /// Write confinement further assumes the worktree's own
+    /// `.claude/settings*.json` (loaded via `--setting-sources project,local`)
+    /// adds no allow rule or `additionalDirectories` reaching outside `cwd`, and
+    /// no allow rule for any code-running tool (that would re-open command
+    /// execution). Only `ClaudeCodeHarness` honours this; `PiHarness` refuses
+    /// `true` with `Unavailable` (it cannot confine writes) and
+    /// `OpencodeHarness` ignores it.
+    pub tool_use: bool,
 }
 
 /// A single user turn sent to a live session.
