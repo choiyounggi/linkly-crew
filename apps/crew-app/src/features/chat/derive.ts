@@ -94,19 +94,39 @@ export interface ActiveGate {
   reason: string;
 }
 
-/** t7 plan D6: the composer targets the most recent `human.gate` that has no `human.response` yet, or null when none is active. */
-export function findActiveGate(messages: { seq: number; envelope: Envelope }[]): ActiveGate | null {
+/**
+ * t7 plan D6: the composer targets the most recent `human.gate` that has no
+ * `human.response` yet, or null when none is active.
+ *
+ * integ-fix F2: on the real backend `human.gate` goes out on the Lead's own
+ * thread (`th-agent:lead`) while the matching `human.response` lands on a
+ * different thread (`th-gate-<task_id>`, posted by the human proxy) — only
+ * the mock and old fixtures ever put both on the same thread. So gate
+ * candidates are restricted to `threadMessages` (this thread's own
+ * `human.gate` rows) but a gate is closed by a `human.response` from
+ * ANYWHERE in the run (`allMessages`, defaulting to `threadMessages` so
+ * same-thread callers/tests are unaffected). Order stays seq-aware so a
+ * re-escalation (a new `human.gate` for a task_id already resolved) reopens
+ * the composer for it.
+ */
+export function findActiveGate(
+  threadMessages: { seq: number; envelope: Envelope }[],
+  allMessages: { seq: number; envelope: Envelope }[] = threadMessages,
+): ActiveGate | null {
+  const relevant = [
+    ...threadMessages.filter(({ envelope }) => envelope.kind === "human.gate"),
+    ...allMessages.filter(({ envelope }) => envelope.kind === "human.response"),
+  ].sort((a, b) => a.seq - b.seq);
+
   const open = new Map<string, string>();
-  for (const { envelope } of messages) {
+  for (const { envelope } of relevant) {
     if (envelope.kind === "human.gate") {
       const parsed = parseHumanGateBody(envelope.body);
       if (parsed) open.set(parsed.task_id, parsed.reason);
       continue;
     }
-    if (envelope.kind === "human.response") {
-      const parsed = parseHumanResponseBody(envelope.body);
-      if (parsed) open.delete(parsed.task_id);
-    }
+    const parsed = parseHumanResponseBody(envelope.body);
+    if (parsed) open.delete(parsed.task_id);
   }
   const last = [...open.entries()].at(-1);
   return last ? { taskId: last[0], reason: last[1] } : null;
