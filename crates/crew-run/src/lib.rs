@@ -5,6 +5,7 @@
 mod config;
 mod controller;
 mod events;
+mod gitflow;
 mod observe;
 mod worktree;
 
@@ -14,4 +15,4 @@ pub use config::{
 };
 pub use crew_lead::plan::CmdCheck;
 pub use controller::{validate_roster, RunController, RunHandle};
-pub use events::{RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};
+pub use events::{GitFlowKindDto, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};

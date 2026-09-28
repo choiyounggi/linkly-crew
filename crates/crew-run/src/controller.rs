@@ -23,7 +23,7 @@ use crew_lead::plan_llm::LlmLeadPlanner;
 use crew_ledger::{EventLedger, StoredMessage};
 use crew_proto::{
     handoff_body, presence_read_from_body, presence_typing_from_body, Envelope, HandoffPack, MessageKind, Role,
-    Roster, RosterAgent, SpecDoc, TaskDag,
+    Roster, RosterAgent, SpecDoc, TaskDag, TaskSpec,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -31,8 +31,10 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::config::{GateDecision, RunConfig, RunError, RunMode};
 use crate::events::{
-    now_ts, PresenceKindDto, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto,
+    now_ts, GitFlowKindDto, PresenceKindDto, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto,
+    TaskStateDto,
 };
+use crate::gitflow::{self, GitFlowCtx};
 use crate::observe::{ObservingLead, TaskStateChange};
 use crate::worktree;
 
@@ -143,6 +145,19 @@ fn role_cli_cwd(role_worktrees: Option<&[(Role, PathBuf)]>, data_dir: &Path, rol
     cwd
 }
 
+/// The RealCli spawn spec's harness config (t7 design D1): tool use is on
+/// exactly when the run has per-role worktrees, i.e. when the CLI's cwd —
+/// the only place tool use lets it write — is the role's own git worktree.
+/// Without a `project_root` the cwd is the scratch `data_dir/cli-cwd/<role>`
+/// and the CLI stays tool-less.
+fn role_harness_cfg(role_worktrees: Option<&[(Role, PathBuf)]>, data_dir: &Path, role: Role) -> HarnessAgentCfg {
+    HarnessAgentCfg {
+        cwd: role_cli_cwd(role_worktrees, data_dir, role),
+        model: None,
+        tool_use: role_worktrees.is_some(),
+    }
+}
+
 /// Whether `spawn_sprint` should wire the Browser DoD executor at all.
 ///
 /// BOTH conditions are required. `project_root` is required by settled user
@@ -187,10 +202,13 @@ fn role_system_hint(role: Role, goal: &str, project_root: Option<&Path>) -> Stri
     let mut hint = format!("You are the {role:?} of a crew building: {goal}");
     if let Some(root) = project_root {
         hint.push_str(&format!(
-            "\n\n공유 산출물·문서·이미지·디자인 토큰은 {}/.crew/artifacts 에서 주고받는다(하위 docs/ images/ design-tokens/ deliverables/). \
-             같은 파일을 동시에 편집하지 말고 역할별 파일로 분리하라. \
+            "\n\n공유 산출물·문서·이미지·디자인 토큰은 현재 디렉터리(역할 worktree) 기준 상대 경로 .crew/artifacts/{role_dir}/ 아래에 쓴다(하위 docs/ images/ design-tokens/ deliverables/). \
+             현재 디렉터리 밖이나 절대 경로에는 쓰지 않는다. \
+             다른 역할의 산출물은 스프린트가 끝나 메인 브랜치로 머지된 뒤에야 {root}/.crew/artifacts 에서 읽기 전용으로 볼 수 있다(그곳에는 쓰지 않는다). \
+             같은 파일을 동시에 편집하지 말고 역할별 파일로 분리하라 — 두 역할이 같은 파일을 쓰면 머지할 때마다 충돌한다. \
              프로젝트에 메인 체크아웃 쓰기를 차단하는 훅을 추가하지 말라.",
-            root.display()
+            role_dir = role_dir_name(role),
+            root = root.display()
         ));
     }
     hint
@@ -214,7 +232,7 @@ fn role_from_str(role: &str) -> Option<Role> {
 /// Canonical role order (contracts-m7.md §E1's `ROLE_ORDER`, mirrored here
 /// since `crew-run` has no access to `crew-lead::plan`'s private constant)
 /// — `crew_agents`' sort key.
-const ROLE_ORDER: [Role; 5] = [Role::Pm, Role::Designer, Role::Publisher, Role::Developer, Role::Qa];
+pub(crate) const ROLE_ORDER: [Role; 5] = [Role::Pm, Role::Designer, Role::Publisher, Role::Developer, Role::Qa];
 
 /// Non-lead roster slots with a recognized role, sorted into canonical role
 /// order (contracts-m7.md §E4 verbatim) — the vary-roster replacement for
@@ -424,11 +442,7 @@ async fn spawn_sprint(
                     );
                     continue;
                 };
-                let harness_cfg = HarnessAgentCfg {
-                    cwd: role_cli_cwd(role_worktrees, data_dir, role),
-                    model: None,
-                    tool_use: false,
-                };
+                let harness_cfg = role_harness_cfg(role_worktrees, data_dir, role);
                 let system_hint = role_system_hint(role, goal, project_root);
                 // Permit is scoped to each CLI interaction (turn), not the
                 // runner's lifetime (contracts-m6.md §D2d) — a runner-
@@ -754,6 +768,18 @@ pub struct RunController;
 
 impl RunController {
     pub async fn start(cfg: RunConfig) -> Result<RunHandle, RunError> {
+        Self::start_inner(cfg, None).await
+    }
+
+    /// `start` with the role worktrees placed under `worktrees_base` instead
+    /// of `~/.linkly-crew/projects/...` (t7 design D16) — a test seam so a
+    /// suite running the git flow never writes under the real `$HOME`.
+    #[doc(hidden)]
+    pub async fn start_with_worktrees_base(cfg: RunConfig, worktrees_base: PathBuf) -> Result<RunHandle, RunError> {
+        Self::start_inner(cfg, Some(worktrees_base)).await
+    }
+
+    async fn start_inner(cfg: RunConfig, worktrees_base_override: Option<PathBuf>) -> Result<RunHandle, RunError> {
         // Validated before anything else (M13 turn-recovery fix D4) — `0`
         // would make every turn instantly time out; a misconfiguration must
         // not silently become that.
@@ -790,6 +816,14 @@ impl RunController {
             }
         };
 
+        // Generated before the worktrees so the run lock can name this run.
+        let run_id = uuid::Uuid::new_v4().to_string();
+        // The per-project-root run lock (t7 design D21): taken after the
+        // root is validated and before any worktree is touched, released by
+        // the finisher right before RunFinished (or by shutdown). A later
+        // `?` in start drops the slot and so releases it.
+        let lock_slot: gitflow::LockSlot = Arc::new(Mutex::new(None));
+
         // Plan D1-D3 (HANDOFF pitfall 30): pre-create every canonical
         // role's out-of-repo worktree once, up front — role_cli_cwd (both
         // the agent CLI cwd and the Cmd DoD exec cwd call sites) then does
@@ -802,10 +836,26 @@ impl RunController {
             None => None,
             Some(root) => {
                 worktree::check_artifacts_not_ignored(root).map_err(RunError::ProjectRootInvalid)?;
-                let worktrees_base = worktree::project_worktrees_base(root);
+                let worktrees_base = worktrees_base_override
+                    .clone()
+                    .unwrap_or_else(|| worktree::project_worktrees_base(root));
+                std::fs::create_dir_all(&worktrees_base).map_err(|e| {
+                    RunError::ProjectRootInvalid(format!("cannot create {}: {e}", worktrees_base.display()))
+                })?;
+                let lock = gitflow::RunLock::acquire(&worktrees_base.join(".crew-run.lock"), &run_id)
+                    .map_err(RunError::ProjectRootInvalid)?;
+                *lock_slot.lock().expect("lock slot mutex poisoned") = Some(lock);
                 Some(resolve_role_worktrees(root, &worktrees_base).map_err(RunError::ProjectRootInvalid)?)
             }
         };
+        // None — and so no git command for the whole run — unless both are
+        // present (t7 design D12).
+        let gitflow: Option<Arc<GitFlowCtx>> = GitFlowCtx::for_run(
+            project_root.as_deref(),
+            role_worktrees.as_deref(),
+            browser_wiring_enabled(project_root.as_deref(), cfg.browser_binary.as_deref()),
+        )
+        .map(Arc::new);
 
         // Validated before any spec/dag/ledger/spawn work (contracts-m7.md
         // §E4 plan D5) — a rejected roster leaves zero partial run state.
@@ -866,7 +916,6 @@ impl RunController {
         let sprints = SprintSlicer::slice(&dag, effective_max)?;
         let full_order: Vec<String> = sprints.iter().flatten().cloned().collect();
 
-        let run_id = uuid::Uuid::new_v4().to_string();
         let token = uuid::Uuid::new_v4().to_string();
 
         // Created together with its "genesis" receiver, which never misses
@@ -1024,7 +1073,15 @@ impl RunController {
         let escalation_timeout_ms = cfg.escalation_timeout_ms;
         let finisher_live = live.clone();
         let finisher_shared_summaries = shared_summaries.clone();
+        let finisher_gitflow = gitflow.clone();
+        let finisher_lock_slot = lock_slot.clone();
         let finisher: JoinHandle<RunOutcomeDto> = tokio::spawn(async move {
+            // Releases the run lock if anything below panics (t7 design D21).
+            let _lock_release = gitflow::LockRelease(finisher_lock_slot.clone());
+            // Commit/merge phase results folded across sprints (D10).
+            let mut git_failures: usize = 0;
+            let mut merged_any = false;
+            let mut not_landed: Option<String> = None;
             let mut current_worker_aborts = spawned0.worker_aborts;
             let mut current_lead_task = spawned0.lead_task;
             let mut current_agent_ids = spawned0.agent_ids;
@@ -1165,6 +1222,44 @@ impl RunController {
                 });
 
                 let sprint_ok = matches!(lead_result, Ok(Ok(())));
+                // Commit each accepted task, then merge the sprint (t7 design
+                // D2/D19): the lead resolved and its workers were aborted
+                // above, so every role worktree is settled.
+                if let Some(ctx) = &finisher_gitflow {
+                    let accepted: Vec<TaskSpec> = sprint_tasks
+                        .iter()
+                        .filter(|id| states_snapshot.get(*id) == Some(&TaskState::Accepted))
+                        .filter_map(|id| dag.tasks.iter().find(|t| &t.id == id).cloned())
+                        .collect();
+                    let guard = ctx.phase.clone().lock_owned().await;
+                    let (phase_ctx, phase_tx, sprint_index) = (ctx.clone(), finisher_run_tx.clone(), index as u32);
+                    let phase = tokio::task::spawn_blocking(move || {
+                        let _guard = guard;
+                        let commit_failures = accepted.iter().filter(|task| phase_ctx.commit_accepted(task, &phase_tx)).count();
+                        (commit_failures, phase_ctx.merge_sprint(sprint_index, sprint_ok, &phase_tx))
+                    })
+                    .await;
+                    match phase {
+                        Ok((commit_failures, report)) => {
+                            git_failures += commit_failures + report.failures;
+                            merged_any |= report.merged_any;
+                            if not_landed.is_none() {
+                                not_landed = report.not_landed;
+                            }
+                        }
+                        Err(e) => {
+                            git_failures += 1;
+                            let _ = finisher_run_tx.send(gitflow::event(
+                                GitFlowKindDto::Error,
+                                None,
+                                None,
+                                None,
+                                None,
+                                format!("sprint {index} git phase did not finish: {e}"),
+                            ));
+                        }
+                    }
+                }
                 if !sprint_ok {
                     outcome = RunOutcomeDto::Failed;
                     break;
@@ -1179,6 +1274,47 @@ impl RunController {
             // before `RunFinished`.
             drop(ts_tx);
             let _ = relay_task.await;
+
+            // End of run (t7 design D8/D10): the Completed gate, then the
+            // guarded push — both only with a project_root.
+            if let Some(ctx) = &finisher_gitflow {
+                if outcome == RunOutcomeDto::Completed {
+                    let states = cumulative.lock().expect("cumulative state mutex poisoned").clone();
+                    let mut causes = Vec::new();
+                    if !gitflow::completed_gate_met(&dag, &states, ctx.browser_wired()) {
+                        causes.push("no accepted task carried an executed cmd or browser DoD check".to_string());
+                    }
+                    if git_failures > 0 {
+                        causes.push(format!("git flow reported {git_failures} conflict/error event(s)"));
+                    }
+                    if let Some(reason) = &not_landed {
+                        let main = ctx.main_branch().unwrap_or("the main branch");
+                        causes.push(format!("crew work committed on role branches did not land on {main}: {reason}"));
+                    }
+                    if !causes.is_empty() {
+                        outcome = RunOutcomeDto::Failed;
+                        let _ = finisher_run_tx.send(gitflow::event(GitFlowKindDto::Gate, None, None, None, None, causes.join("; ")));
+                    }
+                }
+                let guard = ctx.phase.clone().lock_owned().await;
+                let (phase_ctx, phase_tx) = (ctx.clone(), finisher_run_tx.clone());
+                let run_completed = outcome == RunOutcomeDto::Completed;
+                let pushed = tokio::task::spawn_blocking(move || {
+                    let _guard = guard;
+                    phase_ctx.push_main(run_completed, merged_any, &phase_tx);
+                })
+                .await;
+                if let Err(e) = pushed {
+                    let _ = finisher_run_tx.send(gitflow::event(
+                        GitFlowKindDto::Error,
+                        None,
+                        None,
+                        None,
+                        None,
+                        format!("push phase did not finish: {e}"),
+                    ));
+                }
+            }
 
             // Run has ended (plan D1: "런 종료(join/shutdown) 경로에서
             // abort") — signal the human proxy to stop *gracefully* (never
@@ -1205,6 +1341,9 @@ impl RunController {
             // trusting the drain alone.
             wait_for_bus_lifecycle(&mut human_unregister_rx, "Unregistered", "agent:human", HUMAN_UNREGISTER_TIMEOUT).await;
 
+            // Every git phase has returned: free the root before RunFinished,
+            // so a finished handle the app keeps never blocks the next run.
+            gitflow::release(&finisher_lock_slot);
             let _ = finisher_run_tx.send(RunEvent::RunFinished {
                 outcome,
                 ts: now_ts(),
@@ -1228,6 +1367,8 @@ impl RunController {
             summaries: summaries_for_handle,
             human_abort,
             gate_tx,
+            gitflow,
+            lock_slot,
         })
     }
 }
@@ -1452,6 +1593,11 @@ pub struct RunHandle {
     /// Sends `resolve_gate` requests to the human proxy task (plan D2) — a
     /// closed receiver (proxy ended) surfaces as `RunError::GateUnavailable`.
     gate_tx: mpsc::Sender<GateCmd>,
+    /// The run's git flow (t7 design D12/D23): its phase mutex and command
+    /// counter; `None` without a project_root.
+    gitflow: Option<Arc<GitFlowCtx>>,
+    /// The run lock's slot (D21) — empty once the finisher released it.
+    lock_slot: gitflow::LockSlot,
 }
 
 /// One control-channel swap attempt against a specific worker's sender —
@@ -1746,6 +1892,15 @@ impl RunHandle {
     /// sprint boundary, so a single fixed set of handles captured at
     /// `start()` time could no longer describe "what's currently running").
     pub async fn shutdown(self) {
+        self.abort_all();
+        self.bus.shutdown().await;
+    }
+
+    /// `shutdown`'s aborts, shared with `shutdown_and_wait`.
+    fn abort_all(&self) {
+        if let Some(ctx) = &self.gitflow {
+            ctx.cancel();
+        }
         if let Some(finisher) = &self.finisher {
             finisher.abort();
         }
@@ -1759,7 +1914,42 @@ impl RunHandle {
         self.sub_task.abort();
         self.relay_abort.abort();
         self.human_abort.abort();
-        self.bus.shutdown().await;
+        // The run lock is released only after an in-flight git phase ends
+        // (t7 design D19/D21): that phase is a blocking task the aborts above
+        // cannot stop, and the next run on this root must not overlap it.
+        match &self.gitflow {
+            Some(ctx) => gitflow::release_after_phase(ctx.phase.clone(), self.lock_slot.clone()),
+            None => gitflow::release(&self.lock_slot),
+        }
+    }
+
+    /// `shutdown`, then waits (bounded by `SETTLE_TIMEOUT`) until nothing of
+    /// this run still touches the filesystem: the finisher, the subscription
+    /// task and any in-flight git phase (t7 design D23). A test seam: suites
+    /// remove their scratch repos right after it returns.
+    #[doc(hidden)]
+    pub async fn shutdown_and_wait(self) {
+        self.abort_all();
+        let RunHandle { finisher, sub_task, bus, gitflow, lock_slot, .. } = self;
+        bus.shutdown().await;
+        let _ = tokio::time::timeout(gitflow::SETTLE_TIMEOUT, async {
+            if let Some(finisher) = finisher {
+                let _ = finisher.await;
+            }
+            let _ = sub_task.await;
+            if let Some(ctx) = &gitflow {
+                let _phase = ctx.phase.lock().await;
+            }
+        })
+        .await;
+        gitflow::release(&lock_slot);
+    }
+
+    /// How many git commands this run's flow issued — 0 without a
+    /// project_root (t7 design D12). A test seam.
+    #[doc(hidden)]
+    pub fn git_commands_issued(&self) -> usize {
+        self.gitflow.as_ref().map_or(0, |ctx| ctx.git_calls())
     }
 }
 
@@ -2765,7 +2955,7 @@ mod role_system_hint_tests {
         assert_eq!(hint, "You are the Developer of a crew building: goal");
     }
 
-    /// Normal/D4: `project_root: Some` injects the absolute path plus the
+    /// Normal/D4: `project_root: Some` injects the role's cwd-relative artifacts dir plus the
     /// no-concurrent-edit and no-hook-addition clauses.
     #[test]
     fn some_project_root_injects_the_artifacts_convention() {
@@ -2774,11 +2964,116 @@ mod role_system_hint_tests {
 
         assert!(hint.starts_with("You are the Qa of a crew building: goal"));
         assert!(
-            hint.contains(&format!("{}/.crew/artifacts", root.display())),
-            "must include the absolute artifacts path: {hint}"
+            hint.contains(".crew/artifacts/qa/"),
+            "must include the role's cwd-relative artifacts dir: {hint}"
         );
         assert!(hint.contains("동시에 편집하지"), "must include the no-concurrent-edit clause: {hint}");
         assert!(hint.contains("훅을 추가하지"), "must include the no-hook-addition clause: {hint}");
+    }
+
+    /// t7 design D18 / ruling C5: under tool_use the agent can only write
+    /// inside its own cwd (the role worktree), so the hint names the
+    /// cwd-relative write dir and mentions the project root exactly once —
+    /// as the READ-ONLY place merged artifacts appear, never as a write
+    /// target.
+    #[test]
+    fn some_project_root_hint_never_tells_the_agent_to_write_to_the_root() {
+        let root = std::path::Path::new("/fake/root");
+        let hint = role_system_hint(Role::Developer, "goal", Some(root));
+
+        for needle in [".crew/artifacts/developer/", "현재 디렉터리", "읽기 전용", "그곳에는 쓰지 않는다", "역할별 파일로 분리"] {
+            assert!(hint.contains(needle), "hint must contain {needle:?}: {hint}");
+        }
+        assert_eq!(
+            hint.matches("/fake/root").count(),
+            1,
+            "the project root must appear exactly once: {hint}"
+        );
+        let at = hint.find("/fake/root").unwrap();
+        assert!(
+            hint[at + "/fake/root".len()..].starts_with("/.crew/artifacts 에서 읽기 전용"),
+            "the only root mention must be the read-only merged-artifacts location: {hint}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod role_harness_cfg_tests {
+    //! t7 design D1: RealCli workers get `tool_use` exactly when the run has
+    //! per-role worktrees (`project_root` Some) — the only case where the
+    //! write-confining cwd is the role's own git worktree.
+
+    use super::*;
+
+    /// Removes the per-test data dir even when an assertion panics, so a
+    /// failing run leaves no `.crew-test/` leftover.
+    struct DirGuard(PathBuf);
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Normal: resolved worktrees turn tool use on and point the CLI at the
+    /// role's worktree.
+    #[test]
+    fn some_worktrees_turn_tool_use_on_and_use_the_worktree() {
+        let worktree = PathBuf::from("/abs/worktrees/developer");
+        let worktrees = [(Role::Developer, worktree.clone())];
+
+        let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Developer);
+
+        assert!(cfg.tool_use, "a role with a worktree must get tool_use");
+        assert_eq!(cfg.cwd, worktree);
+        assert_eq!(cfg.model, None);
+    }
+
+    /// Normal: with every canonical role resolved, each role gets its OWN
+    /// worktree (never another role's) and tool use — the lookup must key on
+    /// the `role` argument, not on a fixed role.
+    #[test]
+    fn each_role_gets_its_own_worktree_and_tool_use() {
+        let worktrees: Vec<(Role, PathBuf)> = ROLE_ORDER
+            .iter()
+            .map(|&r| (r, PathBuf::from("/abs/worktrees").join(role_dir_name(r))))
+            .collect();
+        assert!(worktrees.len() >= 2, "test setup: needs at least two roles");
+
+        for (role, expected) in &worktrees {
+            let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), *role);
+
+            assert_eq!(&cfg.cwd, expected, "{role:?} must run in its own worktree");
+            assert!(cfg.tool_use, "{role:?} with a worktree must get tool_use");
+            assert_eq!(cfg.model, None);
+        }
+        let qa = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Qa);
+        assert_eq!(qa.cwd, PathBuf::from("/abs/worktrees/qa"));
+    }
+
+    /// Normal (the default path): no worktrees keep tool use off and use the
+    /// scratch cwd under data_dir.
+    #[test]
+    fn no_worktrees_keep_tool_use_off_and_use_the_scratch_cwd() {
+        let data_dir = std::env::current_dir()
+            .unwrap()
+            .join(".crew-test")
+            .join(format!("rhc-{}", uuid::Uuid::new_v4()));
+        let _guard = DirGuard(data_dir.clone());
+
+        let cfg = role_harness_cfg(None, &data_dir, Role::Developer);
+
+        assert!(!cfg.tool_use, "no worktree must keep tool_use off");
+        assert_eq!(cfg.cwd, data_dir.join("cli-cwd").join("developer"));
+        assert_eq!(cfg.model, None);
+    }
+
+    /// Error/boundary: an empty worktree slice is a lookup bug and still
+    /// panics — `tool_use` must never mask it.
+    #[test]
+    #[should_panic(expected = "no precomputed worktree")]
+    fn empty_worktrees_still_panic() {
+        let _ = role_harness_cfg(Some(&[]), Path::new("/abs/data-unused"), Role::Developer);
     }
 }
 
