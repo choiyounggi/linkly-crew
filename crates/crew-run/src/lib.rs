@@ -5,6 +5,7 @@
 mod config;
 mod controller;
 mod events;
+mod gitflow;
 mod observe;
 mod worktree;
 
