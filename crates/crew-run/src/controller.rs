@@ -324,6 +324,18 @@ struct SnapshotState {
     last_seq: i64,
 }
 
+/// One spawned worker's control-channel identity, handed back so the caller
+/// can attach a [`reap_controls_entry`] reaper once the shared
+/// [`LiveHandles`] exists (it does not yet when `spawn_sprint` runs — the
+/// struct needs this sprint's `lead_task` abort handle to be built at all).
+struct WorkerTask {
+    agent_id: String,
+    /// This worker's own sender — the same clone that went into `controls`,
+    /// so the reaper can prove the entry it is about to drop is still its own.
+    ctrl_tx: mpsc::Sender<AgentControl>,
+    task: JoinHandle<Result<(), RunnerError>>,
+}
+
 /// One sprint's just-spawned workers/lead (plan D1/D5/D6), plus this
 /// sprint's worker control-channel registry (t-swap plan D1/D2:
 /// `agent_id` -> the `mpsc::Sender` `AgentRunner::run_with_control` reads
@@ -332,6 +344,9 @@ struct SpawnedSprint {
     worker_aborts: Vec<AbortHandle>,
     lead_task: JoinHandle<Result<(), RunnerError>>,
     controls: HashMap<String, mpsc::Sender<AgentControl>>,
+    /// Every worker's `(agent_id, own sender, JoinHandle)`, in spawn order —
+    /// consumed by the caller to arm one reaper per worker.
+    worker_tasks: Vec<WorkerTask>,
     /// Every bus id this sprint registered, in connect order — the exact set
     /// the next sprint re-connects, so the sprint boundary knows what it
     /// must see unregistered before spawning again.
@@ -369,6 +384,7 @@ async fn spawn_sprint(
     let mut worker_aborts = Vec::new();
     let mut agent_ids: Vec<String> = Vec::new();
     let mut controls: HashMap<String, mpsc::Sender<AgentControl>> = HashMap::new();
+    let mut worker_tasks: Vec<WorkerTask> = Vec::new();
     // Vary-roster spawn/routing (contracts-m7.md §E4): `crew` replaces the
     // fixed `roles_all()` here and feeds `LeadBehavior`'s routing table
     // below, so both reflect exactly this roster's non-lead, recognized-role
@@ -394,7 +410,8 @@ async fn spawn_sprint(
                 let member = ScriptedCrewMember::new(agent_id, role, planted);
                 let task = tokio::spawn(AgentRunner::run_with_control(conn, member, ctrl_rx));
                 worker_aborts.push(task.abort_handle());
-                controls.insert(agent_id.to_string(), ctrl_tx);
+                controls.insert(agent_id.to_string(), ctrl_tx.clone());
+                worker_tasks.push(WorkerTask { agent_id: agent_id.to_string(), ctrl_tx, task });
             }
             RunMode::RealCli => {
                 let harness_id = harness_id_for(roster, agent_id);
@@ -428,7 +445,8 @@ async fn spawn_sprint(
                 }
                 let task = tokio::spawn(AgentRunner::run_with_control(conn, behavior, ctrl_rx));
                 worker_aborts.push(task.abort_handle());
-                controls.insert(agent_id.to_string(), ctrl_tx);
+                controls.insert(agent_id.to_string(), ctrl_tx.clone());
+                worker_tasks.push(WorkerTask { agent_id: agent_id.to_string(), ctrl_tx, task });
             }
         }
     }
@@ -472,7 +490,7 @@ async fn spawn_sprint(
     // D6, pitfall 14) — lead swaps stay M5 boundary-only via `AgentRunner::run`.
     let lead_task = tokio::spawn(AgentRunner::run(lead_conn, observing));
 
-    Ok(SpawnedSprint { worker_aborts, lead_task, controls, agent_ids })
+    Ok(SpawnedSprint { worker_aborts, lead_task, controls, agent_ids, worker_tasks })
 }
 
 /// The abort handles for whichever sprint's workers/lead are currently
@@ -492,6 +510,66 @@ struct LiveHandles {
     /// runtime's cancellation instead of cleanly falling back to the
     /// sender-absent path (contracts-m6.md §D2b step 3's "sender 부재" case).
     controls: HashMap<String, mpsc::Sender<AgentControl>>,
+}
+
+/// Removes one worker's entry from [`LiveHandles::controls`] once that
+/// worker's own task has ended, whatever ended it — a return, an error
+/// return, or an abort — because a resolved `JoinHandle` covers all three.
+///
+/// Why per-worker, and not only the sprint-boundary batch `.controls.clear()`:
+/// that clear runs only after the *lead* task joins (the finisher's
+/// `(&mut current_lead_task).await`), and a worker's `ctrl_rx` can be gone
+/// long before then. Measured, under 8 concurrent `m5_swap` binaries: on a
+/// failing run a probe recorded `swap_harness`'s step-3 lookup finding the
+/// entry **present** while the very next `tx.send(ctrl)` **failed**, which
+/// `send_swap_control` reports only when the receiver is already dropped. So
+/// `controls` advertised a dead worker mid-sprint, and the run failed with
+/// `RunError::SwapIncomplete` — either `"worker control channel closed"` (the
+/// send itself failed) or `"worker dropped ack"` (the send landed in the
+/// buffer of a receiver dropped before draining it) — instead of taking §D2b
+/// step 3's sender-absent `Ok` fallback. The boundary clear stays where it
+/// is, because `abort()` is itself asynchronous and that clear is the only
+/// *synchronous* guarantee at the boundary.
+///
+/// Which exit path ends that worker early is deliberately NOT asserted here,
+/// and this reaper does not depend on it: it keys off `JoinHandle`
+/// resolution. What IS established by grep at this HEAD is only a negative —
+/// it is not the `is_done()` path. `is_done()` is a constant `false` in every
+/// behavior `crew-run` spawns as a worker (`crew-agent`'s crew_member.rs:163
+/// for `ScriptedCrewMember`, harness_behavior.rs:300 and :593 for
+/// `RoleHarnessBehavior`), so `AgentRunner::run_with_control`'s four
+/// `return Ok(())` sites (runner.rs:141/:178/:206/:216) are unreachable from
+/// here; what remains is the `?` on `conn.send` (:138/:175/:203/:213),
+/// `RunnerError::Fatal` (:183), `RunnerError::ConnectionClosed` (:187), and
+/// the boundary's own `abort()`. Naming which one fires is task t3b's first
+/// step, via a probe that logs the worker task's `Result`.
+///
+/// This narrows the window from "the rest of the sprint" to "the scheduling
+/// gap between the worker task ending and this reaper taking the mutex"; it
+/// does NOT close it, and cannot. The only authority on "this worker will
+/// never serve another control message" is the worker task itself, and it
+/// announces that by dropping `ctrl_rx` — an event `crew-run` can only
+/// observe after the fact. Fully closing it needs the worker side to drain
+/// and ack (or refuse) pending controls before it ends, in `crew-agent`
+/// (task t3b). Run-specific failure counts for this change live in that
+/// task's DoD evidence, not in this comment.
+///
+/// `own_tx` is this worker's own sender: the removal happens only while the
+/// registered entry is still the very channel this reaper armed, so a reaper
+/// from sprint N that is scheduled late can never evict the entry sprint N+1
+/// just registered for the same `agent_id`.
+async fn reap_controls_entry(
+    live: Arc<Mutex<LiveHandles>>,
+    agent_id: String,
+    own_tx: mpsc::Sender<AgentControl>,
+    task: JoinHandle<Result<(), RunnerError>>,
+) {
+    let _ = task.await;
+    let mut guard = live.lock().expect("live handles mutex poisoned");
+    let still_ours = matches!(guard.controls.get(&agent_id), Some(current) if current.same_channel(&own_tx));
+    if still_ours {
+        guard.controls.remove(&agent_id);
+    }
 }
 
 /// Drains the subscription loop's already-buffered bus-event backlog
@@ -893,7 +971,7 @@ impl RunController {
             ts: now_ts(),
         });
         let roster_snapshot0 = roster.lock().expect("roster mutex poisoned").clone();
-        let spawned0 = spawn_sprint(
+        let mut spawned0 = spawn_sprint(
             &url,
             &token,
             &cfg.mode,
@@ -919,6 +997,16 @@ impl RunController {
             lead_abort: spawned0.lead_task.abort_handle(),
             controls: spawned0.controls.clone(),
         }));
+        // One reaper per worker, armed the moment `live` exists: each
+        // `controls` entry now lives exactly as long as its worker's task.
+        for worker in std::mem::take(&mut spawned0.worker_tasks) {
+            tokio::spawn(reap_controls_entry(
+                live.clone(),
+                worker.agent_id,
+                worker.ctrl_tx,
+                worker.task,
+            ));
+        }
 
         // Controller is the single `RunEvent` emission point (plan D4):
         // `ObservingLead` only sends to the relay's mpsc channel, never
@@ -976,14 +1064,32 @@ impl RunController {
                     .await
                     {
                         Ok(spawned) => {
+                            let SpawnedSprint {
+                                worker_aborts,
+                                lead_task,
+                                controls,
+                                agent_ids,
+                                worker_tasks,
+                            } = spawned;
                             *finisher_live.lock().expect("live handles mutex poisoned") = LiveHandles {
-                                worker_aborts: spawned.worker_aborts.clone(),
-                                lead_abort: spawned.lead_task.abort_handle(),
-                                controls: spawned.controls,
+                                worker_aborts: worker_aborts.clone(),
+                                lead_abort: lead_task.abort_handle(),
+                                controls,
                             };
-                            current_worker_aborts = spawned.worker_aborts;
-                            current_lead_task = spawned.lead_task;
-                            current_agent_ids = spawned.agent_ids;
+                            // Arm this sprint's reapers only after its map is
+                            // installed, so each one is matched against the
+                            // entry it actually registered.
+                            for worker in worker_tasks {
+                                tokio::spawn(reap_controls_entry(
+                                    finisher_live.clone(),
+                                    worker.agent_id,
+                                    worker.ctrl_tx,
+                                    worker.task,
+                                ));
+                            }
+                            current_worker_aborts = worker_aborts;
+                            current_lead_task = lead_task;
+                            current_agent_ids = agent_ids;
                         }
                         Err(err) => {
                             tracing::error!(error = %err, index, "failed to spawn sprint; ending run early");
@@ -1730,6 +1836,168 @@ mod send_swap_control_tests {
 }
 
 #[cfg(test)]
+mod controls_reaper_tests {
+    //! Deterministic coverage for [`reap_controls_entry`] — the per-worker
+    //! `LiveHandles.controls` lifecycle: a worker whose own task had already
+    //! ended stayed advertised in `controls` until the sprint-boundary batch
+    //! clear, so `RunHandle::swap_harness` reached a dead channel and returned
+    //! `RunError::SwapIncomplete` instead of §D2b step 3's sender-absent `Ok`
+    //! fallback. These pin the lifecycle invariant itself, which is
+    //! deterministic, rather than the residual timing window the reaper
+    //! narrows but cannot close (see [`reap_controls_entry`]'s own note).
+    //!
+    //! These read the real `LiveHandles.controls` map at the critical moment
+    //! rather than any narration the code emits, and each was watched RED
+    //! under a mutation of the reaper body before being trusted
+    //! (wiki/testing/quality/narration-based-ordering-assertions.md step 2).
+
+    use super::*;
+
+    fn fake_harness() -> Arc<dyn Harness> {
+        Arc::new(crew_harness::claude::ClaudeCodeHarness::with_binary("/bin/false"))
+    }
+
+    /// A `LiveHandles` holding exactly `entries`. `lead_abort` is a real
+    /// abort handle for a trivial task — the field is never read here.
+    fn live_with(entries: Vec<(&str, mpsc::Sender<AgentControl>)>) -> Arc<Mutex<LiveHandles>> {
+        let lead_abort = tokio::spawn(async {}).abort_handle();
+        let mut controls: HashMap<String, mpsc::Sender<AgentControl>> = HashMap::new();
+        for (agent_id, tx) in entries {
+            controls.insert(agent_id.to_string(), tx);
+        }
+        Arc::new(Mutex::new(LiveHandles { worker_aborts: Vec::new(), lead_abort, controls }))
+    }
+
+    fn registered(live: &Arc<Mutex<LiveHandles>>) -> Vec<String> {
+        let guard = live.lock().expect("live handles mutex poisoned");
+        let mut keys: Vec<String> = guard.controls.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    fn registered_sender(live: &Arc<Mutex<LiveHandles>>, agent_id: &str) -> Option<mpsc::Sender<AgentControl>> {
+        let guard = live.lock().expect("live handles mutex poisoned");
+        guard.controls.get(agent_id).cloned()
+    }
+
+    /// A worker task that has already ended: it owns `ctrl_rx` and drops it
+    /// on the way out. That is the only property the reaper keys off — which
+    /// arm of `AgentRunner::run_with_control` ended the real worker is not
+    /// asserted here (see [`reap_controls_entry`]).
+    fn finished_worker(rx: mpsc::Receiver<AgentControl>) -> JoinHandle<Result<(), RunnerError>> {
+        tokio::spawn(async move {
+            drop(rx);
+            Ok::<(), RunnerError>(())
+        })
+    }
+
+    /// Error/regression case (the flake): once a worker's own task has ended,
+    /// its control entry must be gone, so `swap_harness` takes the
+    /// sender-absent `Ok` fallback instead of sending into a dead channel.
+    /// RED before the reaper removed anything; GREEN after.
+    #[tokio::test]
+    async fn a_finished_workers_control_entry_is_removed_when_its_task_ends() {
+        let (tx, rx) = mpsc::channel::<AgentControl>(4);
+        let live = live_with(vec![("agent:designer", tx.clone())]);
+        let task = finished_worker(rx);
+
+        reap_controls_entry(live.clone(), "agent:designer".to_string(), tx, task).await;
+
+        assert_eq!(
+            registered(&live),
+            Vec::<String>::new(),
+            "a worker whose task has ended must not stay advertised in LiveHandles.controls"
+        );
+    }
+
+    /// Normal case: a worker that is still running keeps its entry, and that
+    /// entry is a genuinely reachable control channel — the reaper must not
+    /// evict a live worker.
+    #[tokio::test]
+    async fn a_still_running_workers_entry_stays_registered_and_reachable() {
+        let (tx, mut rx) = mpsc::channel::<AgentControl>(4);
+        let live = live_with(vec![("agent:designer", tx.clone())]);
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let task: JoinHandle<Result<(), RunnerError>> = tokio::spawn(async move {
+            if let Some(AgentControl::Swap { ack, harness_id, .. }) = rx.recv().await {
+                let _ = ack.send(Ok(HandoffSnapshot {
+                    harness: harness_id,
+                    session_id: "s-live".to_string(),
+                    notes: "still working".to_string(),
+                }));
+            }
+            let _ = release_rx.await;
+            Ok(())
+        });
+        let reaper = tokio::spawn(reap_controls_entry(
+            live.clone(),
+            "agent:designer".to_string(),
+            tx,
+            task,
+        ));
+
+        let sender = registered_sender(&live, "agent:designer")
+            .expect("a worker whose task is still running must stay registered");
+        let snapshot = send_swap_control(&sender, fake_harness(), "claude-code".to_string(), "ctx".to_string())
+            .await
+            .expect("a live worker's registered sender must complete the control round-trip");
+        assert_eq!(snapshot.session_id, "s-live");
+
+        let _ = release_tx.send(());
+        reaper.await.expect("the reaper task must not panic");
+    }
+
+    /// Boundary case: a reaper scheduled late must not evict the entry the
+    /// *next* sprint registered for the same `agent_id` — the whole point of
+    /// matching on the channel identity rather than the key alone.
+    #[tokio::test]
+    async fn a_late_reaper_leaves_the_next_sprints_entry_for_the_same_agent_id_alone() {
+        let (old_tx, old_rx) = mpsc::channel::<AgentControl>(4);
+        let (new_tx, _new_rx) = mpsc::channel::<AgentControl>(4);
+        let live = live_with(vec![("agent:designer", old_tx.clone())]);
+        let task = finished_worker(old_rx);
+        {
+            let mut guard = live.lock().expect("live handles mutex poisoned");
+            guard.controls.insert("agent:designer".to_string(), new_tx.clone());
+        }
+
+        reap_controls_entry(live.clone(), "agent:designer".to_string(), old_tx, task).await;
+
+        let survivor = registered_sender(&live, "agent:designer")
+            .expect("the re-registered live entry must survive the previous sprint's reaper");
+        assert!(
+            survivor.same_channel(&new_tx),
+            "the surviving entry must still be the NEW sprint's channel, not a resurrected old one"
+        );
+    }
+
+    /// Boundary case: the sprint-boundary batch clear (this function's
+    /// co-worker, which stays because `abort()` is asynchronous) can empty the
+    /// map first. A reaper that finds its entry already gone must be a no-op,
+    /// not a panic and not a removal of somebody else's key.
+    #[tokio::test]
+    async fn a_reaper_whose_entry_was_already_cleared_is_a_no_op() {
+        let (qa_tx, qa_rx) = mpsc::channel::<AgentControl>(4);
+        let (pm_tx, _pm_rx) = mpsc::channel::<AgentControl>(4);
+        let live = live_with(vec![("agent:qa", qa_tx.clone())]);
+        let task = finished_worker(qa_rx);
+        {
+            let mut guard = live.lock().expect("live handles mutex poisoned");
+            guard.controls.clear();
+            guard.controls.insert("agent:pm".to_string(), pm_tx);
+        }
+
+        reap_controls_entry(live.clone(), "agent:qa".to_string(), qa_tx, task).await;
+
+        assert_eq!(
+            registered(&live),
+            vec!["agent:pm".to_string()],
+            "a reaper whose own entry is already gone must leave every other entry untouched"
+        );
+    }
+}
+
+#[cfg(test)]
 mod live_controls_wiring_tests {
     //! White-box coverage (test-quality-auditor finding on this task): the
     //! integration-level "mid-sprint swap reaches the live worker" test in
@@ -1775,6 +2043,101 @@ mod live_controls_wiring_tests {
             .join(format!("{label}-{}", uuid::Uuid::new_v4()))
     }
 
+    /// Owns one test's data directory and removes it when the test ends —
+    /// pass OR panic (auditor r2: a panicking test skips a trailing
+    /// `remove_dir_all`, and `.crew-test/` is not covered by any ignore rule,
+    /// so the leftover `ledger.sqlite` shows up as untracked). `Drop` removes
+    /// exactly the one path this guard owns; never a glob, never its parent.
+    ///
+    /// `Drop` alone is the panic-safety net, not the primary teardown: it is
+    /// synchronous, so it cannot wait for the run's tasks, and a task that is
+    /// merely *aborted* gets one more poll in which `role_cli_cwd`'s
+    /// `create_dir_all` (controller.rs:142) can re-create the path right after
+    /// the removal. Measured before the fix below: 1 of 3 full
+    /// `cargo test -p crew-run` runs left `live-controls-reaper-finisher-<uuid>`
+    /// behind. The deterministic path is [`shutdown_and_settle`]; every test
+    /// here calls it, and `Drop` only has work left to do on a panic.
+    struct TestDataDir(std::path::PathBuf);
+
+    impl TestDataDir {
+        fn new(label: &str) -> Self {
+            Self(test_data_dir(label))
+        }
+
+        fn to_path_buf(&self) -> std::path::PathBuf {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for TestDataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Shuts a run down and does not return until its data directory is gone
+    /// and stays gone (auditor r3).
+    ///
+    /// Every test here calls this on the ONLY path out of its body, and none of
+    /// them panics while a run is still live: each observes into a value, tears
+    /// down, and asserts afterwards (auditor r3 round 2 — a test that panicked
+    /// mid-body skipped this entirely and fell back to `TestDataDir`'s `Drop`,
+    /// which is racy by construction, and the directory reappeared in 2/3 and
+    /// 3/3 of the auditor's mutation runs). The only panics left ahead of a
+    /// teardown are `RunController::start`'s own `expect` — where the run never
+    /// started, so no background task exists to re-create anything — and a
+    /// poisoned `LiveHandles` mutex, which already means another task panicked.
+    /// Nothing else indexes or unwraps while a run is live: the `worker_aborts`
+    /// lookups go through `.get()` and report an index/alignment mismatch as an
+    /// observation error rather than an index panic (auditor r3 second pass
+    /// named that site; `spawn_sprint` keeps the vector aligned with
+    /// `crew_agents`, so this is a guard, not an expected path).
+    ///
+    /// `RunHandle::shutdown` aborts every task but awaits only the bus, so the
+    /// finisher and the subscription loop are merely *asked* to stop. Both can
+    /// still be polled afterwards — the finisher through `spawn_sprint`, which
+    /// reaches `role_cli_cwd`'s `create_dir_all`, and the ledger through the
+    /// subscription loop — which is how an emptied directory reappeared after
+    /// the guard had removed it. So this takes those two `JoinHandle`s out of
+    /// the handle, aborts them, lets `shutdown` abort the rest, and then JOINS
+    /// them: once both have resolved, neither can touch the path again.
+    ///
+    /// The lead and the per-worker tasks expose only `AbortHandle`s
+    /// (`LiveHandles`), so they cannot be joined from here; that is what the
+    /// bounded loop is for. It is cooperative (`yield_now`) and never sleeps:
+    /// each turn removes the directory, yields so any task still being
+    /// cancelled takes its final poll, and only returns once the path is still
+    /// absent after that yield.
+    async fn shutdown_and_settle(mut handle: RunHandle, data_dir: &TestDataDir) {
+        let finisher = handle.finisher.take();
+        let sub_task = std::mem::replace(&mut handle.sub_task, tokio::spawn(async {}));
+        if let Some(task) = &finisher {
+            task.abort();
+        }
+        sub_task.abort();
+
+        // Aborts the rest — workers, lead, relay, human proxy — and awaits the bus.
+        RunHandle::shutdown(handle).await;
+
+        if let Some(task) = finisher {
+            let _ = task.await;
+        }
+        let _ = sub_task.await;
+
+        let path = data_dir.to_path_buf();
+        tokio::time::timeout(JOIN_TIMEOUT, async {
+            loop {
+                let _ = std::fs::remove_dir_all(&path);
+                tokio::task::yield_now().await;
+                if !path.exists() {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the run's data directory must stop being re-created once its tasks are joined: {path:?}"))
+    }
+
     /// Default (D5, contracts-m10.md §H1h.3): the existing helper's
     /// `RunConfig` carries no cmd DoD checks unless a test opts in.
     #[test]
@@ -1790,8 +2153,8 @@ mod live_controls_wiring_tests {
     /// `roles_all()` and the roster.
     #[tokio::test(flavor = "multi_thread")]
     async fn every_non_lead_role_is_registered_in_live_controls_lead_is_not() {
-        let data_dir = test_data_dir("live-controls-wiring");
-        let handle = RunController::start(scripted_config(data_dir.clone()))
+        let data_dir = TestDataDir::new("live-controls-wiring");
+        let handle = RunController::start(scripted_config(data_dir.to_path_buf()))
             .await
             .expect("start must succeed");
 
@@ -1800,6 +2163,8 @@ mod live_controls_wiring_tests {
             live.controls.keys().cloned().collect()
         };
 
+        shutdown_and_settle(handle, &data_dir).await;
+
         for id in ["agent:pm", "agent:designer", "agent:publisher", "agent:developer", "agent:qa"] {
             assert!(registered.contains(id), "{id} must be registered in live controls: {registered:?}");
         }
@@ -1807,9 +2172,6 @@ mod live_controls_wiring_tests {
             !registered.contains("agent:lead"),
             "the lead slot must never be registered (§D2a): {registered:?}"
         );
-
-        handle.shutdown().await;
-        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1824,34 +2186,346 @@ mod live_controls_wiring_tests {
     /// wrongly see `Ok(())` and fail.
     #[tokio::test(flavor = "multi_thread")]
     async fn swap_harness_uses_a_present_sender_and_reports_incomplete_when_it_is_dead() {
-        let data_dir = test_data_dir("live-controls-dead-sender");
-        let mut handle = RunController::start(scripted_config(data_dir.clone()))
+        let data_dir = TestDataDir::new("live-controls-dead-sender");
+        let mut handle = RunController::start(scripted_config(data_dir.to_path_buf()))
             .await
             .expect("start must succeed");
 
-        // The finisher clears `controls` at every sprint boundary; waiting
-        // for it to finish first keeps that clear from wiping the dead
-        // sender inserted below (issue #19).
-        tokio::time::timeout(JOIN_TIMEOUT, handle.join())
-            .await
-            .expect("join must finish within the deterministic budget")
-            .expect("lead runner must complete cleanly");
+        // Observation phase — returns instead of panicking, so the teardown
+        // below is reached on every path.
+        let observed: Result<Result<(), RunError>, String> = async {
+            // The finisher clears `controls` at every sprint boundary; waiting
+            // for it to finish first keeps that clear from wiping the dead
+            // sender inserted below (issue #19).
+            tokio::time::timeout(JOIN_TIMEOUT, handle.join())
+                .await
+                .map_err(|_| "join must finish within the deterministic budget".to_string())?
+                .map_err(|e| format!("lead runner must complete cleanly: {e}"))?;
 
-        {
-            let (dead_tx, dead_rx) = mpsc::channel::<AgentControl>(4);
-            drop(dead_rx);
-            let mut live = handle.live.lock().expect("live handles mutex poisoned");
-            live.controls.insert("agent:designer".to_string(), dead_tx);
+            {
+                let (dead_tx, dead_rx) = mpsc::channel::<AgentControl>(4);
+                drop(dead_rx);
+                let mut live = handle.live.lock().expect("live handles mutex poisoned");
+                live.controls.insert("agent:designer".to_string(), dead_tx);
+            }
+
+            Ok(handle.swap_harness("agent:designer", "opencode").await)
         }
+        .await;
 
-        let result = handle.swap_harness("agent:designer", "opencode").await;
+        shutdown_and_settle(handle, &data_dir).await;
+
+        let result = observed.unwrap_or_else(|e| panic!("{e}"));
         assert!(
             matches!(result, Err(RunError::SwapIncomplete(_))),
             "a present-but-dead sender must produce SwapIncomplete, not the sender-absent Ok fallback: {result:?}"
         );
+    }
 
-        handle.shutdown().await;
-        let _ = std::fs::remove_dir_all(&data_dir);
+    /// The escalation park (m7_gate.rs's fixture, contracts-m7.md §E5): a
+    /// planted Designer violation with `max_rework = 0` escalates `t-design`
+    /// on its first attempt, and `escalation_timeout_ms = 0` disables
+    /// `LeadBehavior`'s tick branch (crew-lead/src/dispatch.rs:576), so
+    /// nothing except `resolve_gate` can un-park the run. That holds the lead
+    /// task open, and the finisher's sprint-boundary `.controls.clear()` runs
+    /// only after the lead task joins — so for the whole of the test below,
+    /// the batch clear provably cannot fire. No sleep, no retry, no raised
+    /// timeout: the park is a state of the run, not a delay.
+    fn escalating_config(data_dir: std::path::PathBuf) -> RunConfig {
+        RunConfig {
+            mode: RunMode::Scripted {
+                planted_violations: vec![(Role::Designer, vec!["REQ-2".to_string()])],
+            },
+            max_rework: 0,
+            ..scripted_config(data_dir)
+        }
+    }
+
+    fn registered_keys(handle: &RunHandle) -> std::collections::HashSet<String> {
+        let live = handle.live.lock().expect("live handles mutex poisoned");
+        live.controls.keys().cloned().collect()
+    }
+
+    fn registered_sender(handle: &RunHandle, agent_id: &str) -> Option<mpsc::Sender<AgentControl>> {
+        let live = handle.live.lock().expect("live handles mutex poisoned");
+        live.controls.get(agent_id).cloned()
+    }
+
+    /// Waits (bounded) for one `TaskStateChanged`, the signal both wiring
+    /// tests use to know the run has reached its escalation park.
+    ///
+    /// Returns an error instead of panicking, so a caller can still reach its
+    /// teardown before reporting the failure (see the module note on why no
+    /// wiring test panics while a run is still live).
+    async fn wait_for_task_state(
+        rx: &mut broadcast::Receiver<RunEvent>,
+        task_id: &str,
+        state: TaskStateDto,
+    ) -> Result<(), String> {
+        tokio::time::timeout(JOIN_TIMEOUT, async {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        let matched = matches!(
+                            &ev,
+                            RunEvent::TaskStateChanged { task_id: t, state: s, .. }
+                                if t == task_id && *s == state
+                        );
+                        if matched {
+                            return Ok(());
+                        }
+                    }
+                    Err(err) => return Err(format!("the run's event stream closed or lagged: {err}")),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(format!("{task_id} must reach {state:?} within the deterministic budget")))
+    }
+
+    /// (c) Production wiring, SPRINT 0's arming site only (review r1 F2,
+    /// scope narrowed per auditor r2). [`reap_controls_entry`] has exactly two
+    /// production call sites, and this test covers the first one:
+    /// `RunController::start`'s loop, which arms reapers for sprint 0's
+    /// workers. Mutating that site to `drop((` makes this test RED; the
+    /// finisher's next-sprint site is NOT exercised here, because
+    /// `max_per_sprint = 0` keeps the whole run in sprint 0 — see
+    /// `the_finishers_next_sprint_install_arms_reapers_for_that_sprints_workers`
+    /// for that one. `controls_reaper_tests` stays GREEN under either
+    /// mutation, since those call the helper directly.
+    ///
+    /// The run is parked at `t-design`'s unresolved escalation, so the
+    /// sprint-0 boundary `.controls.clear()` cannot run and a reaper is the
+    /// only thing that can remove the aborted worker's key.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_spawn_path_arms_a_reaper_that_removes_one_ended_workers_entry_mid_sprint() {
+        let data_dir = TestDataDir::new("live-controls-reaper-wiring");
+        let handle = RunController::start(escalating_config(data_dir.to_path_buf()))
+            .await
+            .expect("start must succeed");
+        let mut rx = handle.subscribe();
+        const VICTIM: &str = "agent:qa";
+
+        // Observation phase — returns instead of panicking, so the teardown
+        // below is reached on every path.
+        type Observed = (std::collections::HashSet<String>, std::collections::HashSet<String>);
+        let observed: Result<Observed, String> = async {
+            wait_for_task_state(&mut rx, "t-design", TaskStateDto::Escalated).await?;
+
+            // `spawn_sprint` pushes `worker_aborts` inside the same
+            // `for (agent_id, role) in &crew` loop that inserts each `controls`
+            // entry, so index `i` is `crew[i]`'s worker. If that alignment ever
+            // breaks, the wrong worker is aborted, `VICTIM` stays registered and
+            // the bounded wait below fails loudly — it cannot pass vacuously.
+            let crew = crew_agents(&default_roster());
+            let victim_index = crew
+                .iter()
+                .position(|(id, _)| id == VICTIM)
+                .ok_or_else(|| "the default roster must carry the QA slot".to_string())?;
+
+            let before = registered_keys(&handle);
+            {
+                let live = handle.live.lock().expect("live handles mutex poisoned");
+                live.worker_aborts
+                    .get(victim_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "worker_aborts must be index-aligned with crew_agents: no entry {victim_index} in {} handles",
+                            live.worker_aborts.len()
+                        )
+                    })?
+                    .abort();
+            }
+
+            // Bounded and cooperative — `yield_now`, never a sleep: the reaper
+            // removes the key once the aborted `JoinHandle` resolves.
+            let after = tokio::time::timeout(JOIN_TIMEOUT, async {
+                loop {
+                    let keys = registered_keys(&handle);
+                    if !keys.contains(VICTIM) {
+                        return keys;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                "a reaper armed by the spawn path must remove an ended worker's control entry mid-sprint"
+                    .to_string()
+            })?;
+
+            Ok((before, after))
+        }
+        .await;
+
+        shutdown_and_settle(handle, &data_dir).await;
+
+        let (before, after) = observed.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            before.contains(VICTIM) && before.len() >= 2,
+            "the parked run must still advertise {VICTIM} plus at least one other worker: {before:?}"
+        );
+        assert!(
+            !after.is_empty(),
+            "removal must be per-worker: an emptied map would mean the sprint-boundary batch clear ran, \
+             which the unresolved escalation makes unreachable here: {after:?}"
+        );
+        assert!(
+            after.iter().all(|id| before.contains(id)),
+            "a reaper only removes its own key and must never add one: {after:?} vs {before:?}"
+        );
+    }
+
+    /// (d) Production wiring, the FINISHER's arming site (auditor r2,
+    /// BLOCKING). `RunController::start`'s loop covers sprint 0 only; every
+    /// later sprint's reapers are armed by a second loop inside the finisher,
+    /// right after that sprint's `controls` map is installed. Mutating that
+    /// second site alone survived the entire `crew-run` suite (lib 70/70,
+    /// m5_swap 8 passed) — this test is what makes it RED.
+    ///
+    /// Fixture. `max_per_sprint = 2` slices the linear DAG
+    /// (t-pm → t-design → t-publish → t-dev → t-qa) into
+    /// [t-pm, t-design] / [t-publish, t-dev] / [t-qa], which
+    /// m5_multisprint.rs pins. Nothing is planted for Pm or Designer, so
+    /// sprint 0 completes and the finisher really does spawn sprint 1. The
+    /// planted *Publisher* violation with `max_rework = 0` then escalates
+    /// `t-publish` inside sprint 1, and `t-dev` — which depends on it — stays
+    /// `Pending`, so `LeadBehavior::is_done()` never turns true and sprint 1's
+    /// own boundary `.controls.clear()` is unreachable for the rest of the
+    /// test. (Measured with this fixture: the run does not join within 5s and
+    /// all five entries are still registered. An in-sprint escalation does
+    /// NOT cascade dependents to `Blocked` — that only happens through the
+    /// next sprint's `prior_states`, which is why m5_multisprint's cascade
+    /// test needs `max_per_sprint = 2` to observe it.)
+    ///
+    /// Why `agent:designer` is the victim: it has no task in sprint 1 or
+    /// sprint 2, so aborting it cannot disturb the lead's dispatch or make the
+    /// bus report an undeliverable envelope.
+    ///
+    /// Why "sprint 1 is installed" is decided on channel identity rather than
+    /// on the `SprintStarted` event: the finisher emits `SprintStarted` BEFORE
+    /// it calls `spawn_sprint`, so that event proves nothing about the map. The
+    /// wait below instead requires the victim's registered entry to be a
+    /// DIFFERENT channel from the one sprint 0 registered, and reads the abort
+    /// handle under the same lock acquisition, so the map and the handle cannot
+    /// come from two different sprints.
+    ///
+    /// Why the peer check is what makes this exact: a boundary clear plus the
+    /// next sprint's install would replace `agent:pm`'s entry with a fresh
+    /// channel (or leave it briefly absent). Requiring it to still be sprint
+    /// 1's OWN channel means a boundary win can only ever fail this test, never
+    /// pass it for the wrong reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_finishers_next_sprint_install_arms_reapers_for_that_sprints_workers() {
+        const VICTIM: &str = "agent:designer";
+        const PEER: &str = "agent:pm";
+
+        let data_dir = TestDataDir::new("live-controls-reaper-finisher");
+        let handle = RunController::start(RunConfig {
+            mode: RunMode::Scripted {
+                planted_violations: vec![(Role::Publisher, vec!["REQ-2".to_string()])],
+            },
+            max_rework: 0,
+            max_per_sprint: 2,
+            ..scripted_config(data_dir.to_path_buf())
+        })
+        .await
+        .expect("start must succeed");
+        let mut rx = handle.subscribe();
+
+        // Observation phase — returns instead of panicking, so the teardown
+        // below is reached on every path.
+        type Observed = (
+            Option<mpsc::Sender<AgentControl>>,
+            Option<mpsc::Sender<AgentControl>>,
+            mpsc::Sender<AgentControl>,
+            Vec<String>,
+        );
+        let observed: Result<Observed, String> = async {
+            let sprint0_victim_tx = registered_sender(&handle, VICTIM)
+                .ok_or_else(|| "the victim must be registered in sprint 0".to_string())?;
+
+            wait_for_task_state(&mut rx, "t-publish", TaskStateDto::Escalated).await?;
+
+            // `spawn_sprint` pushes `worker_aborts` inside the same
+            // `for (agent_id, role) in &crew` loop that inserts each `controls`
+            // entry, so index `i` is `crew[i]`'s worker.
+            let crew = crew_agents(&default_roster());
+            let victim_index = crew
+                .iter()
+                .position(|(id, _)| id == VICTIM)
+                .ok_or_else(|| "the default roster must carry the Designer slot".to_string())?;
+
+            let (victim_tx, peer_tx, victim_abort) = tokio::time::timeout(JOIN_TIMEOUT, async {
+                loop {
+                    let installed = {
+                        let live = handle.live.lock().expect("live handles mutex poisoned");
+                        match (
+                            live.controls.get(VICTIM).cloned(),
+                            live.controls.get(PEER).cloned(),
+                            live.worker_aborts.get(victim_index).cloned(),
+                        ) {
+                            (Some(victim), Some(peer), Some(abort))
+                                if !victim.same_channel(&sprint0_victim_tx) =>
+                            {
+                                Some((victim, peer, abort))
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(found) = installed {
+                        return found;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| "the finisher must install a later sprint's controls map".to_string())?;
+
+            victim_abort.abort();
+
+            // Bounded and cooperative — `yield_now`, never a sleep.
+            tokio::time::timeout(JOIN_TIMEOUT, async {
+                loop {
+                    let gone = {
+                        let live = handle.live.lock().expect("live handles mutex poisoned");
+                        !live.controls.get(VICTIM).is_some_and(|tx| tx.same_channel(&victim_tx))
+                    };
+                    if gone {
+                        return;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| {
+                "a reaper armed by the FINISHER's next-sprint install must remove an ended worker's \
+                 control entry"
+                    .to_string()
+            })?;
+
+            let (victim_now, peer_now, keys) = {
+                let live = handle.live.lock().expect("live handles mutex poisoned");
+                let mut keys: Vec<String> = live.controls.keys().cloned().collect();
+                keys.sort();
+                (live.controls.get(VICTIM).cloned(), live.controls.get(PEER).cloned(), keys)
+            };
+            Ok((victim_now, peer_now, peer_tx, keys))
+        }
+        .await;
+
+        shutdown_and_settle(handle, &data_dir).await;
+
+        let (victim_now, peer_now, peer_tx, keys) = observed.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            victim_now.is_none(),
+            "the ended worker's entry must be REMOVED, not replaced by a later sprint's channel: {keys:?}"
+        );
+        assert!(
+            peer_now.is_some_and(|tx| tx.same_channel(&peer_tx)),
+            "the peer must still hold the very channel this sprint registered — anything else means the \
+             sprint boundary replaced the map instead of a reaper removing one key: {keys:?}"
+        );
     }
 }
 
