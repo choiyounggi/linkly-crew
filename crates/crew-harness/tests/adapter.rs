@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crew_harness::claude::ClaudeCodeHarness;
-use crew_harness::{AgentCfg, Harness, HarnessEvent, TurnOutcome, UserTurn};
+use crew_harness::{AgentCfg, Harness, HarnessError, HarnessEvent, TurnOutcome, UserTurn};
 
 fn fake_cli_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-claude.sh")
@@ -18,6 +18,7 @@ fn agent_cfg() -> AgentCfg {
     AgentCfg {
         cwd: std::env::current_dir().expect("current dir"),
         model: None,
+        tool_use: false,
     }
 }
 
@@ -441,4 +442,207 @@ async fn auto_memory_disabled_false_omits_the_env_var() {
     );
 
     harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D1/D5 — `tool_use: true` appends exactly the 6 permission-flag elements, in
+/// D1's order, after the `--setting-sources` pair. The assertion is on the WHOLE
+/// argv (wiki testing-mocking-captured-call-arguments, rule 1): a wrong value, a
+/// dropped element and a reordering all redden it, which asserting
+/// `argv.contains("--permission-mode")` would not.
+#[tokio::test]
+async fn spawn_with_tool_use_appends_permission_flags() {
+    let log_path = argv_log_path("spawn_with_tool_use_appends_permission_flags");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ARGV_LOG", log_path.to_str().unwrap());
+    let mut cfg = agent_cfg();
+    cfg.tool_use = true;
+
+    let mut session = harness.spawn(&cfg).await.expect("spawn should succeed");
+    let id = session.session_id().to_string();
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let argv = read_and_clear_argv(&log_path);
+
+    let expected: Vec<String> = [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--session-id",
+        &id,
+        "--setting-sources",
+        "project,local",
+        "--permission-mode",
+        "acceptEdits",
+        "--permission-prompts",
+        "none",
+        "--disallowedTools",
+        "Bash",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(argv, expected);
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D1 boundary — `tool_use: false` (every production path in this release) must
+/// leave the spawn argv byte-identical to the legacy 10 elements: the flag is
+/// opt-in, so a harness that always adds them would change production behaviour.
+#[tokio::test]
+async fn spawn_without_tool_use_keeps_legacy_argv() {
+    let log_path = argv_log_path("spawn_without_tool_use_keeps_legacy_argv");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ARGV_LOG", log_path.to_str().unwrap());
+    let cfg = agent_cfg();
+    assert!(!cfg.tool_use, "agent_cfg() must keep the production default");
+
+    let mut session = harness.spawn(&cfg).await.expect("spawn should succeed");
+    let id = session.session_id().to_string();
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let argv = read_and_clear_argv(&log_path);
+
+    let expected: Vec<String> = [
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--session-id",
+        &id,
+        "--setting-sources",
+        "project,local",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(argv, expected);
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D1 — the resume path carries the same flags, or a resumed crew member silently
+/// loses tool use mid-run. Legacy resumed argv is also 10 elements (`-p -r <id>`
+/// = 3, the 4 stream-json/verbose flags = 5, `--setting-sources project,local`
+/// = 2; no `--session-id`).
+#[tokio::test]
+async fn spawn_resumed_with_tool_use_appends_permission_flags() {
+    let log_path = argv_log_path("spawn_resumed_with_tool_use_appends_permission_flags");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ARGV_LOG", log_path.to_str().unwrap());
+    let mut cfg = agent_cfg();
+    cfg.tool_use = true;
+    let rid = uuid::Uuid::new_v4();
+
+    let mut session = harness
+        .spawn_resumed(&cfg, rid)
+        .await
+        .expect("spawn_resumed should succeed");
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let argv = read_and_clear_argv(&log_path);
+
+    let rid = rid.to_string();
+    let expected: Vec<String> = [
+        "-p",
+        "-r",
+        &rid,
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--setting-sources",
+        "project,local",
+        "--permission-mode",
+        "acceptEdits",
+        "--permission-prompts",
+        "none",
+        "--disallowedTools",
+        "Bash",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(argv, expected);
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D1 boundary, resume path — `tool_use: false` leaves the resumed argv byte-
+/// identical to its legacy 10 elements.
+#[tokio::test]
+async fn spawn_resumed_without_tool_use_keeps_legacy_argv() {
+    let log_path = argv_log_path("spawn_resumed_without_tool_use_keeps_legacy_argv");
+    let harness = ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap())
+        .with_env("FAKE_MODE", "normal")
+        .with_env("FAKE_ARGV_LOG", log_path.to_str().unwrap());
+    let cfg = agent_cfg();
+    assert!(!cfg.tool_use, "agent_cfg() must keep the production default");
+    let rid = uuid::Uuid::new_v4();
+
+    let mut session = harness
+        .spawn_resumed(&cfg, rid)
+        .await
+        .expect("spawn_resumed should succeed");
+    wait_for_started(&mut harness.take_events(&mut session)).await;
+    let argv = read_and_clear_argv(&log_path);
+
+    let rid = rid.to_string();
+    let expected: Vec<String> = [
+        "-p",
+        "-r",
+        &rid,
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--setting-sources",
+        "project,local",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(argv, expected);
+
+    harness.shutdown(session).await.expect("shutdown");
+}
+
+/// D5 error case — the permission flags must not change how a bad `cwd` fails:
+/// `.current_dir()` on a nonexistent directory still surfaces as
+/// `HarnessError::Spawn`, in both modes.
+#[tokio::test]
+async fn spawn_in_missing_cwd_fails_as_spawn_error_in_both_modes() {
+    let missing = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".crew-test/t5-no-such-dir");
+    assert!(
+        !missing.exists(),
+        "precondition: {} must not exist",
+        missing.display()
+    );
+    let harness =
+        ClaudeCodeHarness::with_binary(fake_cli_path().to_str().unwrap()).with_env("FAKE_MODE", "normal");
+
+    for tool_use in [false, true] {
+        let mut cfg = agent_cfg();
+        cfg.cwd = missing.clone();
+        cfg.tool_use = tool_use;
+
+        // Classified instead of `matches!`-and-print: `Session` has no `Debug`,
+        // and the string keeps the failure message readable.
+        let outcome = match harness.spawn(&cfg).await {
+            Err(HarnessError::Spawn(_)) => "Spawn".to_string(),
+            Err(other) => format!("other error: {other}"),
+            Ok(_) => "Ok(session)".to_string(),
+        };
+        assert_eq!(
+            outcome, "Spawn",
+            "tool_use={tool_use}: a nonexistent cwd must stay a HarnessError::Spawn"
+        );
+    }
 }
