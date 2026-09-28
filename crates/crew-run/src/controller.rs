@@ -410,6 +410,7 @@ async fn spawn_sprint(
                 let harness_cfg = HarnessAgentCfg {
                     cwd: role_cli_cwd(role_worktrees, data_dir, role),
                     model: None,
+                    tool_use: false,
                 };
                 let system_hint = role_system_hint(role, goal, project_root);
                 // Permit is scoped to each CLI interaction (turn), not the

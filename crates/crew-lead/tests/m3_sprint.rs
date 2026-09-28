@@ -390,6 +390,7 @@ async fn real_cli_five_role_sprint_completes() {
         let cfg = AgentCfg {
             cwd: isolated_cli_cwd(dir_name),
             model: None,
+            tool_use: false,
         };
         let system_hint = format!("You are the {role:?} of a web team building a simple landing page.");
         let behavior = RoleHarnessBehavior::new(harness, cfg, role, system_hint);

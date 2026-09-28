@@ -44,6 +44,7 @@ impl LlmLeadPlanner {
         let cfg = AgentCfg {
             cwd: std::env::current_dir().map_err(|e| PlanError::LlmSpecify(format!("cwd: {e}")))?,
             model: None,
+            tool_use: false,
         };
         let mut session = harness
             .spawn(&cfg)

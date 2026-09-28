@@ -689,6 +689,7 @@ mod role_harness_behavior_tests {
             AgentCfg {
                 cwd: std::env::current_dir().expect("current dir"),
                 model: None,
+                tool_use: false,
             },
             Role::Developer,
             // Deliberately does NOT mention tools or JSON — proves the
@@ -782,6 +783,7 @@ mod turn_recovery_tests {
         AgentCfg {
             cwd: std::env::current_dir().expect("current dir"),
             model: None,
+            tool_use: false,
         }
     }
 
@@ -1212,6 +1214,7 @@ mod timeout_knob_tests {
         AgentCfg {
             cwd: std::env::current_dir().expect("current dir"),
             model: None,
+            tool_use: false,
         }
     }
 
