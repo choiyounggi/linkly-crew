@@ -1,8 +1,9 @@
-// Bottom input (t7 plan D6): there is no backend free-message command, so
-// the composer is gate-response-only. With an active gate it lets the user
-// type a reason and approve/reject it (same resolveGate(runId, ...) call
-// GateCard uses); with none, it is disabled with a placeholder explaining
-// why (free text is a later milestone).
+// Thread-side answer widget (t8 plan D3d): there is no backend free-message
+// command, so the composer is gate-response-only. It requires an active gate
+// to mount at all — the caller (ThreadPanel) is responsible for not mounting
+// it when there is nothing to answer, so this component never shows a
+// disabled placeholder state; a control with nothing to do is absent, not
+// disabled.
 
 import { useState } from "react";
 
@@ -13,7 +14,7 @@ import type { ActiveGate } from "./derive";
 
 interface ComposerProps {
   runId: string;
-  activeGate: ActiveGate | null;
+  activeGate: ActiveGate;
   source?: RunEventSource;
 }
 
@@ -28,10 +29,10 @@ export default function Composer({ runId, activeGate, source = defaultSource }: 
   const [submitting, setSubmitting] = useState<Submitting>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const active = activeGate !== null && typeof source.resolveGate === "function";
+  if (typeof source.resolveGate !== "function") return null;
 
   async function decide(decision: "approve" | "reject") {
-    if (!activeGate || typeof source.resolveGate !== "function") return;
+    if (typeof source.resolveGate !== "function") return;
     setSubmitting(decision);
     setError(null);
     try {
@@ -48,10 +49,10 @@ export default function Composer({ runId, activeGate, source = defaultSource }: 
     <div className="composer">
       <textarea
         className="composer__input"
-        value={active ? reason : ""}
+        value={reason}
         onChange={(e) => setReason(e.target.value)}
-        disabled={!active || submitting !== null}
-        placeholder={active ? "승인/반려 사유 (선택)" : "@멘션 2차 예정"}
+        disabled={submitting !== null}
+        placeholder="승인/반려 사유 (선택)"
         aria-label="게이트 응답"
         rows={2}
       />
@@ -59,7 +60,7 @@ export default function Composer({ runId, activeGate, source = defaultSource }: 
         <Button
           variant="primary"
           size="sm"
-          disabled={!active || submitting !== null}
+          disabled={submitting !== null}
           loading={submitting === "approve"}
           onClick={() => void decide("approve")}
         >
@@ -68,7 +69,7 @@ export default function Composer({ runId, activeGate, source = defaultSource }: 
         <Button
           variant="danger"
           size="sm"
-          disabled={!active || submitting !== null}
+          disabled={submitting !== null}
           loading={submitting === "reject"}
           onClick={() => void decide("reject")}
         >

@@ -55,7 +55,7 @@ describe("MessageRow — kind render map (normal, D2)", () => {
     expect(screen.getByText("dod unmet")).toBeInTheDocument();
   });
 
-  it("renders human.gate as a sentence (REPLACES the old GateCard render — GateCard is gone from this row)", () => {
+  it("renders human.gate as a sentence (REPLACES the old dedicated-card render — that card component is gone from this row)", () => {
     render(
       <MessageRow
         {...BASE_PROPS}
@@ -331,6 +331,20 @@ describe("MessageRow — presence + reply footer (normal/boundary, D1/D4)", () =
     render(<MessageRow {...BASE_PROPS} envelope={envelope({ id: "e7", kind: "task.assign", body: {} })} />);
 
     expect(screen.queryByText(/👀/)).not.toBeInTheDocument();
+  });
+
+  it("shows the 응답 필요 badge when unresolvedGate is true (normal, D3b)", () => {
+    render(
+      <MessageRow {...BASE_PROPS} unresolvedGate envelope={envelope({ id: "e7a", kind: "task.assign", body: {} })} />,
+    );
+
+    expect(screen.getByText("응답 필요")).toBeInTheDocument();
+  });
+
+  it("omits the 응답 필요 badge when unresolvedGate is omitted/false (boundary, D3b)", () => {
+    render(<MessageRow {...BASE_PROPS} envelope={envelope({ id: "e7b", kind: "task.assign", body: {} })} />);
+
+    expect(screen.queryByText("응답 필요")).not.toBeInTheDocument();
   });
 
   it("shows a clickable 댓글 N개 badge and calls onOpenThread with the thread id", () => {

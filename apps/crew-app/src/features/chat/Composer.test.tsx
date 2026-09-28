@@ -18,14 +18,13 @@ function fakeSource(overrides: Partial<RunEventSource> = {}): RunEventSource {
   };
 }
 
-describe("Composer — no active gate (boundary, D6)", () => {
-  it("is disabled with the '@멘션 2차 예정' placeholder — no free-message command exists", () => {
-    render(<Composer runId="run_1" activeGate={null} source={fakeSource()} />);
+describe("Composer — no resolveGate on the source (boundary, D3d — REPLACES the old 'no active gate' disabled-state describe block, since activeGate is now required and that state can no longer be constructed)", () => {
+  it("renders nothing when the source has no resolveGate method", () => {
+    const { container } = render(
+      <Composer runId="run_1" activeGate={{ taskId: "t-qa", reason: "why" }} source={fakeSource({ resolveGate: undefined })} />,
+    );
 
-    const input = screen.getByPlaceholderText("@멘션 2차 예정");
-    expect(input).toBeDisabled();
-    expect(screen.getByRole("button", { name: "승인" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "반려" })).toBeDisabled();
+    expect(container.firstChild).toBeNull();
   });
 });
 

@@ -103,6 +103,98 @@ describe("ThreadPanel — timeline filtering (normal/boundary)", () => {
   });
 });
 
+describe("ThreadPanel — thread-side answer composer (normal/boundary, D3d)", () => {
+  it("shows an enabled 게이트 응답 composer when the thread has an unresolved human.gate", () => {
+    setChannel({
+      messages: [
+        { seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-qa", body: {} }) },
+        {
+          seq: 2,
+          envelope: envelope({
+            id: "e2",
+            kind: "human.gate",
+            thread: "t-qa",
+            body: { task_id: "t-qa", reason: "why" },
+          }),
+        },
+      ],
+    });
+
+    render(<ThreadPanel runId={RUN_ID} threadId="t-qa" onClose={() => {}} />);
+
+    const composer = screen.getByLabelText("게이트 응답");
+    expect(composer).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "승인" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "반려" })).not.toBeDisabled();
+  });
+
+  it("shows no composer once a matching human.response has resolved the gate", () => {
+    setChannel({
+      messages: [
+        { seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-qa", body: {} }) },
+        {
+          seq: 2,
+          envelope: envelope({
+            id: "e2",
+            kind: "human.gate",
+            thread: "t-qa",
+            body: { task_id: "t-qa", reason: "why" },
+          }),
+        },
+        {
+          seq: 3,
+          envelope: envelope({
+            id: "e3",
+            kind: "human.response",
+            thread: "t-qa",
+            body: { task_id: "t-qa", decision: "approve", reason: "ok" },
+          }),
+        },
+      ],
+    });
+
+    render(<ThreadPanel runId={RUN_ID} threadId="t-qa" onClose={() => {}} />);
+
+    expect(screen.queryByLabelText("게이트 응답")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "승인" })).not.toBeInTheDocument();
+  });
+
+  it("shows no composer for a thread with no gate at all (boundary)", () => {
+    setChannel({
+      messages: [{ seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-pm", body: {} }) }],
+    });
+
+    render(<ThreadPanel runId={RUN_ID} threadId="t-pm" onClose={() => {}} />);
+
+    expect(screen.queryByLabelText("게이트 응답")).not.toBeInTheDocument();
+  });
+});
+
+describe("ThreadPanel — ack-derived readers (normal, D2)", () => {
+  it("shows the 👀 badge for a message an ack's in_reply_to targets, inside this thread", () => {
+    setChannel({
+      messages: [
+        { seq: 1, envelope: envelope({ id: "e1", kind: "task.assign", thread: "t-pm", body: {} }) },
+        {
+          seq: 2,
+          envelope: envelope({
+            id: "e2",
+            kind: "task.ack",
+            thread: "t-pm",
+            from: "agent:pm",
+            in_reply_to: "e1",
+            body: {},
+          }),
+        },
+      ],
+    });
+
+    render(<ThreadPanel runId={RUN_ID} threadId="t-pm" onClose={() => {}} />);
+
+    expect(screen.getByText("👀 1")).toBeInTheDocument();
+  });
+});
+
 describe("ThreadPanel — list container structure (issue #29 regression pin)", () => {
   it("renders exactly one .thread-panel__list containing exactly one row (normal)", () => {
     setChannel({

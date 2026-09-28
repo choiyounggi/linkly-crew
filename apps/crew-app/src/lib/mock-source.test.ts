@@ -99,6 +99,23 @@ describe("MockEventSource", () => {
     ]);
   });
 
+  it("scripted=true additionally emits the 4 showcase kinds on their own thread, base 19 unaffected (D7)", async () => {
+    const source = new MockEventSource(0);
+    const received: RunEvent[] = [];
+    source.onEvent((_runId, ev) => received.push(ev));
+
+    await source.start("간단한 랜딩 페이지", true, null);
+    await vi.runAllTimersAsync();
+
+    const messages = received.filter((ev): ev is Extract<RunEvent, { type: "message" }> => ev.type === "message");
+    const showcase = messages.filter((m) => m.envelope.thread === "demo-showcase");
+    expect(showcase.map((m) => m.envelope.kind)).toEqual(["task.progress", "review.request", "question", "answer"]);
+    expect(showcase.every((m) => m.envelope.thread === "demo-showcase")).toBe(true);
+
+    const nonShowcase = messages.filter((m) => m.envelope.thread !== "demo-showcase");
+    expect(nonShowcase).toHaveLength(3 * 3 + 4 + 5 + 1);
+  });
+
   it("escalates t-qa via a blocked message + human.gate carrying body.task_id, reaching state escalated (contracts-m7.md §E8)", async () => {
     const source = new MockEventSource(0);
     const received: RunEvent[] = [];

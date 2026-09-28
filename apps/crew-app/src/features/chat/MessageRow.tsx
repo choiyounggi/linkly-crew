@@ -27,6 +27,8 @@ interface MessageRowProps {
   gateResolution: HumanResponseBody | null;
   /** t7 plan D1 exception (R3): set when this row is a `human.gate` promoted into the main stream — names the task thread it belongs to. */
   parentThread?: string;
+  /** t8 plan D3b: true when this root's thread holds an unresolved `human.gate` — shows the "응답 필요" footer badge. */
+  unresolvedGate?: boolean;
   onOpenThread?: (threadId: string) => void;
 }
 
@@ -184,7 +186,14 @@ function MessageBody({ envelope }: Pick<MessageRowProps, "envelope">) {
   );
 }
 
-function MessageRow({ envelope, replyCount, readers, parentThread, onOpenThread }: MessageRowProps) {
+function MessageRow({
+  envelope,
+  replyCount,
+  readers,
+  parentThread,
+  unresolvedGate = false,
+  onOpenThread,
+}: MessageRowProps) {
   if (envelope.kind === "task.ack") return null;
 
   const variant = rowVariantClass(envelope.kind);
@@ -225,6 +234,7 @@ function MessageRow({ envelope, replyCount, readers, parentThread, onOpenThread 
           </div>
         )}
         <div className="message-row__footer">
+          {unresolvedGate && <span className="message-row__gate-badge">{"응답 필요"}</span>}
           {readers.length > 0 && (
             <span className="message-row__readers" title={readers.join(", ")}>
               {`👀 ${readers.length}`}

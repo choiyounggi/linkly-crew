@@ -5,8 +5,6 @@ export interface ChatRootItem {
   seq: number;
   envelope: Envelope;
   replyCount: number;
-  /** t7 plan D1 exception (R3): set when this root is a `human.gate` promoted into the main stream even though it is a reply, not its thread's actual root — names the task thread it still belongs to (also `envelope.thread`), so a click can still open that thread. */
-  parentThread?: string;
 }
 
 /**
@@ -14,13 +12,10 @@ export interface ChatRootItem {
  * `id === thread`, or — for a reply that arrives before its root, e.g.
  * out-of-order/scripted demo delivery — it is the first message seen for
  * that `thread`, provisionally, until the real root shows up). Every other
- * message in the same thread folds into the root's `replyCount` ("댓글 N개").
- *
- * D1 exception (R3, decisions.md): a `human.gate` always ALSO surfaces as
- * its own one-message root in the main stream — approval must never be
- * buried behind a "댓글 N개" click — while still counting as a reply on its
- * real thread's root. Skipped only when the gate happens to already be that
- * thread's actual root (no duplicate row).
+ * message in the same thread folds into the root's `replyCount` ("댓글 N개"),
+ * including `human.gate` (t8 plan D3a — the prior main-stream promotion
+ * exception is gone; an unresolved gate now surfaces via `unresolvedGateThreads`
+ * below and a footer badge, not a duplicated row).
  */
 export function deriveRoots(messages: { seq: number; envelope: Envelope }[]): ChatRootItem[] {
   const rootByThread = new Map<string, ChatRootItem>();
@@ -37,12 +32,6 @@ export function deriveRoots(messages: { seq: number; envelope: Envelope }[]): Ch
     } else {
       existing.replyCount += 1;
     }
-
-    if (envelope.kind === "human.gate" && rootByThread.get(key)?.envelope.id !== envelope.id) {
-      const gateKey = `gate:${envelope.id}`;
-      rootByThread.set(gateKey, { seq, envelope, replyCount: 0, parentThread: key });
-      order.push(gateKey);
-    }
   }
 
   return order.map((key) => {
@@ -52,7 +41,31 @@ export function deriveRoots(messages: { seq: number; envelope: Envelope }[]): Ch
   });
 }
 
-/** t7 plan D3: task id -> its `human.response`, once one arrives — GateCard reads this to disable itself and show the outcome. */
+/** t8 plan D2: a `task.ack`'s sender is added to the readers of the message it acknowledges — `in_reply_to` when present, otherwise the ack's thread ROOT ROW's real `envelope.id` (never the thread id string itself; message ids and thread ids are disjoint namespaces). */
+export function ackReaders(messages: { seq: number; envelope: Envelope }[]): Record<string, string[]> {
+  const roots = deriveRoots(messages);
+  const rootIdByThread = new Map(roots.map((r) => [r.envelope.thread, r.envelope.id]));
+  const readers: Record<string, string[]> = {};
+  for (const { envelope } of messages) {
+    if (envelope.kind !== "task.ack") continue;
+    const targetId = envelope.in_reply_to ?? rootIdByThread.get(envelope.thread) ?? envelope.thread;
+    const existing = readers[targetId] ?? [];
+    if (!existing.includes(envelope.from)) readers[targetId] = [...existing, envelope.from];
+  }
+  return readers;
+}
+
+/** t8 plan D2: unions the store's presence-derived read receipts with ack-derived readers for one message id, deduped. */
+export function readersFor(
+  id: string,
+  storeReadReceipts: Record<string, string[]>,
+  ackMap: Record<string, string[]>,
+): string[] {
+  const combined = new Set([...(storeReadReceipts[id] ?? []), ...(ackMap[id] ?? [])]);
+  return [...combined];
+}
+
+/** t7 plan D3: task id -> its `human.response`, once one arrives — used to tell a resolved gate from an unresolved one. */
 export function gateResolutions(messages: { seq: number; envelope: Envelope }[]): Map<string, HumanResponseBody> {
   const resolved = new Map<string, HumanResponseBody>();
   for (const { envelope } of messages) {
@@ -61,6 +74,19 @@ export function gateResolutions(messages: { seq: number; envelope: Envelope }[])
     if (parsed) resolved.set(parsed.task_id, parsed);
   }
   return resolved;
+}
+
+/** t8 plan D3b: every thread that holds a `human.gate` with no matching `human.response` yet — drives the "응답 필요" footer badge on that thread's root row. Computed at render time from `messages`, never stored. */
+export function unresolvedGateThreads(messages: { seq: number; envelope: Envelope }[]): Set<string> {
+  const resolved = gateResolutions(messages);
+  const unresolved = new Set<string>();
+  for (const { envelope } of messages) {
+    if (envelope.kind !== "human.gate") continue;
+    const parsed = parseHumanGateBody(envelope.body);
+    if (!parsed) continue;
+    if (!resolved.has(parsed.task_id)) unresolved.add(envelope.thread);
+  }
+  return unresolved;
 }
 
 export interface ActiveGate {
