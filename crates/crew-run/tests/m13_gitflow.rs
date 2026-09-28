@@ -656,3 +656,79 @@ async fn rejected_root_creates_no_base_dir() {
     }
     assert!(!f.base.exists(), "a rejected root must create no base dir");
 }
+
+/// Drains everything already buffered on `rx`.
+fn drain(rx: &mut tokio::sync::broadcast::Receiver<RunEvent>) -> Vec<RunEvent> {
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    events
+}
+
+/// The handoff notes and `RosterChanged` count in `events` — the two things a
+/// swap that went through always emits for a worker slot.
+fn swap_signature(events: &[RunEvent]) -> (Vec<String>, usize) {
+    let notes = events
+        .iter()
+        .filter_map(|ev| match ev {
+            RunEvent::Message { envelope, .. } if envelope.kind == crew_proto::MessageKind::Handoff => {
+                crew_proto::handoff_pack_from_body(&envelope.body).map(|pack| pack.notes)
+            }
+            _ => None,
+        })
+        .collect();
+    let roster_changed = events.iter().filter(|ev| matches!(ev, RunEvent::RosterChanged { .. })).count();
+    (notes, roster_changed)
+}
+
+/// Integration review F1 r2 (error + boundary): under a project_root the
+/// claude-code roles run with tool use, which pi cannot confine to the
+/// worktree — a swap to pi is refused before the roster, the ledger or the
+/// live worker is touched. A swap to claude-code on the same slot still goes
+/// through, and its handoff shows the slot was never rewritten to pi.
+#[tokio::test(flavor = "multi_thread")]
+async fn swap_to_pi_under_project_root_is_refused_up_front() {
+    let f = Fixture::new("swap-pi");
+    let handle = RunController::start_with_worktrees_base(f.config(Some(f.repo.clone()), false), f.base.clone())
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+    let mut rx = handle.subscribe();
+    drain(&mut rx);
+
+    let refused = handle.swap_harness("agent:developer", "pi").await;
+    let after_refused = swap_signature(&drain(&mut rx));
+    let kept = handle.swap_harness("agent:developer", "claude-code").await;
+    let after_kept = swap_signature(&drain(&mut rx));
+    handle.shutdown_and_wait().await;
+
+    match refused {
+        Err(RunError::SwapRejected(msg)) => {
+            assert!(msg.contains("pi"), "must name the target harness: {msg}");
+            assert!(msg.contains("cannot confine writes to the worktree"), "must say why: {msg}");
+        }
+        other => panic!("a swap to pi under a project_root must be SwapRejected, got {other:?}"),
+    }
+    assert_eq!(after_refused, (Vec::new(), 0), "a refused swap must emit no handoff and no RosterChanged");
+    assert!(kept.is_ok(), "a swap to claude-code must still proceed: {kept:?}");
+    assert_eq!(
+        after_kept,
+        (vec!["harness swap: claude-code -> claude-code".to_string()], 1),
+        "the refused swap must not have rewritten the slot to pi"
+    );
+}
+
+/// Normal (F1 r2): without a project_root nothing runs with tool use, so a
+/// swap to pi is allowed exactly as before.
+#[tokio::test(flavor = "multi_thread")]
+async fn swap_to_pi_without_project_root_is_allowed() {
+    let f = Fixture::new("swap-pi-none");
+    let handle = RunController::start_with_worktrees_base(f.config(None, false), f.base.clone())
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+
+    let result = handle.swap_harness("agent:developer", "pi").await;
+    handle.shutdown_and_wait().await;
+
+    assert!(result.is_ok(), "without a project_root a swap to pi must proceed: {result:?}");
+}
