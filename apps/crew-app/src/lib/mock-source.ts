@@ -35,6 +35,12 @@ function isValidProjectName(name: string): boolean {
 
 const SPRINT_ID = "sprint-1";
 
+/** integ-fix F2: the real backend's Lead thread id (`format!("th-{agent_id}")`, crew-lead/src/dispatch.rs) — `human.gate` goes out here, never on the task's own thread. */
+const LEAD_THREAD = "th-agent:lead";
+
+/** integ-fix F2: the real backend's per-task gate-response thread id (`format!("th-gate-{}", cmd.task_id)`, crew-run/src/controller.rs human_proxy_loop) — resolveGate's `human.response` lands here, not on LEAD_THREAD or the task's thread. */
+const gateResponseThread = (taskId: string) => `th-gate-${taskId}`;
+
 const REQ_IDS = ["REQ-1", "REQ-2", "REQ-3", "REQ-4", "REQ-5"];
 
 const REQUIREMENTS: Requirement[] = [
@@ -274,7 +280,7 @@ function buildScenario(goal: string, initialRoster: Roster, allocateSeq: () => n
       events.push({ type: "task_state_changed", task_id: task.id, state: "blocked", ts: PENDING_TS });
 
       const gate = makeEnvelope({
-        thread: task.id,
+        thread: LEAD_THREAD,
         from: "lead",
         to: [],
         kind: "human.gate",
@@ -641,7 +647,7 @@ export class MockEventSource implements RunEventSource {
       id: `env_gate_${++this.gateEnvCounter}`,
       ts: now,
       sprint: SPRINT_ID,
-      thread: taskId,
+      thread: gateResponseThread(taskId),
       from: "human",
       to: ["lead"],
       kind: "human.response",

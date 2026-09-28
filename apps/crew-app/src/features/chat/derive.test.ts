@@ -118,6 +118,23 @@ describe("unresolvedGateThreads — normal/boundary (D3b)", () => {
   it("returns an empty set for no messages (boundary)", () => {
     expect(unresolvedGateThreads([])).toEqual(new Set());
   });
+
+  it("excludes the gate's thread once resolved by a human.response on a DIFFERENT thread, matched only by task_id (integ-fix F2, real thread ids)", () => {
+    const messages = [
+      { seq: 1, envelope: env({ id: "g1", thread: "th-agent:lead", kind: "human.gate", body: { task_id: "t-qa", reason: "why" } }) },
+      {
+        seq: 2,
+        envelope: env({
+          id: "r1",
+          thread: "th-gate-t-qa",
+          kind: "human.response",
+          body: { task_id: "t-qa", decision: "approve", reason: "ok" },
+        }),
+      },
+    ];
+
+    expect(unresolvedGateThreads(messages)).toEqual(new Set());
+  });
 });
 
 describe("ackReaders — normal/boundary (D2)", () => {
@@ -227,5 +244,60 @@ describe("findActiveGate — normal/error/boundary (D6)", () => {
 
     expect(() => findActiveGate(messages)).not.toThrow();
     expect(findActiveGate(messages)).toBeNull();
+  });
+});
+
+describe("findActiveGate — cross-thread resolution (integ-fix F2: gate on th-agent:lead, response on th-gate-<task_id>)", () => {
+  const LEAD_THREAD = "th-agent:lead";
+
+  it("stays open when the run's only human.response is for a different task_id (normal)", () => {
+    const threadMessages = [
+      { seq: 1, envelope: env({ id: "g1", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-qa", reason: "why" } }) },
+    ];
+    const allMessages = [
+      ...threadMessages,
+      { seq: 2, envelope: env({ id: "r1", thread: "th-gate-t-other", kind: "human.response", body: { task_id: "t-other", decision: "approve", reason: "ok" } }) },
+    ];
+
+    expect(findActiveGate(threadMessages, allMessages)).toEqual({ taskId: "t-qa", reason: "why" });
+  });
+
+  it("resolves via a human.response on a DIFFERENT thread than the gate, matched only by task_id (the F2 regression)", () => {
+    const threadMessages = [
+      { seq: 1, envelope: env({ id: "g1", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-qa", reason: "why" } }) },
+    ];
+    const allMessages = [
+      ...threadMessages,
+      { seq: 2, envelope: env({ id: "r1", thread: "th-gate-t-qa", kind: "human.response", body: { task_id: "t-qa", decision: "approve", reason: "ok" } }) },
+    ];
+
+    expect(findActiveGate(threadMessages, allMessages)).toBeNull();
+  });
+
+  it("with two gates in the same thread, falls back to the earlier one once the later one resolves on its own thread (order-aware)", () => {
+    const threadMessages = [
+      { seq: 1, envelope: env({ id: "g1", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-qa", reason: "first" } }) },
+      { seq: 2, envelope: env({ id: "g2", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-design", reason: "second" } }) },
+    ];
+    const allMessages = [
+      ...threadMessages,
+      { seq: 3, envelope: env({ id: "r1", thread: "th-gate-t-design", kind: "human.response", body: { task_id: "t-design", decision: "approve", reason: "ok" } }) },
+    ];
+
+    expect(findActiveGate(threadMessages, allMessages)).toEqual({ taskId: "t-qa", reason: "first" });
+  });
+
+  it("returns null once both gates in the thread are independently resolved on their own threads (boundary)", () => {
+    const threadMessages = [
+      { seq: 1, envelope: env({ id: "g1", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-qa", reason: "first" } }) },
+      { seq: 2, envelope: env({ id: "g2", thread: LEAD_THREAD, kind: "human.gate", body: { task_id: "t-design", reason: "second" } }) },
+    ];
+    const allMessages = [
+      ...threadMessages,
+      { seq: 3, envelope: env({ id: "r1", thread: "th-gate-t-design", kind: "human.response", body: { task_id: "t-design", decision: "approve", reason: "ok" } }) },
+      { seq: 4, envelope: env({ id: "r2", thread: "th-gate-t-qa", kind: "human.response", body: { task_id: "t-qa", decision: "reject", reason: "no" } }) },
+    ];
+
+    expect(findActiveGate(threadMessages, allMessages)).toBeNull();
   });
 });

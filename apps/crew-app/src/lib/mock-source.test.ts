@@ -126,9 +126,11 @@ describe("MockEventSource", () => {
 
     const messages = received.filter((ev): ev is Extract<RunEvent, { type: "message" }> => ev.type === "message");
     const qaMessages = messages.filter((m) => m.envelope.thread === "t-qa");
-    expect(qaMessages.map((m) => m.envelope.kind)).toEqual(["task.assign", "task.ack", "blocked", "human.gate"]);
+    expect(qaMessages.map((m) => m.envelope.kind)).toEqual(["task.assign", "task.ack", "blocked"]);
 
-    const gate = qaMessages.find((m) => m.envelope.kind === "human.gate")!;
+    // integ-fix F2: human.gate goes out on the real Lead thread (th-agent:lead), not the task's own thread — matches crew-lead/src/dispatch.rs
+    const gate = messages.find((m) => m.envelope.kind === "human.gate")!;
+    expect(gate.envelope.thread).toBe("th-agent:lead");
     expect(gate.envelope.body).toMatchObject({ task_id: "t-qa" });
 
     const finalQaState = received
@@ -300,6 +302,8 @@ describe("MockEventSource — gate/search methods (plan D4, D8: runId first)", (
       Extract<RunEvent, { type: "task_state_changed" }>,
     ];
     expect(responseEvent.envelope.kind).toBe("human.response");
+    // integ-fix F2: the response lands on the real th-gate-<task_id> thread, not the task's own thread or the lead thread — matches crew-run/src/controller.rs human_proxy_loop
+    expect(responseEvent.envelope.thread).toBe("th-gate-t-qa");
     expect(responseEvent.envelope.body).toMatchObject({ task_id: "t-qa", decision: "approve" });
     expect(assignedEvent).toMatchObject({ task_id: "t-qa", state: "assigned" });
     expect(acceptedEvent).toMatchObject({ task_id: "t-qa", state: "accepted" });

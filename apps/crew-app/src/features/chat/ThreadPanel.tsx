@@ -28,9 +28,12 @@ function ThreadPanelContent({ runId, threadId, onClose, mounted }: ThreadPanelPr
   const messages = useRunStore((s) => s.channels[runId]?.messages ?? EMPTY_MESSAGES);
   const readReceipts = useRunStore((s) => s.channels[runId]?.readReceipts ?? EMPTY_READ_RECEIPTS);
   const items = messages.filter(({ envelope }) => envelope.thread === threadId);
-  const resolutions = gateResolutions(items);
+  // integ-fix F2: resolved-by / active-gate must see the whole run, not just
+  // this thread — the real backend posts human.gate and human.response on
+  // different threads (derive.ts findActiveGate/gateResolutions doc).
+  const resolutions = gateResolutions(messages);
   const ackMap = ackReaders(items);
-  const activeGate = findActiveGate(items);
+  const activeGate = findActiveGate(items, messages);
 
   return (
     <div className="thread-panel" aria-label="스레드 패널" data-portal-mounted={mounted || undefined}>
