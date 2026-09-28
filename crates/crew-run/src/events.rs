@@ -78,6 +78,18 @@ pub enum RunEvent {
         target_msg_id: Option<String>,
         active: Option<bool>,
     },
+    /// One git action of the run's git flow (issue #31c, t7 design D3).
+    /// Emitted only when project_root is Some. Never ledgered, not in
+    /// RunSnapshot.
+    GitFlow {
+        kind: GitFlowKindDto,
+        role: Option<String>,
+        branch: Option<String>,
+        sha: Option<String>,
+        task_id: Option<String>,
+        detail: String,
+        ts: String,
+    },
 }
 
 /// `RunEvent::Presence.kind` (t2-be-presence D3/D4) — wire values
@@ -109,6 +121,19 @@ impl From<&crew_proto::RosterAgent> for RosterAgentDto {
             model: agent.model.clone(),
         }
     }
+}
+
+/// `RunEvent::GitFlow.kind` (t7 design D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitFlowKindDto {
+    Commit,
+    Merge,
+    Push,
+    Skip,
+    Conflict,
+    Error,
+    Gate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,5 +501,127 @@ mod tests {
             err.to_string().contains("kind"),
             "deserialize error must name the missing field, got: {err}"
         );
+    }
+
+    /// Normal: a `git_flow` event with every optional field set round-trips
+    /// through JSON, carrying the `git_flow` tag and a snake_case kind.
+    #[test]
+    fn git_flow_round_trips_every_field() {
+        let ev = RunEvent::GitFlow {
+            kind: GitFlowKindDto::Commit,
+            role: Some("developer".to_string()),
+            branch: Some("crew/developer".to_string()),
+            sha: Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+            task_id: Some("t-dev".to_string()),
+            detail: "committed 2 files".to_string(),
+            ts: "2026-09-28T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "git_flow");
+        assert_eq!(json["kind"], "commit");
+        assert_eq!(json["role"], "developer");
+        assert_eq!(json["branch"], "crew/developer");
+        let back: RunEvent = serde_json::from_value(json).unwrap();
+        match back {
+            RunEvent::GitFlow {
+                kind,
+                role,
+                branch,
+                sha,
+                task_id,
+                detail,
+                ts,
+            } => {
+                assert_eq!(kind, GitFlowKindDto::Commit);
+                assert_eq!(role.as_deref(), Some("developer"));
+                assert_eq!(branch.as_deref(), Some("crew/developer"));
+                assert_eq!(
+                    sha.as_deref(),
+                    Some("0123456789abcdef0123456789abcdef01234567")
+                );
+                assert_eq!(task_id.as_deref(), Some("t-dev"));
+                assert_eq!(detail, "committed 2 files");
+                assert_eq!(ts, "2026-09-28T00:00:00Z");
+            }
+            other => panic!("expected GitFlow, got {other:?}"),
+        }
+    }
+
+    /// Boundary: every `GitFlowKindDto` value has its snake_case wire name
+    /// and deserializes back to itself.
+    #[test]
+    fn git_flow_kinds_serialize_snake_case() {
+        let cases = [
+            (GitFlowKindDto::Commit, "commit"),
+            (GitFlowKindDto::Merge, "merge"),
+            (GitFlowKindDto::Push, "push"),
+            (GitFlowKindDto::Skip, "skip"),
+            (GitFlowKindDto::Conflict, "conflict"),
+            (GitFlowKindDto::Error, "error"),
+            (GitFlowKindDto::Gate, "gate"),
+        ];
+        for (kind, wire) in cases {
+            assert_eq!(serde_json::to_value(kind).unwrap(), wire);
+            let back: GitFlowKindDto = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, kind);
+        }
+    }
+
+    /// Error: a `git_flow` event missing the required `detail` field fails
+    /// to deserialize, naming the missing field.
+    #[test]
+    fn git_flow_missing_detail_fails_to_deserialize() {
+        let malformed = json!({
+            "type": "git_flow",
+            "kind": "push",
+            "role": null,
+            "branch": "main",
+            "sha": null,
+            "task_id": null,
+            "ts": "2026-09-28T00:00:00Z",
+        });
+        let err = serde_json::from_value::<RunEvent>(malformed).unwrap_err();
+        assert!(
+            err.to_string().contains("detail"),
+            "deserialize error must name the missing field, got: {err}"
+        );
+    }
+
+    /// Boundary: push/gate events carry no role, branch, sha or task — all
+    /// four Options as `None` serialize to null and round-trip.
+    #[test]
+    fn git_flow_with_all_options_none_round_trips() {
+        let ev = RunEvent::GitFlow {
+            kind: GitFlowKindDto::Gate,
+            role: None,
+            branch: None,
+            sha: None,
+            task_id: None,
+            detail: String::new(),
+            ts: "2026-09-28T00:00:00Z".to_string(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kind"], "gate");
+        for field in ["role", "branch", "sha", "task_id"] {
+            assert!(json[field].is_null(), "{field} must serialize as null");
+        }
+        let back: RunEvent = serde_json::from_value(json).unwrap();
+        match back {
+            RunEvent::GitFlow {
+                kind,
+                role,
+                branch,
+                sha,
+                task_id,
+                detail,
+                ts,
+            } => {
+                assert_eq!(kind, GitFlowKindDto::Gate);
+                assert!(role.is_none() && branch.is_none() && sha.is_none() && task_id.is_none());
+                assert_eq!(detail, "");
+                assert_eq!(ts, "2026-09-28T00:00:00Z");
+            }
+            other => panic!("expected GitFlow, got {other:?}"),
+        }
     }
 }

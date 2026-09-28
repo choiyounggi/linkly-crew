@@ -14,4 +14,4 @@ pub use config::{
 };
 pub use crew_lead::plan::CmdCheck;
 pub use controller::{validate_roster, RunController, RunHandle};
-pub use events::{RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};
+pub use events::{GitFlowKindDto, RosterAgentDto, RunEvent, RunOutcomeDto, RunSnapshot, StoredMessageDto, TaskStateDto};

@@ -554,6 +554,7 @@ mod tests {
             RunEvent::SprintFinished { .. } => "SprintFinished",
             RunEvent::RosterChanged { .. } => "RosterChanged",
             RunEvent::Presence { .. } => "Presence",
+            RunEvent::GitFlow { .. } => "GitFlow",
         }
     }
 

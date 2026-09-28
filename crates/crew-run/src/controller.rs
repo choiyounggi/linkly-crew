@@ -143,6 +143,19 @@ fn role_cli_cwd(role_worktrees: Option<&[(Role, PathBuf)]>, data_dir: &Path, rol
     cwd
 }
 
+/// The RealCli spawn spec's harness config (t7 design D1): tool use is on
+/// exactly when the run has per-role worktrees, i.e. when the CLI's cwd —
+/// the only place tool use lets it write — is the role's own git worktree.
+/// Without a `project_root` the cwd is the scratch `data_dir/cli-cwd/<role>`
+/// and the CLI stays tool-less.
+fn role_harness_cfg(role_worktrees: Option<&[(Role, PathBuf)]>, data_dir: &Path, role: Role) -> HarnessAgentCfg {
+    HarnessAgentCfg {
+        cwd: role_cli_cwd(role_worktrees, data_dir, role),
+        model: None,
+        tool_use: role_worktrees.is_some(),
+    }
+}
+
 /// Whether `spawn_sprint` should wire the Browser DoD executor at all.
 ///
 /// BOTH conditions are required. `project_root` is required by settled user
@@ -187,10 +200,13 @@ fn role_system_hint(role: Role, goal: &str, project_root: Option<&Path>) -> Stri
     let mut hint = format!("You are the {role:?} of a crew building: {goal}");
     if let Some(root) = project_root {
         hint.push_str(&format!(
-            "\n\n공유 산출물·문서·이미지·디자인 토큰은 {}/.crew/artifacts 에서 주고받는다(하위 docs/ images/ design-tokens/ deliverables/). \
-             같은 파일을 동시에 편집하지 말고 역할별 파일로 분리하라. \
+            "\n\n공유 산출물·문서·이미지·디자인 토큰은 현재 디렉터리(역할 worktree) 기준 상대 경로 .crew/artifacts/{role_dir}/ 아래에 쓴다(하위 docs/ images/ design-tokens/ deliverables/). \
+             현재 디렉터리 밖이나 절대 경로에는 쓰지 않는다. \
+             다른 역할의 산출물은 스프린트가 끝나 메인 브랜치로 머지된 뒤에야 {root}/.crew/artifacts 에서 읽기 전용으로 볼 수 있다(그곳에는 쓰지 않는다). \
+             같은 파일을 동시에 편집하지 말고 역할별 파일로 분리하라 — 두 역할이 같은 파일을 쓰면 머지할 때마다 충돌한다. \
              프로젝트에 메인 체크아웃 쓰기를 차단하는 훅을 추가하지 말라.",
-            root.display()
+            role_dir = role_dir_name(role),
+            root = root.display()
         ));
     }
     hint
@@ -424,11 +440,7 @@ async fn spawn_sprint(
                     );
                     continue;
                 };
-                let harness_cfg = HarnessAgentCfg {
-                    cwd: role_cli_cwd(role_worktrees, data_dir, role),
-                    model: None,
-                    tool_use: false,
-                };
+                let harness_cfg = role_harness_cfg(role_worktrees, data_dir, role);
                 let system_hint = role_system_hint(role, goal, project_root);
                 // Permit is scoped to each CLI interaction (turn), not the
                 // runner's lifetime (contracts-m6.md §D2d) — a runner-
@@ -2765,7 +2777,7 @@ mod role_system_hint_tests {
         assert_eq!(hint, "You are the Developer of a crew building: goal");
     }
 
-    /// Normal/D4: `project_root: Some` injects the absolute path plus the
+    /// Normal/D4: `project_root: Some` injects the role's cwd-relative artifacts dir plus the
     /// no-concurrent-edit and no-hook-addition clauses.
     #[test]
     fn some_project_root_injects_the_artifacts_convention() {
@@ -2774,11 +2786,116 @@ mod role_system_hint_tests {
 
         assert!(hint.starts_with("You are the Qa of a crew building: goal"));
         assert!(
-            hint.contains(&format!("{}/.crew/artifacts", root.display())),
-            "must include the absolute artifacts path: {hint}"
+            hint.contains(".crew/artifacts/qa/"),
+            "must include the role's cwd-relative artifacts dir: {hint}"
         );
         assert!(hint.contains("동시에 편집하지"), "must include the no-concurrent-edit clause: {hint}");
         assert!(hint.contains("훅을 추가하지"), "must include the no-hook-addition clause: {hint}");
+    }
+
+    /// t7 design D18 / ruling C5: under tool_use the agent can only write
+    /// inside its own cwd (the role worktree), so the hint names the
+    /// cwd-relative write dir and mentions the project root exactly once —
+    /// as the READ-ONLY place merged artifacts appear, never as a write
+    /// target.
+    #[test]
+    fn some_project_root_hint_never_tells_the_agent_to_write_to_the_root() {
+        let root = std::path::Path::new("/fake/root");
+        let hint = role_system_hint(Role::Developer, "goal", Some(root));
+
+        for needle in [".crew/artifacts/developer/", "현재 디렉터리", "읽기 전용", "그곳에는 쓰지 않는다", "역할별 파일로 분리"] {
+            assert!(hint.contains(needle), "hint must contain {needle:?}: {hint}");
+        }
+        assert_eq!(
+            hint.matches("/fake/root").count(),
+            1,
+            "the project root must appear exactly once: {hint}"
+        );
+        let at = hint.find("/fake/root").unwrap();
+        assert!(
+            hint[at + "/fake/root".len()..].starts_with("/.crew/artifacts 에서 읽기 전용"),
+            "the only root mention must be the read-only merged-artifacts location: {hint}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod role_harness_cfg_tests {
+    //! t7 design D1: RealCli workers get `tool_use` exactly when the run has
+    //! per-role worktrees (`project_root` Some) — the only case where the
+    //! write-confining cwd is the role's own git worktree.
+
+    use super::*;
+
+    /// Removes the per-test data dir even when an assertion panics, so a
+    /// failing run leaves no `.crew-test/` leftover.
+    struct DirGuard(PathBuf);
+
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Normal: resolved worktrees turn tool use on and point the CLI at the
+    /// role's worktree.
+    #[test]
+    fn some_worktrees_turn_tool_use_on_and_use_the_worktree() {
+        let worktree = PathBuf::from("/abs/worktrees/developer");
+        let worktrees = [(Role::Developer, worktree.clone())];
+
+        let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Developer);
+
+        assert!(cfg.tool_use, "a role with a worktree must get tool_use");
+        assert_eq!(cfg.cwd, worktree);
+        assert_eq!(cfg.model, None);
+    }
+
+    /// Normal: with every canonical role resolved, each role gets its OWN
+    /// worktree (never another role's) and tool use — the lookup must key on
+    /// the `role` argument, not on a fixed role.
+    #[test]
+    fn each_role_gets_its_own_worktree_and_tool_use() {
+        let worktrees: Vec<(Role, PathBuf)> = ROLE_ORDER
+            .iter()
+            .map(|&r| (r, PathBuf::from("/abs/worktrees").join(role_dir_name(r))))
+            .collect();
+        assert!(worktrees.len() >= 2, "test setup: needs at least two roles");
+
+        for (role, expected) in &worktrees {
+            let cfg = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), *role);
+
+            assert_eq!(&cfg.cwd, expected, "{role:?} must run in its own worktree");
+            assert!(cfg.tool_use, "{role:?} with a worktree must get tool_use");
+            assert_eq!(cfg.model, None);
+        }
+        let qa = role_harness_cfg(Some(&worktrees), Path::new("/abs/data-unused"), Role::Qa);
+        assert_eq!(qa.cwd, PathBuf::from("/abs/worktrees/qa"));
+    }
+
+    /// Normal (the default path): no worktrees keep tool use off and use the
+    /// scratch cwd under data_dir.
+    #[test]
+    fn no_worktrees_keep_tool_use_off_and_use_the_scratch_cwd() {
+        let data_dir = std::env::current_dir()
+            .unwrap()
+            .join(".crew-test")
+            .join(format!("rhc-{}", uuid::Uuid::new_v4()));
+        let _guard = DirGuard(data_dir.clone());
+
+        let cfg = role_harness_cfg(None, &data_dir, Role::Developer);
+
+        assert!(!cfg.tool_use, "no worktree must keep tool_use off");
+        assert_eq!(cfg.cwd, data_dir.join("cli-cwd").join("developer"));
+        assert_eq!(cfg.model, None);
+    }
+
+    /// Error/boundary: an empty worktree slice is a lookup bug and still
+    /// panics — `tool_use` must never mask it.
+    #[test]
+    #[should_panic(expected = "no precomputed worktree")]
+    fn empty_worktrees_still_panic() {
+        let _ = role_harness_cfg(Some(&[]), Path::new("/abs/data-unused"), Role::Developer);
     }
 }
 
