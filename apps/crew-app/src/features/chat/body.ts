@@ -30,6 +30,26 @@ export interface HumanResponseBody {
   reason: string;
 }
 
+export interface TaskAssignBody {
+  title: string;
+}
+
+export interface TaskProgressBody {
+  summary: string;
+}
+
+export interface BlockedBody {
+  reason: string;
+}
+
+export interface HandoffBody {
+  role: string;
+}
+
+export interface TextBody {
+  text: string;
+}
+
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
@@ -85,4 +105,41 @@ export function parseHumanResponseBody(body: unknown): HumanResponseBody | null 
   if (body.decision !== "approve" && body.decision !== "reject") return null;
   if (typeof body.reason !== "string") return null;
   return { task_id: body.task_id, decision: body.decision, reason: body.reason };
+}
+
+/** DESIGN.md §3.2 `task.assign`: `{"task": {"title": "...", ...}}`. */
+export function parseTaskAssignBody(body: unknown): TaskAssignBody | null {
+  if (!isRecord(body)) return null;
+  if (!isRecord(body.task)) return null;
+  if (typeof body.task.title !== "string") return null;
+  return { title: body.task.title };
+}
+
+/** DESIGN.md §3.2 `task.progress`: `{"summary": "..."}`. */
+export function parseTaskProgressBody(body: unknown): TaskProgressBody | null {
+  if (!isRecord(body)) return null;
+  if (typeof body.summary !== "string") return null;
+  return { summary: body.summary };
+}
+
+/** DESIGN.md §3.2 `blocked`: `{"reason": "..."}`. */
+export function parseBlockedBody(body: unknown): BlockedBody | null {
+  if (!isRecord(body)) return null;
+  if (typeof body.reason !== "string") return null;
+  return { reason: body.reason };
+}
+
+/** DESIGN.md §3.2 `handoff`: `{"pack": {"role": "...", ...}}`. */
+export function parseHandoffBody(body: unknown): HandoffBody | null {
+  if (!isRecord(body)) return null;
+  if (!isRecord(body.pack)) return null;
+  if (typeof body.pack.role !== "string") return null;
+  return { role: body.pack.role };
+}
+
+/** DESIGN.md §3.2 `question`/`answer`: `{"text": "..."}` (shared shape). */
+export function parseTextBody(body: unknown): TextBody | null {
+  if (!isRecord(body)) return null;
+  if (typeof body.text !== "string") return null;
+  return { text: body.text };
 }

@@ -7,8 +7,17 @@ import { memo } from "react";
 
 import type { Envelope, MessageKind } from "../../lib/types";
 import type { HumanResponseBody } from "./body";
-import { parseChangeRequestBody, parseHumanGateBody, parseTaskResultBody } from "./body";
-import GateCard from "./GateCard";
+import {
+  parseBlockedBody,
+  parseChangeRequestBody,
+  parseHandoffBody,
+  parseHumanGateBody,
+  parseHumanResponseBody,
+  parseTaskAssignBody,
+  parseTaskProgressBody,
+  parseTaskResultBody,
+  parseTextBody,
+} from "./body";
 
 interface MessageRowProps {
   runId: string;
@@ -32,16 +41,91 @@ function rowVariantClass(kind: MessageKind): string {
   return "";
 }
 
-function RawBody({ body }: { body: unknown }) {
+function mentionLabel(recipient: string): string {
+  return `@${recipient.replace(/^agent:/, "")}`;
+}
+
+function RawToggle({ body }: { body: unknown }) {
   return (
     <details className="message-body__raw">
-      <summary>{"본문 보기"}</summary>
+      <summary>{"원문"}</summary>
       <pre>{JSON.stringify(body, null, 2)}</pre>
     </details>
   );
 }
 
-function MessageBody({ runId, envelope, gateResolution }: Pick<MessageRowProps, "runId" | "envelope" | "gateResolution">) {
+function mentionLabelForTemplate(recipient: string): string {
+  return `@${recipient.replace(/^agent:/, "")}`;
+}
+
+function renderTaskAssign(envelope: Envelope): string {
+  const parsed = parseTaskAssignBody(envelope.body);
+  const who = envelope.to[0] ? mentionLabelForTemplate(envelope.to[0]) : null;
+  if (parsed && who) return `${who}님, ${parsed.title} 진행해 주세요`;
+  if (parsed) return `${parsed.title} 진행해 주세요`;
+  if (who) return `${who}님, 작업을 진행해 주세요`;
+  return "작업을 진행해 주세요";
+}
+
+function renderTaskProgress(envelope: Envelope): string {
+  const parsed = parseTaskProgressBody(envelope.body);
+  return parsed ? parsed.summary : "진행 상황이 업데이트되었습니다";
+}
+
+function renderReviewRequest(envelope: Envelope): string {
+  const who = envelope.to[0] ? mentionLabelForTemplate(envelope.to[0]) : null;
+  return who ? `${who}님 리뷰 요청` : "리뷰 요청";
+}
+
+function renderQuestion(envelope: Envelope): string {
+  const parsed = parseTextBody(envelope.body);
+  return `❓ ${parsed ? parsed.text : "(내용 없음)"}`;
+}
+
+function renderAnswer(envelope: Envelope): string {
+  const parsed = parseTextBody(envelope.body);
+  return `💬 ${parsed ? parsed.text : "(내용 없음)"}`;
+}
+
+function renderBlocked(envelope: Envelope): string {
+  const parsed = parseBlockedBody(envelope.body);
+  return parsed ? `🚧 차단: ${parsed.reason}` : "🚧 차단됨";
+}
+
+function renderHandoff(envelope: Envelope): string {
+  const parsed = parseHandoffBody(envelope.body);
+  return parsed ? `🔄 인수인계: ${parsed.role}` : "🔄 인수인계됨";
+}
+
+function renderHumanGate(envelope: Envelope): string {
+  const parsed = parseHumanGateBody(envelope.body);
+  return parsed ? `@human님, ${parsed.task_id} 검토가 필요합니다: ${parsed.reason}` : "@human님, 검토가 필요합니다";
+}
+
+function renderHumanResponse(envelope: Envelope): string {
+  const parsed = parseHumanResponseBody(envelope.body);
+  if (!parsed) return "응답이 도착했습니다";
+  const verdict = parsed.decision === "approve" ? "승인됨" : "반려됨";
+  return parsed.reason ? `${verdict} — ${parsed.reason}` : verdict;
+}
+
+function renderUnknownKind(envelope: Envelope): string {
+  return `알 수 없는 메시지 종류: ${envelope.kind}`;
+}
+
+const KIND_LINE_RENDERERS: Partial<Record<MessageKind, (envelope: Envelope) => string>> = {
+  "task.assign": renderTaskAssign,
+  "task.progress": renderTaskProgress,
+  "review.request": renderReviewRequest,
+  question: renderQuestion,
+  answer: renderAnswer,
+  blocked: renderBlocked,
+  handoff: renderHandoff,
+  "human.gate": renderHumanGate,
+  "human.response": renderHumanResponse,
+};
+
+function MessageBody({ envelope }: Pick<MessageRowProps, "envelope">) {
   if (envelope.kind === "task.result") {
     const parsed = parseTaskResultBody(envelope.body);
     if (parsed) {
@@ -60,9 +144,16 @@ function MessageBody({ runId, envelope, gateResolution }: Pick<MessageRowProps, 
               ))}
             </ul>
           )}
+          <RawToggle body={envelope.body} />
         </div>
       );
     }
+    return (
+      <div className="message-body">
+        <p>{"작업 결과가 도착했습니다 (본문 형식 오류)"}</p>
+        <RawToggle body={envelope.body} />
+      </div>
+    );
   }
 
   if (envelope.kind === "change_request") {
@@ -72,22 +163,30 @@ function MessageBody({ runId, envelope, gateResolution }: Pick<MessageRowProps, 
         <div className="message-body">
           <p>위반: {parsed.violations.join(", ") || "—"}</p>
           <p>{parsed.reason}</p>
+          <RawToggle body={envelope.body} />
         </div>
       );
     }
+    return (
+      <div className="message-body">
+        <p>{"변경 요청 (본문 형식 오류)"}</p>
+        <RawToggle body={envelope.body} />
+      </div>
+    );
   }
 
-  if (envelope.kind === "human.gate") {
-    const parsed = parseHumanGateBody(envelope.body);
-    if (parsed) {
-      return <GateCard runId={runId} taskId={parsed.task_id} reason={parsed.reason} resolution={gateResolution} />;
-    }
-  }
-
-  return <RawBody body={envelope.body} />;
+  const line = KIND_LINE_RENDERERS[envelope.kind]?.(envelope) ?? renderUnknownKind(envelope);
+  return (
+    <div className="message-body">
+      <p>{line}</p>
+      <RawToggle body={envelope.body} />
+    </div>
+  );
 }
 
-function MessageRow({ runId, envelope, replyCount, readers, gateResolution, parentThread, onOpenThread }: MessageRowProps) {
+function MessageRow({ envelope, replyCount, readers, parentThread, onOpenThread }: MessageRowProps) {
+  if (envelope.kind === "task.ack") return null;
+
   const variant = rowVariantClass(envelope.kind);
   const initial = envelope.from.replace(/^agent:/, "").charAt(0).toUpperCase() || "?";
 
@@ -104,7 +203,27 @@ function MessageRow({ runId, envelope, replyCount, readers, gateResolution, pare
             {formatTs(envelope.ts)}
           </time>
         </div>
-        <MessageBody runId={runId} envelope={envelope} gateResolution={gateResolution} />
+        <MessageBody envelope={envelope} />
+        {envelope.to.length > 0 && (
+          <div className="message-row__mentions">
+            {envelope.to.map((recipient) =>
+              onOpenThread ? (
+                <button
+                  key={recipient}
+                  type="button"
+                  className="message-row__mention-chip"
+                  onClick={() => onOpenThread(envelope.thread)}
+                >
+                  {mentionLabel(recipient)}
+                </button>
+              ) : (
+                <span key={recipient} className="message-row__mention-chip">
+                  {mentionLabel(recipient)}
+                </span>
+              ),
+            )}
+          </div>
+        )}
         <div className="message-row__footer">
           {readers.length > 0 && (
             <span className="message-row__readers" title={readers.join(", ")}>
