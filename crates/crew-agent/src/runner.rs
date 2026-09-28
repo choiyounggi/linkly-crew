@@ -3,6 +3,8 @@ use crew_proto::{
 };
 use serde_json::Value;
 
+use crew_harness::{HandoffSnapshot, HarnessError};
+
 use crate::bus::{BusConn, BusError, BusEvent};
 use crate::control::AgentControl;
 use crate::role::RoleBehavior;
@@ -12,6 +14,92 @@ use crate::role::RoleBehavior;
 /// itself cannot continue, so surfacing them as a test/caller failure is
 /// correct rather than silently retrying.
 const FATAL_ERROR_CODES: &[&str] = &["loop_blocked", "delivery_failed"];
+
+/// Notes on the `Ok` ack a queued `AgentControl::Swap` gets when its worker
+/// ended legitimately (aborted at a boundary/shutdown, or returned) before
+/// serving it — the same outcome crew-run reports for an absent sender.
+pub(crate) const UNSERVED_ON_EXIT_NOTES: &str =
+    "worker ended before serving this control; no live session";
+
+/// How the runner's task ended — decides the answer an unserved control gets.
+enum ExitKind {
+    /// Initial value; still set in `Drop` means the future was dropped
+    /// without returning (abort at a sprint boundary or `RunHandle::shutdown`).
+    Aborted,
+    Returned,
+    /// The runner returned `Err`; holds `format!("{err:?}")`.
+    Failed(String),
+    Panicked,
+}
+
+/// Owns the worker's control receiver for the life of `run_with_control`.
+/// On drop (every return, error, abort or panic) it hands the receiver to a
+/// task that answers every control still queued or sent later, until the
+/// last Sender is gone — so crew-run never sees a dropped ack or a closed
+/// channel from a worker that merely ended. No `close()`: a Sender cloned
+/// before the exit must still be able to deliver and get an answer.
+struct CtrlInbox {
+    rx: Option<tokio::sync::mpsc::Receiver<AgentControl>>,
+    exit: ExitKind,
+}
+
+fn answer_unserved(ctrl: AgentControl, exit: &ExitKind) {
+    match ctrl {
+        AgentControl::Swap {
+            harness_id, ack, ..
+        } => {
+            let answer = match exit {
+                ExitKind::Aborted | ExitKind::Returned => Ok(HandoffSnapshot {
+                    harness: harness_id,
+                    session_id: String::new(),
+                    notes: UNSERVED_ON_EXIT_NOTES.to_string(),
+                }),
+                ExitKind::Failed(e) => Err(HarnessError::Unavailable(format!(
+                    "worker ended with an error before serving this control: {e}"
+                ))),
+                ExitKind::Panicked => Err(HarnessError::Unavailable(
+                    "worker panicked before serving this control".to_string(),
+                )),
+            };
+            let _ = ack.send(answer);
+        }
+    }
+}
+
+impl Drop for CtrlInbox {
+    fn drop(&mut self) {
+        // tokio drops a panicked task's future while the panic unwinds
+        // (runtime/task/harness.rs poll_future Guard); an abort drops it
+        // outside any unwind. Relies on the default panic=unwind.
+        if matches!(self.exit, ExitKind::Aborted) && std::thread::panicking() {
+            self.exit = ExitKind::Panicked;
+        }
+        let Some(mut rx) = self.rx.take() else { return };
+        let exit = std::mem::replace(&mut self.exit, ExitKind::Aborted);
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let mut answered = 0usize;
+                    while let Some(ctrl) = rx.recv().await {
+                        answer_unserved(ctrl, &exit);
+                        answered += 1;
+                    }
+                    if answered > 0 {
+                        tracing::debug!(
+                            answered,
+                            "answered control messages left unserved when the runner ended"
+                        );
+                    }
+                });
+            }
+            Err(_) => {
+                while let Ok(ctrl) = rx.try_recv() {
+                    answer_unserved(ctrl, &exit);
+                }
+            }
+        }
+    }
+}
 
 /// t2-be-presence D2: `presence.read`/`presence.typing` deadline — reused
 /// from the same 900s convention every other envelope in this crate uses
@@ -126,10 +214,41 @@ impl AgentRunner {
         Self::run_with_control(conn, behavior, rx).await
     }
 
+    /// Same loop as [`AgentRunner::run`], with an external control channel
+    /// (contracts-m6.md §D1). Every control message accepted into `ctrl_rx`
+    /// is answered even when this runner ends first (see [`CtrlInbox`]).
     pub async fn run_with_control<B>(
+        conn: BusConn,
+        behavior: B,
+        ctrl_rx: tokio::sync::mpsc::Receiver<AgentControl>,
+    ) -> Result<(), RunnerError>
+    where
+        B: RoleBehavior + Send,
+    {
+        let mut inbox = CtrlInbox {
+            rx: Some(ctrl_rx),
+            exit: ExitKind::Aborted,
+        };
+        let result = Self::run_with_control_inner(
+            conn,
+            behavior,
+            inbox
+                .rx
+                .as_mut()
+                .expect("CtrlInbox holds its receiver until drop"),
+        )
+        .await;
+        inbox.exit = match &result {
+            Ok(()) => ExitKind::Returned,
+            Err(e) => ExitKind::Failed(format!("{e:?}")),
+        };
+        result
+    }
+
+    async fn run_with_control_inner<B>(
         mut conn: BusConn,
         mut behavior: B,
-        mut ctrl_rx: tokio::sync::mpsc::Receiver<AgentControl>,
+        ctrl_rx: &mut tokio::sync::mpsc::Receiver<AgentControl>,
     ) -> Result<(), RunnerError>
     where
         B: RoleBehavior + Send,
@@ -237,6 +356,7 @@ fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use crew_harness::{HandoffSnapshot, HarnessError};
     use crew_proto::{ClientFrame, Envelope, MessageKind, ServerFrame};
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
@@ -244,6 +364,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
     use tokio_tungstenite::tungstenite::Message;
 
     struct CountingBehavior {
@@ -878,5 +999,467 @@ mod tests {
         assert!(typing_on.active);
         let typing_off = crew_proto::presence_typing_from_body(&got[2].body).unwrap();
         assert!(!typing_off.active);
+    }
+    // ---- #23 piece B: what happens to a control message its worker never
+    // serves. The five tests below are one per exit mechanism class of
+    // `run_with_control` (abort, failed send, runner error, panic, and a send
+    // arriving after the runner already returned); every `return Ok(())` site
+    // inside the loop is a single class with the error returns, because they
+    // all leave through the same drop of the control receiver.
+
+    type AckRx = oneshot::Receiver<Result<HandoffSnapshot, HarnessError>>;
+
+    fn swap_ctrl() -> (AgentControl, AckRx) {
+        let (ack, ack_rx) = oneshot::channel();
+        let ctrl = AgentControl::Swap {
+            harness: Arc::new(crew_harness::claude::ClaudeCodeHarness::with_binary(
+                "/bin/false",
+            )),
+            harness_id: "harness-new".to_string(),
+            injected_context: "ctx".to_string(),
+            ack,
+        };
+        (ctrl, ack_rx)
+    }
+
+    /// Welcome, then hold the socket open and never send anything — in
+    /// particular no `Receipt`, so a `BusConn::send` exhausts its retries.
+    async fn silent_bus(listener: TcpListener) {
+        let (stream, _peer) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        send_welcome(&mut ws).await;
+        while let Some(Ok(_)) = ws.next().await {}
+    }
+
+    /// Welcome, deliver `msg_1`, then hold the socket open.
+    async fn one_envelope_bus(listener: TcpListener) {
+        let (stream, _peer) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        send_welcome(&mut ws).await;
+        let frame = ServerFrame::Envelope(wire_envelope("msg_1"));
+        ws.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+            .await
+            .unwrap();
+        while let Some(Ok(_)) = ws.next().await {}
+    }
+
+    /// Signals that it reached `on_start`, then parks there forever: the
+    /// runner never reaches its `select!`, so an abort can only hit it while
+    /// a control message sits unread.
+    struct ParkedOnStart {
+        entered: Option<oneshot::Sender<()>>,
+    }
+
+    #[async_trait]
+    impl RoleBehavior for ParkedOnStart {
+        async fn on_start(&mut self) -> Vec<Envelope> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            std::future::pending::<Vec<Envelope>>().await
+        }
+
+        async fn on_envelope(&mut self, _env: Envelope) -> Vec<Envelope> {
+            vec![]
+        }
+
+        fn is_done(&self) -> bool {
+            false
+        }
+    }
+
+    /// Parks in `on_start` until released, then returns one envelope — so the
+    /// test decides the exact moment the runner starts its first `conn.send`.
+    struct GatedStart {
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+    }
+
+    #[async_trait]
+    impl RoleBehavior for GatedStart {
+        async fn on_start(&mut self) -> Vec<Envelope> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+            }
+            if let Some(release) = self.release.take() {
+                let _ = release.await;
+            }
+            vec![wire_envelope("start_1")]
+        }
+
+        async fn on_envelope(&mut self, _env: Envelope) -> Vec<Envelope> {
+            vec![]
+        }
+
+        fn is_done(&self) -> bool {
+            false
+        }
+    }
+
+    /// Parks inside its first `on_envelope` until released — the window in
+    /// which the bus can queue more events and the test can queue controls.
+    /// With `panic_after_release` it then panics, which is the runner task's
+    /// panic exit.
+    struct GatedEnvelope {
+        entered: Option<oneshot::Sender<()>>,
+        release: Option<oneshot::Receiver<()>>,
+        panic_after_release: bool,
+    }
+
+    #[async_trait]
+    impl RoleBehavior for GatedEnvelope {
+        async fn on_envelope(&mut self, _env: Envelope) -> Vec<Envelope> {
+            if self.entered.is_some() {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = self.release.take() {
+                    let _ = release.await;
+                }
+                if self.panic_after_release {
+                    panic!("t-panic test behaviour");
+                }
+            }
+            vec![]
+        }
+
+        fn is_done(&self) -> bool {
+            false
+        }
+    }
+
+    /// Error/boundary case, and the arm the #23 piece B probe confirmed
+    /// (`outcome=aborted-future-dropped`, `pending_at_drop=1`): crew-run
+    /// aborts a worker at the sprint/run boundary while `swap_harness` is
+    /// sending on a control Sender it cloned just before. `abort()` only
+    /// *requests* cancellation, so the send still lands in the receiver's
+    /// buffer — and the queued swap must be answered rather than dropped.
+    #[tokio::test]
+    async fn an_aborted_runner_answers_a_swap_queued_after_the_abort_request() {
+        let (url, listener) = start_fake_bus().await;
+        tokio::spawn(silent_bus(listener));
+
+        let conn = BusConn::connect(&url, "tok", "agent:pm").await.unwrap();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel(4);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let handle = tokio::spawn(AgentRunner::run_with_control(
+            conn,
+            ParkedOnStart {
+                entered: Some(entered_tx),
+            },
+            ctrl_rx,
+        ));
+
+        entered_rx.await.expect("the behaviour must reach on_start");
+        handle.abort();
+        let (ctrl, ack_rx) = swap_ctrl();
+        ctrl_tx
+            .try_send(ctrl)
+            .expect("the receiver is alive: abort was only requested");
+
+        assert!(handle.await.unwrap_err().is_cancelled());
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(5), ack_rx)
+            .await
+            .expect("ack within budget")
+            .expect("a queued swap must be answered, not dropped")
+            .expect("an aborted worker answers Ok");
+        assert_eq!(snapshot.notes, UNSERVED_ON_EXIT_NOTES);
+        assert_eq!(snapshot.harness, "harness-new");
+        assert!(
+            snapshot.session_id.is_empty(),
+            "an unserved swap has no session: {snapshot:?}"
+        );
+    }
+
+    /// Error case: the runner leaves through `conn.send(..)?` (the bus never
+    /// receipts, so `BusConn::send` exhausts its 3 attempts) while a swap is
+    /// already queued. The worker DIED, so the answer must be the error
+    /// contract — `HarnessError::Unavailable` naming the failure — not an
+    /// `Ok` snapshot that would hide the death from crew-run.
+    #[tokio::test]
+    async fn a_runner_ending_on_a_failed_send_answers_a_swap_queued_while_it_was_sending() {
+        let (url, listener) = start_fake_bus().await;
+        tokio::spawn(silent_bus(listener));
+
+        let conn = BusConn::connect(&url, "tok", "agent:pm").await.unwrap();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel(4);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let handle = tokio::spawn(AgentRunner::run_with_control(
+            conn,
+            GatedStart {
+                entered: Some(entered_tx),
+                release: Some(release_rx),
+            },
+            ctrl_rx,
+        ));
+
+        entered_rx.await.expect("the behaviour must reach on_start");
+        let (ctrl, ack_rx) = swap_ctrl();
+        ctrl_tx
+            .try_send(ctrl)
+            .expect("the receiver is alive while on_start is parked");
+        release_tx
+            .send(())
+            .expect("the behaviour awaits the release");
+
+        // ~6-7s of real time: 3 send attempts x 2s receipt timeout + backoff.
+        let result = tokio::time::timeout(Duration::from_secs(30), handle)
+            .await
+            .expect("runner ends within budget")
+            .expect("no panic");
+        assert!(
+            matches!(result, Err(RunnerError::Send(BusError::SendFailed { .. }))),
+            "{result:?}"
+        );
+
+        match tokio::time::timeout(Duration::from_secs(5), ack_rx)
+            .await
+            .expect("ack within budget")
+            .expect("a queued swap must be answered, not dropped")
+        {
+            Err(HarnessError::Unavailable(msg)) => {
+                assert!(msg.contains("SendFailed"), "{msg}")
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// Error + boundary case at the channel's capacity: the runner leaves
+    /// through `RunnerError::Fatal` with a full control buffer, so both
+    /// answers appear in one run — the swaps the loop served before the fatal
+    /// frame won the `select!` (`Ok`, "no live session") and every one left
+    /// behind must still be answered (`Unavailable`, naming the fatal code).
+    ///
+    /// Probabilistic by construction: tokio::select! starts at a random
+    /// branch; with the tick branch disabled ctrl wins 2 of 3 starts, so
+    /// unpatched code leaves >=1 swap unanswered with probability
+    /// 1-(2/3)^32 ~ 1-2.3e-6, and the patched `unserved >= 1` assertion has
+    /// the same 2.3e-6 flake.
+    #[tokio::test]
+    async fn a_runner_ending_on_a_fatal_frame_answers_every_swap_it_left_queued() {
+        let (url, listener) = start_fake_bus().await;
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let (buffered_tx, buffered_rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            send_welcome(&mut ws).await;
+
+            let frame = ServerFrame::Envelope(wire_envelope("msg_1"));
+            ws.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                .await
+                .unwrap();
+
+            go_rx.await.expect("the test releases the fatal frame");
+
+            let error = ServerFrame::Error {
+                code: "loop_blocked".to_string(),
+                message: "cycle detected".to_string(),
+            };
+            ws.send(Message::Text(serde_json::to_string(&error).unwrap().into()))
+                .await
+                .unwrap();
+            let frame = ServerFrame::Envelope(wire_envelope("msg_2"));
+            ws.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                .await
+                .unwrap();
+
+            // The reader task receipts every envelope it buffers, so msg_2's
+            // Receipt is the signal that both frames are in the events queue.
+            let mut buffered_tx = Some(buffered_tx);
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(text) = msg {
+                    if let Ok(ClientFrame::Receipt { id }) =
+                        serde_json::from_str::<ClientFrame>(text.as_str())
+                    {
+                        if id == "msg_2" {
+                            if let Some(tx) = buffered_tx.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let conn = BusConn::connect(&url, "tok", "agent:pm").await.unwrap();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel(32);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let handle = tokio::spawn(AgentRunner::run_with_control(
+            conn,
+            GatedEnvelope {
+                entered: Some(entered_tx),
+                release: Some(release_rx),
+                panic_after_release: false,
+            },
+            ctrl_rx,
+        ));
+
+        entered_rx
+            .await
+            .expect("the behaviour must reach on_envelope");
+        go_tx.send(()).expect("the bus task awaits the go signal");
+        buffered_rx
+            .await
+            .expect("the fatal frame and msg_2 must be buffered before the controls");
+
+        let mut acks = Vec::new();
+        for _ in 0..32 {
+            let (ctrl, ack_rx) = swap_ctrl();
+            ctrl_tx
+                .try_send(ctrl)
+                .expect("the buffer holds 32 controls");
+            acks.push(ack_rx);
+        }
+        release_tx
+            .send(())
+            .expect("the behaviour awaits the release");
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("runner ends within budget")
+            .expect("no panic");
+        assert!(
+            matches!(&result, Err(RunnerError::Fatal { code, .. }) if code == "loop_blocked"),
+            "{result:?}"
+        );
+
+        let mut served = 0usize;
+        let mut unserved = 0usize;
+        for ack_rx in acks {
+            let answer = tokio::time::timeout(Duration::from_secs(5), ack_rx)
+                .await
+                .expect("ack within budget")
+                .expect("every queued swap must be answered");
+            match answer {
+                Ok(snapshot) if snapshot.notes == "no live session" => served += 1,
+                Err(HarnessError::Unavailable(msg)) if msg.contains("loop_blocked") => {
+                    unserved += 1
+                }
+                other => panic!("unexpected answer: {other:?}"),
+            }
+        }
+        assert_eq!(
+            served + unserved,
+            32,
+            "served {served}, unserved {unserved}"
+        );
+        assert!(
+            unserved >= 1,
+            "the fatal frame must have cut the drain short: served {served}"
+        );
+    }
+
+    /// Error case: the worker task panics inside `on_envelope`. The control
+    /// receiver is dropped while the panic unwinds, so the queued swap must
+    /// still be answered — with the error contract, since the worker died.
+    #[tokio::test]
+    async fn a_panicking_runner_answers_a_queued_swap_with_an_error() {
+        let (url, listener) = start_fake_bus().await;
+        tokio::spawn(one_envelope_bus(listener));
+
+        let conn = BusConn::connect(&url, "tok", "agent:pm").await.unwrap();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel(4);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let handle = tokio::spawn(AgentRunner::run_with_control(
+            conn,
+            GatedEnvelope {
+                entered: Some(entered_tx),
+                release: Some(release_rx),
+                panic_after_release: true,
+            },
+            ctrl_rx,
+        ));
+
+        entered_rx
+            .await
+            .expect("the behaviour must reach on_envelope");
+        let (ctrl, ack_rx) = swap_ctrl();
+        ctrl_tx
+            .try_send(ctrl)
+            .expect("the receiver is alive while on_envelope is parked");
+        release_tx
+            .send(())
+            .expect("the behaviour awaits the release");
+
+        assert!(handle.await.unwrap_err().is_panic());
+
+        match tokio::time::timeout(Duration::from_secs(5), ack_rx)
+            .await
+            .expect("ack within budget")
+            .expect("a queued swap must be answered, not dropped")
+        {
+            Err(HarnessError::Unavailable(msg)) => {
+                assert!(msg.contains("panicked"), "{msg}")
+            }
+            other => panic!("expected Unavailable, got {other:?}"),
+        }
+    }
+
+    /// Boundary case on the other side of the exit: the control arrives
+    /// *after* the runner has already returned. crew-run's `swap_harness`
+    /// holds a cloned Sender, so the send must still be accepted and
+    /// answered — a closed channel there is the second error arm
+    /// ("worker control channel closed") of issue #23.
+    ///
+    /// Determinism relies on current_thread FIFO scheduling: the drain task
+    /// spawned in the runner's Drop is queued before this task's JoinHandle
+    /// wake, and yield_now defers this task's waker behind it, so the drain
+    /// has been polled once before the send (theoretical exception only if
+    /// event_interval or more other ready tasks were queued ahead).
+    #[tokio::test]
+    async fn a_swap_sent_after_the_runner_returned_is_still_answered() {
+        let (url, listener) = start_fake_bus().await;
+
+        tokio::spawn(async move {
+            let (stream, _peer) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            send_welcome(&mut ws).await;
+
+            let error = ServerFrame::Error {
+                code: "loop_blocked".to_string(),
+                message: "cycle detected".to_string(),
+            };
+            ws.send(Message::Text(serde_json::to_string(&error).unwrap().into()))
+                .await
+                .unwrap();
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+
+        let conn = BusConn::connect(&url, "tok", "agent:pm").await.unwrap();
+        let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel(4);
+        let handle = tokio::spawn(AgentRunner::run_with_control(
+            conn,
+            CountingBehavior { remaining: 2 },
+            ctrl_rx,
+        ));
+
+        let result = handle.await.expect("no panic");
+        assert!(
+            matches!(&result, Err(RunnerError::Fatal { code, .. }) if code == "loop_blocked"),
+            "{result:?}"
+        );
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (ctrl, ack_rx) = swap_ctrl();
+            ctrl_tx
+                .send(ctrl)
+                .await
+                .expect("a Sender still exists, so the ended worker's channel must still accept");
+            match ack_rx.await.expect("the late swap must be answered") {
+                Err(HarnessError::Unavailable(msg)) => {
+                    assert!(msg.contains("loop_blocked"), "{msg}")
+                }
+                other => panic!("expected Unavailable, got {other:?}"),
+            }
+        })
+        .await
+        .expect("the late swap must be answered within the budget");
     }
 }
