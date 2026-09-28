@@ -610,7 +610,7 @@ mod tests {
                 }]
             });
 
-            let verdict = crate::dod_exec::judge(task, &body, &[], &[]);
+            let verdict = crate::dod_exec::judge(task, &body, &[], &[], None);
 
             assert!(
                 verdict.passed,
@@ -637,7 +637,7 @@ mod tests {
             "artifacts": []
         });
 
-        let verdict = crate::dod_exec::judge(dev_task, &body, &[], &[]);
+        let verdict = crate::dod_exec::judge(dev_task, &body, &[], &[], None);
 
         assert!(!verdict.passed);
         assert_eq!(verdict.uncovered, vec![dev_ids[1].as_str().to_string()]);

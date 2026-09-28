@@ -5,7 +5,7 @@
 //! rest of the DAG keeps moving (§4.4).
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -362,8 +362,15 @@ impl LeadBehavior {
         task: TaskSpec,
         cmd_outcomes: &[CmdOutcome],
         browser_outcomes: &[BrowserOutcome],
+        artifact_cwd: Option<&Path>,
     ) -> Vec<Envelope> {
-        let verdict = dod_exec::judge(&task, &env.body, cmd_outcomes, browser_outcomes);
+        let verdict = dod_exec::judge(
+            &task,
+            &env.body,
+            cmd_outcomes,
+            browser_outcomes,
+            artifact_cwd,
+        );
         let loop_ = self
             .loops
             .entry(task_id.clone())
@@ -519,10 +526,18 @@ impl RoleBehavior for LeadBehavior {
         match env.kind {
             MessageKind::TaskResult => match self.resolve_task_result(&env) {
                 Some((task_id, task)) => {
-                    let outcomes = match &self.cmd_exec_cwd_for_role {
-                        Some(resolve) => {
-                            let cwd = resolve(task.role);
-                            cmd_exec::execute_cmd_checks(&task, &cwd, &self.cmd_policy).await
+                    // plan D8: resolve the role worktree ONCE and reuse it for
+                    // the Cmd DoD executor and for the judge's on-disk artifact
+                    // check (issue #31b) — a second resolve call would break
+                    // `cmd_wiring_resolves_cwd_per_task_role` and re-run the
+                    // resolver's directory creation.
+                    let role_cwd: Option<PathBuf> = self
+                        .cmd_exec_cwd_for_role
+                        .as_ref()
+                        .map(|resolve| resolve(task.role));
+                    let outcomes = match &role_cwd {
+                        Some(cwd) => {
+                            cmd_exec::execute_cmd_checks(&task, cwd, &self.cmd_policy).await
                         }
                         None => Vec::new(),
                     };
@@ -533,7 +548,14 @@ impl RoleBehavior for LeadBehavior {
                         }
                         None => Vec::new(),
                     };
-                    self.handle_task_result(env, task_id, task, &outcomes, &browser_outcomes)
+                    self.handle_task_result(
+                        env,
+                        task_id,
+                        task,
+                        &outcomes,
+                        &browser_outcomes,
+                        role_cwd.as_deref(),
+                    )
                 }
                 None => vec![],
             },
@@ -1053,6 +1075,110 @@ mod tests {
 
     fn empty_result_body() -> Value {
         json!({"covered_req_ids": [], "artifacts": []})
+    }
+
+    /// A task whose only DoD is one expected artifact contract (issue #31b).
+    fn artifact_task(id: &str, role: Role, name: &str) -> TaskSpec {
+        TaskSpec {
+            id: id.to_string(),
+            role,
+            title: "title".to_string(),
+            brief: "brief".to_string(),
+            dod: vec![],
+            deps: vec![],
+            artifacts_expected: vec![crew_proto::ArtifactContract {
+                name: name.to_string(),
+                kind: "doc".to_string(),
+                req_ids: vec![],
+            }],
+        }
+    }
+
+    /// A `task.result` body reporting one artifact BY PATH (no `content`).
+    fn path_artifact_body(name: &str, path: &str) -> Value {
+        json!({
+            "covered_req_ids": [],
+            "artifacts": [{"name": name, "kind": "doc", "req_ids": [], "path": path}],
+        })
+    }
+
+    #[tokio::test]
+    async fn artifact_path_file_on_disk_in_role_cwd_accepts_the_task() {
+        let scratch = crate::dod_exec::test_scratch::ScratchDir::new("dispatch-accept");
+        scratch.write("out/report.md", b"x");
+        let cwd = scratch.path().to_path_buf();
+        let mut lead = lead_for_tasks(
+            vec![artifact_task("t-art", Role::Pm, "report")],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        )
+        .with_cmd_exec(Arc::new(move |_role| cwd.clone()));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(
+            &assign,
+            "agent:pm",
+            path_artifact_body("report", "out/report.md"),
+        );
+        let _ = lead.on_envelope(result).await;
+
+        assert_eq!(lead.state_of("t-art"), Some(TaskState::Accepted));
+    }
+
+    #[tokio::test]
+    async fn artifact_path_file_absent_in_role_cwd_sends_change_request_naming_it() {
+        let scratch = crate::dod_exec::test_scratch::ScratchDir::new("dispatch-absent");
+        let cwd = scratch.path().to_path_buf();
+        let mut lead = lead_for_tasks(
+            vec![artifact_task("t-art", Role::Pm, "report")],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        )
+        .with_cmd_exec(Arc::new(move |_role| cwd.clone()));
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(
+            &assign,
+            "agent:pm",
+            path_artifact_body("report", "out/report.md"),
+        );
+        let replies = lead.on_envelope(result).await;
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].kind, MessageKind::ChangeRequest);
+        assert_eq!(
+            replies[0].body["violations"],
+            json!(["artifact:report (file not found)"]),
+            "the reason must survive accept.rs's dod_violation_strings"
+        );
+        assert_eq!(lead.state_of("t-art"), Some(TaskState::Assigned));
+    }
+
+    #[tokio::test]
+    async fn artifact_path_without_cwd_resolver_is_missing_with_no_cwd_reason() {
+        // No `with_cmd_exec`: a path cannot be verified without a role
+        // worktree, and an unverifiable claim is not evidence (plan D7).
+        let mut lead = lead_for_tasks(
+            vec![artifact_task("t-art", Role::Pm, "report")],
+            vec![(Role::Pm, "agent:pm".to_string())],
+            AcceptanceLoop::default_budget(),
+        );
+
+        let assign = lead.on_start().await.remove(0);
+        let result = task_result_envelope(
+            &assign,
+            "agent:pm",
+            path_artifact_body("report", "out/report.md"),
+        );
+        let replies = lead.on_envelope(result).await;
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].kind, MessageKind::ChangeRequest);
+        assert_eq!(
+            replies[0].body["violations"],
+            json!(["artifact:report (path not verifiable: no role worktree)"])
+        );
+        assert_eq!(lead.state_of("t-art"), Some(TaskState::Assigned));
     }
 
     #[tokio::test]
