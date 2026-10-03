@@ -1,7 +1,7 @@
 //! Run configuration and error types — contract §C3 verbatim, extended by
 //! contracts-m5.md §C5a (multi-sprint fields).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crew_agent::BusError;
 use crew_ledger::LedgerError;
@@ -156,6 +156,60 @@ pub fn default_dev_cmd_checks_node() -> Vec<CmdCheck> {
     ]
 }
 
+/// Auto-detects the dev cmd DoD checks for a project tree (issue #33): a
+/// `Cargo.toml` regular file at `project_root` selects
+/// [`default_dev_cmd_checks_rust`]. A `package.json` regular file contributes
+/// `npm test` only if its `scripts.test` is a non-empty string and
+/// `npm run build` only if its `scripts.build` is (in that order) — a missing
+/// script would make npm exit non-zero on every round, so it is never armed.
+/// A malformed or non-object `package.json` contributes nothing. Both
+/// markers select rust then node. Neither, a missing root, or a marker that
+/// is a directory (not a regular file) yields an empty vector.
+///
+/// A pure filesystem read of the root's two direct entries — nothing is
+/// spawned and subdirectories are never searched. The caller decides whether
+/// to arm the result (the app arms it only for a human-designated
+/// `project_root`, 함정 29 / issue #5).
+pub fn detect_dev_cmd_checks(project_root: &Path) -> Vec<CmdCheck> {
+    let is_file = |name: &str| project_root.join(name).is_file();
+    let mut checks = Vec::new();
+    if is_file("Cargo.toml") {
+        checks.extend(default_dev_cmd_checks_rust());
+    }
+    if is_file("package.json") {
+        checks.extend(node_checks_from_package_json(
+            &project_root.join("package.json"),
+        ));
+    }
+    checks
+}
+
+/// The node half of [`detect_dev_cmd_checks`]: one [`CmdCheck`] per declared,
+/// non-empty `scripts.test` / `scripts.build`. Unreadable or malformed JSON,
+/// a non-object root, or a non-object `scripts` all yield nothing.
+fn node_checks_from_package_json(path: &Path) -> Vec<CmdCheck> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let has_script = |name: &str| {
+        json.get("scripts")
+            .and_then(|scripts| scripts.get(name))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|cmd| !cmd.trim().is_empty())
+    };
+    [("test", "npm test"), ("build", "npm run build")]
+        .into_iter()
+        .filter(|(script, _)| has_script(script))
+        .map(|(_, run)| CmdCheck {
+            run: run.to_string(),
+            expect: "exit 0".to_string(),
+        })
+        .collect()
+}
+
 /// How the run's five crew-member workers behave (contract §C3). `Clone`
 /// so the multi-sprint loop (contracts-m5.md §C5a) can hold one `RunConfig`
 /// value while re-spawning fresh workers from the same `mode` at every
@@ -261,6 +315,158 @@ mod tests {
             assert_eq!(policy.vet_run(&c.run), Ok(()));
             assert_eq!(c.expect, "exit 0");
         }
+    }
+
+    /// A fresh project dir under `.crew-test/` (repo convention, never
+    /// `/tmp`), removed on drop — pass or panic. `Drop` removes exactly the
+    /// one path it owns, never its parent.
+    struct DetectRoot(PathBuf);
+
+    impl DetectRoot {
+        fn new(label: &str) -> Self {
+            let dir = std::env::current_dir()
+                .unwrap()
+                .join(".crew-test")
+                .join(format!("detect-{label}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("test setup: detect root");
+            Self(dir)
+        }
+
+        fn touch(&self, name: &str) {
+            self.write(name, "");
+        }
+
+        fn write(&self, name: &str, contents: &str) {
+            std::fs::write(self.0.join(name), contents).expect("test setup: marker file");
+        }
+    }
+
+    impl Drop for DetectRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn pairs(checks: &[CmdCheck]) -> Vec<(&str, &str)> {
+        checks
+            .iter()
+            .map(|c| (c.run.as_str(), c.expect.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn detect_dev_cmd_checks_selects_the_rust_preset_for_a_cargo_toml() {
+        let root = DetectRoot::new("rust");
+        root.touch("Cargo.toml");
+        assert_eq!(
+            pairs(&detect_dev_cmd_checks(&root.0)),
+            vec![("cargo test", "exit 0")]
+        );
+    }
+
+    const BOTH_SCRIPTS: &str = r#"{"scripts":{"build":"vite build","test":"vitest run"}}"#;
+
+    #[test]
+    fn detect_dev_cmd_checks_selects_npm_test_then_build_when_both_scripts_exist() {
+        let root = DetectRoot::new("node");
+        root.write("package.json", BOTH_SCRIPTS);
+        assert_eq!(
+            pairs(&detect_dev_cmd_checks(&root.0)),
+            vec![("npm test", "exit 0"), ("npm run build", "exit 0")]
+        );
+        assert_eq!(
+            detect_dev_cmd_checks(&root.0),
+            default_dev_cmd_checks_node(),
+            "both scripts must yield exactly the node preset"
+        );
+    }
+
+    #[test]
+    fn detect_dev_cmd_checks_arms_nothing_for_a_package_json_without_scripts() {
+        let root = DetectRoot::new("node-no-scripts");
+        root.write("package.json", r#"{"name":"x"}"#);
+        assert!(detect_dev_cmd_checks(&root.0).is_empty());
+    }
+
+    #[test]
+    fn detect_dev_cmd_checks_arms_only_the_declared_non_empty_script() {
+        let root = DetectRoot::new("node-build-only");
+        root.write(
+            "package.json",
+            r#"{"scripts":{"build":"tsc","test":"","lint":"eslint ."}}"#,
+        );
+        assert_eq!(
+            pairs(&detect_dev_cmd_checks(&root.0)),
+            vec![("npm run build", "exit 0")]
+        );
+    }
+
+    #[test]
+    fn detect_dev_cmd_checks_ignores_a_non_string_or_non_object_scripts_value() {
+        let root = DetectRoot::new("node-odd");
+        root.write("package.json", r#"{"scripts":{"test":1,"build":["tsc"]}}"#);
+        assert!(detect_dev_cmd_checks(&root.0).is_empty());
+        root.write("package.json", r#"["not","an","object"]"#);
+        assert!(detect_dev_cmd_checks(&root.0).is_empty());
+    }
+
+    #[test]
+    fn detect_dev_cmd_checks_skips_malformed_package_json_but_keeps_rust() {
+        let root = DetectRoot::new("node-malformed");
+        root.write("package.json", r#"{"scripts":{"test":"vitest""#);
+        assert!(
+            detect_dev_cmd_checks(&root.0).is_empty(),
+            "malformed JSON -> no node checks"
+        );
+        root.touch("Cargo.toml");
+        assert_eq!(
+            pairs(&detect_dev_cmd_checks(&root.0)),
+            vec![("cargo test", "exit 0")]
+        );
+    }
+
+    #[test]
+    fn detect_dev_cmd_checks_orders_rust_before_node_when_both_markers_exist() {
+        let root = DetectRoot::new("both");
+        root.write("package.json", BOTH_SCRIPTS);
+        root.touch("Cargo.toml");
+        assert_eq!(
+            pairs(&detect_dev_cmd_checks(&root.0)),
+            vec![
+                ("cargo test", "exit 0"),
+                ("npm test", "exit 0"),
+                ("npm run build", "exit 0")
+            ]
+        );
+    }
+
+    #[test]
+    fn detect_dev_cmd_checks_is_empty_without_markers_even_if_a_subdirectory_has_one() {
+        let root = DetectRoot::new("neither");
+        root.touch("README.md");
+        std::fs::create_dir_all(root.0.join("sub")).unwrap();
+        std::fs::write(root.0.join("sub").join("Cargo.toml"), "").unwrap();
+        assert!(
+            detect_dev_cmd_checks(&root.0).is_empty(),
+            "no root marker, no recursion"
+        );
+    }
+
+    #[test]
+    fn detect_dev_cmd_checks_is_empty_for_a_missing_root() {
+        let root = DetectRoot::new("missing");
+        let missing = root.0.join("does-not-exist");
+        assert!(detect_dev_cmd_checks(&missing).is_empty());
+    }
+
+    #[test]
+    fn detect_dev_cmd_checks_ignores_a_cargo_toml_that_is_a_directory() {
+        let root = DetectRoot::new("marker-dir");
+        std::fs::create_dir_all(root.0.join("Cargo.toml")).unwrap();
+        assert!(
+            detect_dev_cmd_checks(&root.0).is_empty(),
+            "a directory named Cargo.toml is not a marker"
+        );
     }
 
     #[test]

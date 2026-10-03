@@ -229,3 +229,14 @@ export interface StartRunArgs {
  */
 export type ListProjectsResult = ProjectInfo[];
 // ===== END StartRunProjectRootArg/ListProjectsCommand contract stub =====
+
+/**
+ * One auto-detected dev cmd DoD check (issue #33) — `invoke("preview_run_checks",
+ * { projectRoot })`'s element type, mirroring `core::RunCheckPreview` in
+ * `src-tauri/src/core.rs`. A run on that root carries exactly these checks; an
+ * empty list means the run can never reach Completed (so it never pushes).
+ */
+export interface RunCheckPreview {
+  run: string;
+  expect: string;
+}
