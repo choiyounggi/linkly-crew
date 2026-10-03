@@ -119,3 +119,28 @@
   min-height: 0;
   overflow-y: auto;
 }
+
+/* Issue #33: auto-detected DoD check preview / no-checks warning. */
+.new-task-modal__checks {
+  color: var(--ink-dim);
+  font-size: var(--font-size-sm);
+}
+
+.new-task-modal__checks p,
+.new-task-modal__checks ul {
+  margin: 0;
+}
+
+.new-task-modal__checks ul {
+  padding-left: var(--space-4);
+}
+
+.new-task-modal__checks-warning {
+  color: var(--status-warning);
+  font-size: var(--font-size-sm);
+}
+
+p.new-task-modal__checks-warning,
+.new-task-modal__checks-warning p {
+  margin: 0;
+}

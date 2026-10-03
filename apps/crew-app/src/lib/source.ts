@@ -1,6 +1,6 @@
 import { isTauri } from "@tauri-apps/api/core";
 
-import type { Envelope, HarnessInfo, ProjectInfo, Roster, RosterPreset, RunEvent, RunSummary } from "./types";
+import type { Envelope, HarnessInfo, ProjectInfo, Roster, RosterPreset, RunCheckPreview, RunEvent, RunSummary } from "./types";
 import { MockEventSource } from "./mock-source";
 import { TauriEventSource } from "./tauri-source";
 
@@ -31,6 +31,13 @@ export interface RunEventSource {
    * directory; resolves `[]` if the root exists with zero projects.
    */
   listProjects?(): Promise<ProjectInfo[]>;
+  /**
+   * preview_run_checks(projectRoot) -> the dev cmd DoD checks a run on that root would
+   * carry (issue #33), auto-detected from `Cargo.toml`/`package.json`. Read-only — never
+   * starts anything. `null` resolves `[]`. Optional so sources without a backend for it
+   * (test fakes) still compile; the new-task modal then renders no preview.
+   */
+  previewRunChecks?(projectRoot: string | null): Promise<RunCheckPreview[]>;
   /** D8: run_id-first, per t1's MultiRunApi contract (decisions.md). */
   swapHarness?(runId: string, agentId: string, harness: string): Promise<void>;
   getRoster?(): Promise<Roster>;

@@ -10,6 +10,7 @@ import type {
   RosterAgentDto,
   ProjectInfo,
   RosterPreset,
+  RunCheckPreview,
   RunEvent,
   RunSummary,
   SpecDoc,
@@ -554,6 +555,15 @@ export class MockEventSource implements RunEventSource {
     return [
       { name: "alpha", path: "/mock/alpha" },
       { name: "beta", path: "/mock/beta" },
+    ];
+  }
+
+  /** Issue #33, deterministic: `null` -> `[]`; any root containing "no-checks" -> `[]` (so the modal's warning path is demoable); any other root -> the node preset. */
+  async previewRunChecks(projectRoot: string | null): Promise<RunCheckPreview[]> {
+    if (projectRoot === null || projectRoot.includes("no-checks")) return [];
+    return [
+      { run: "npm test", expect: "exit 0" },
+      { run: "npm run build", expect: "exit 0" },
     ];
   }
 

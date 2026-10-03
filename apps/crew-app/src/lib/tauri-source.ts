@@ -8,6 +8,7 @@ import type {
   HarnessInfo,
   ProjectInfo,
   Roster,
+  RunCheckPreview,
   RosterPreset,
   RunEvent,
   RunEventEnvelope,
@@ -176,6 +177,11 @@ export class TauriEventSource implements RunEventSource {
   /** Rejects with the backend's error as-is (e.g. `workspace_missing: <path>`) — not wrapped, so callers can branch on it. */
   async listProjects(): Promise<ProjectInfo[]> {
     return this.invoke<ProjectInfo[]>("list_projects");
+  }
+
+  /** Issue #33: `projectRoot` is always sent as an explicit key, `null` included (same rule as `start`). Rejections propagate. */
+  async previewRunChecks(projectRoot: string | null): Promise<RunCheckPreview[]> {
+    return this.invoke<RunCheckPreview[]>("preview_run_checks", { projectRoot });
   }
 
   /** Command names verbatim per contracts-m5.md §C6; D8 adds `runId` first. Errors reject, not swallowed. */

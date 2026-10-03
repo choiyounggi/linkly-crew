@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { useRunStore } from "../../lib/store";
 import type { RunEventSource } from "../../lib/source";
+import { MockEventSource } from "../../lib/mock-source";
 import NewTaskModal from "./NewTaskModal";
 
 function fakeSource(overrides: Partial<RunEventSource> = {}): RunEventSource {
@@ -83,7 +84,7 @@ describe("NewTaskModal — error: gh_missing surfaces a Korean message and keeps
     fireEvent.change(screen.getByLabelText("프로젝트명"), { target: { value: "my-app" } });
     fireEvent.click(screen.getByRole("button", { name: "시작" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("GitHub CLI(gh)가 설치되어 있지 않습니다");
+    expect(await screen.findByText("GitHub CLI(gh)가 설치되어 있지 않습니다")).toHaveAttribute("role", "alert");
     expect(startChannel).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
     expect(screen.getByRole("dialog", { name: "새 작업" })).toBeInTheDocument();
@@ -106,7 +107,8 @@ describe("NewTaskModal — issue #15: startChannel failure after createProject s
     fireEvent.change(screen.getByLabelText("프로젝트명"), { target: { value: "my-app" } });
     fireEvent.click(screen.getByRole("button", { name: "시작" }));
 
-    const alert = await screen.findByRole("alert");
+    const alert = await screen.findByText(/는 생성되었지만 실행 시작에 실패했습니다/);
+    expect(alert).toHaveAttribute("role", "alert");
     expect(alert.textContent).toBe(
       '프로젝트 "my-app"(/ws/my-app)는 생성되었지만 실행 시작에 실패했습니다: project_root invalid: not a git repo',
     );
@@ -130,7 +132,7 @@ describe("NewTaskModal — issue #15: startChannel failure after createProject s
     fireEvent.change(screen.getByLabelText("작업 내용"), { target: { value: "goal" } });
     fireEvent.change(screen.getByLabelText("프로젝트명"), { target: { value: "my-app" } });
     fireEvent.click(screen.getByRole("button", { name: "시작" }));
-    await screen.findByRole("alert");
+    await screen.findByText(/실행 시작에 실패했습니다/);
 
     fireEvent.click(screen.getByRole("button", { name: "시작" }));
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
@@ -155,7 +157,7 @@ describe("NewTaskModal — issue #15: startChannel failure after createProject s
     fireEvent.change(screen.getByLabelText("작업 내용"), { target: { value: "goal" } });
     fireEvent.change(screen.getByLabelText("프로젝트명"), { target: { value: "my-app" } });
     fireEvent.click(screen.getByRole("button", { name: "시작" }));
-    await screen.findByRole("alert");
+    await screen.findByText(/실행 시작에 실패했습니다/);
 
     fireEvent.click(screen.getByRole("button", { name: "기존 선택" }));
     fireEvent.click(screen.getByRole("button", { name: "새로 만들기" }));
@@ -307,6 +309,108 @@ describe("NewTaskModal — 기존 선택 모드 (t2-fe-picker R5/R6/R7/R8/D5)", 
     expect(document.querySelectorAll(".new-task-modal__project-item")).toHaveLength(20);
     expect(document.querySelector(".new-task-modal__actions")).not.toBeNull();
     expect(document.querySelector(".new-task-modal .panel--roster")).not.toBeNull();
+  });
+});
+
+describe("NewTaskModal — issue #33: auto-detected DoD check preview", () => {
+  const CREATE_MODE_NOTE =
+    "새 프로젝트에는 시작 시 Cargo.toml/package.json이 없어 DoD 체크가 감지되지 않습니다 — 첫 런은 Completed/푸시에 도달할 수 없습니다. 기존 레포를 선택하면 체크가 자동 감지됩니다.";
+  const NO_CHECKS_WARNING = /감지된 DoD 체크가 없습니다 — Cargo.toml 또는 test\/build 스크립트가 있는 package.json이 없으면 이 런은 Completed\/푸시에 도달할 수 없습니다/;
+
+  async function selectExisting(projects: { name: string; path: string }[], overrides: Partial<RunEventSource>) {
+    const source = fakeSource({ listProjects: vi.fn(async () => projects), ...overrides });
+    render(<NewTaskModal onClose={() => {}} source={source} />);
+    fireEvent.click(screen.getByRole("button", { name: "기존 선택" }));
+    await screen.findByText(projects[0].name);
+    fireEvent.click(screen.getByLabelText(projects[0].name));
+    return source;
+  }
+
+  it("normal: lists each detected check for the selected root and allows starting", async () => {
+    const mock = new MockEventSource();
+    const previewRunChecks = vi.fn((root: string | null) => mock.previewRunChecks(root));
+    const startChannel = vi.spyOn(useRunStore.getState(), "startChannel").mockResolvedValue("run-1");
+    await selectExisting([{ name: "web", path: "/ws/web" }], { previewRunChecks });
+
+    const list = await screen.findByRole("list", { name: "Developer 태스크의 DoD 체크:" });
+    expect(Array.from(list.querySelectorAll("li"), (li) => li.textContent)).toEqual([
+      "npm test (기대: exit 0)",
+      "npm run build (기대: exit 0)",
+    ]);
+    expect(previewRunChecks).toHaveBeenCalledWith("/ws/web");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("작업 내용"), { target: { value: "goal" } });
+    fireEvent.click(screen.getByRole("button", { name: "시작" }));
+    await waitFor(() => expect(startChannel).toHaveBeenCalledWith("goal", false, "/ws/web"));
+    startChannel.mockRestore();
+  });
+
+  it("boundary: a root with no detected checks shows the warning, and starting is still allowed", async () => {
+    const mock = new MockEventSource();
+    const startChannel = vi.spyOn(useRunStore.getState(), "startChannel").mockResolvedValue("run-1");
+    await selectExisting([{ name: "bare", path: "/ws/no-checks" }], {
+      previewRunChecks: (root) => mock.previewRunChecks(root),
+    });
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(NO_CHECKS_WARNING);
+    expect(screen.queryByText("Developer 태스크의 DoD 체크:")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("작업 내용"), { target: { value: "goal" } });
+    fireEvent.click(screen.getByRole("button", { name: "시작" }));
+    await waitFor(() => expect(startChannel).toHaveBeenCalledWith("goal", false, "/ws/no-checks"));
+    startChannel.mockRestore();
+  });
+
+  it("create mode (the default) always shows the no-checks note, and starting is still allowed", async () => {
+    const startChannel = vi.spyOn(useRunStore.getState(), "startChannel").mockResolvedValue("run-1");
+    render(<NewTaskModal onClose={() => {}} source={fakeSource()} />);
+
+    expect(screen.getByRole("alert")).toHaveTextContent(CREATE_MODE_NOTE);
+
+    fireEvent.change(screen.getByLabelText("작업 내용"), { target: { value: "goal" } });
+    fireEvent.change(screen.getByLabelText("프로젝트명"), { target: { value: "my-app" } });
+    fireEvent.click(screen.getByRole("button", { name: "시작" }));
+    await waitFor(() => expect(startChannel).toHaveBeenCalledWith("goal", false, "/tmp/my-app"));
+    startChannel.mockRestore();
+  });
+
+  it("boundary: existing mode without a selected root previews nothing and renders neither list nor alert", async () => {
+    const previewRunChecks = vi.fn(async () => [{ run: "cargo test", expect: "exit 0" }]);
+    const source = fakeSource({ listProjects: vi.fn(async () => [{ name: "demo", path: "/ws/demo" }]), previewRunChecks });
+    render(<NewTaskModal onClose={() => {}} source={source} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "기존 선택" }));
+    await screen.findByText("demo");
+
+    expect(previewRunChecks).not.toHaveBeenCalled();
+    expect(screen.queryByText(/DoD 체크/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("error: a rejected preview renders the warning plus the error line instead of throwing", async () => {
+    const previewRunChecks = vi.fn(async () => {
+      throw new Error("preview exploded");
+    });
+    await selectExisting([{ name: "demo", path: "/ws/demo" }], { previewRunChecks });
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(NO_CHECKS_WARNING);
+    expect(alert).toHaveTextContent("DoD 체크 감지 실패: preview exploded");
+    expect(document.querySelector(".new-task-modal__actions")).not.toBeNull();
+  });
+
+  it("switching back to create mode clears the preview", async () => {
+    const mock = new MockEventSource();
+    await selectExisting([{ name: "web", path: "/ws/web" }], { previewRunChecks: (root) => mock.previewRunChecks(root) });
+    await screen.findByText("npm test (기대: exit 0)");
+
+    fireEvent.click(screen.getByRole("button", { name: "새로 만들기" }));
+
+    await waitFor(() => expect(screen.queryByText("Developer 태스크의 DoD 체크:")).not.toBeInTheDocument());
+    expect(screen.queryByText("npm test (기대: exit 0)")).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(CREATE_MODE_NOTE);
   });
 });
 

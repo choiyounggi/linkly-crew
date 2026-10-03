@@ -17,7 +17,7 @@ import { useEffect, useRef, useState } from "react";
 import { Button, Field } from "../../components/primitives";
 import { defaultSource, useRunStore } from "../../lib/store";
 import type { RunEventSource } from "../../lib/source";
-import type { ProjectInfo } from "../../lib/types";
+import type { ProjectInfo, RunCheckPreview } from "../../lib/types";
 import RosterPanel from "../roster";
 import "./new-task-modal.css";
 
@@ -29,6 +29,8 @@ interface NewTaskModalProps {
 type SubmitState = "idle" | "loading" | "error";
 type Mode = "create" | "existing";
 type ListState = "idle" | "loading" | "error" | "loaded";
+/** Issue #33: the auto-detected DoD checks for the selected project root. */
+type ChecksPreview = { checks: RunCheckPreview[]; error: string | null };
 
 /** t3-be-project's create_project error vocabulary (decisions.md), mapped to Korean. */
 function projectErrorMessage(err: unknown): string {
@@ -93,6 +95,29 @@ export default function NewTaskModal({ onClose, source = defaultSource }: NewTas
   const [listError, setListError] = useState<string | null>(null);
   const [selected, setSelected] = useState<ProjectInfo | null>(null);
   const [selectedError, setSelectedError] = useState<string | null>(null);
+
+  // Issue #33: preview the DoD checks a run on the selected root would carry. Only a root
+  // that already exists can be inspected — the existing-mode selection; create mode's
+  // project is not made until submit, so it has no root to preview.
+  const selectedRoot = mode === "existing" ? (selected?.path ?? null) : null;
+  const [checksPreview, setChecksPreview] = useState<ChecksPreview | null>(null);
+
+  useEffect(() => {
+    setChecksPreview(null);
+    if (selectedRoot === null || !source.previewRunChecks) return;
+    let cancelled = false;
+    source.previewRunChecks(selectedRoot).then(
+      (checks) => {
+        if (!cancelled) setChecksPreview({ checks, error: null });
+      },
+      (err: unknown) => {
+        if (!cancelled) setChecksPreview({ checks: [], error: err instanceof Error ? err.message : String(err) });
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedRoot, source]);
 
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const firstFieldRef = useRef<HTMLTextAreaElement | null>(null);
@@ -312,6 +337,33 @@ export default function NewTaskModal({ onClose, source = defaultSource }: NewTas
         </label>
 
         <RosterPanel source={source} />
+
+        {mode === "create" && (
+          <p className="new-task-modal__checks-warning" role="alert">
+            새 프로젝트에는 시작 시 Cargo.toml/package.json이 없어 DoD 체크가 감지되지 않습니다 — 첫 런은 Completed/푸시에 도달할 수 없습니다. 기존 레포를 선택하면 체크가 자동 감지됩니다.
+          </p>
+        )}
+
+        {checksPreview && checksPreview.checks.length > 0 && (
+          <div className="new-task-modal__checks">
+            {/* Only the Developer task carries Cmd DoD checks (crew-lead plan.rs). */}
+            <p id="new-task-modal-checks-title">Developer 태스크의 DoD 체크:</p>
+            <ul aria-labelledby="new-task-modal-checks-title">
+              {checksPreview.checks.map((c) => (
+                <li key={`${c.run}|${c.expect}`}>
+                  {c.run} (기대: {c.expect})
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {checksPreview && checksPreview.checks.length === 0 && (
+          <div className="new-task-modal__checks-warning" role="alert">
+            <p>감지된 DoD 체크가 없습니다 — Cargo.toml 또는 test/build 스크립트가 있는 package.json이 없으면 이 런은 Completed/푸시에 도달할 수 없습니다.</p>
+            {checksPreview.error && <p>DoD 체크 감지 실패: {checksPreview.error}</p>}
+          </div>
+        )}
 
         {submitState === "error" && submitError && (
           <p className="new-task-modal__error" role="alert">

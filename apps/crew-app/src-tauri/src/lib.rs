@@ -190,6 +190,14 @@ async fn list_projects() -> Result<Vec<project::ProjectInfo>, String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Issue #33: the dev cmd DoD checks a run on `project_root` would carry,
+/// for the new-task modal to preview before `start_run`. Read-only — it
+/// never starts a run. Filesystem stat only, so it runs inline.
+#[tauri::command]
+fn preview_run_checks(project_root: Option<String>) -> Vec<core::RunCheckPreview> {
+    core::preview_run_checks_core(project_root.as_deref())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let log_guard = logging::init();
@@ -222,6 +230,7 @@ pub fn run() {
             onboarding_status,
             create_project,
             list_projects,
+            preview_run_checks,
             pty::pty_open,
             pty::pty_write,
             pty::pty_resize,

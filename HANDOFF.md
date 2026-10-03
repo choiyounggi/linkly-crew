@@ -374,6 +374,12 @@ E0004 비망라 — 머지 후 통합 테스트가 잡아 1줄로 해소(`core.r
 
 착수 조건은 이제 충족됐다 — 함정 30이 t4에서 봉쇄됐으므로 project_root를 켜도 안전하다.
 단 **함정 29는 계속 비무장 유지**(`dev_cmd_checks: Vec::new()`), 켜려면 별도 판단 필요.
+**갱신(2026-10-03, issue #33)**: 그 판단이 내려졌다 — 앱은 RealCli + `project_root` 런에서
+Cmd DoD를 자동 감지해 무장한다(`Cargo.toml` → `cargo test`, `package.json`
+`scripts.test`/`build` → `npm test`/`npm run build`). 사용자가 `project_root` 런에 한해 함정 29
+노출(에이전트가 쓴 스크립트가 CI처럼 실행됨)을 수용했고, scripted 모드와 `project_root` 없는
+런은 비무장 유지. 모달이 시작 전에 감지 결과를 미리 보여 주고 0개면 경고한다(DESIGN §4.2
+"DoD 체크 자동 감지").
 
 ---
 
@@ -688,6 +694,12 @@ PlanOptions}`, `LeadPlanner::plan_dag_with`, `RunConfig.dev_cmd_checks`,
     남은 상태: `project_root`를 지정하고 `dev_cmd_checks`에 `npm run`/`npm test`류를
     포함시키면, 함정 29가 조용히 통과한다. 봉쇄는 argv 허용목록이 아니라 `project_root`를
     지정하는 사람의 판단뿐이다(DESIGN §4.2 신뢰 경계 문단).
+
+    **갱신(2026-10-03, issue #33) — 무장됨, 해소 아님.** 앱이 RealCli + `project_root` 런에서
+    `package.json`의 `scripts.test`/`build`를 감지하면 `npm test`/`npm run build`를 자동으로
+    단다 — 위 "오늘은 발화하지 않는다"는 더 이상 참이 아니다. 사용자가 이 노출을 수용했다
+    (§3.5 갱신, DESIGN §4.2 "DoD 체크 자동 감지"). scripted 모드와 `project_root` 없는 런은
+    비무장 유지.
 30. **[해소됨 — M12 t4, 2026-09-03]** `project_root: Some`이면 로스터 전원의 CLI 세션 cwd가
     동일하다 — 락·역할별 브랜치·충돌 감지가 전부 없다 (Phase 5 통합 리뷰 발, 코디네이터
     재현, 2026-08-31). **해소 내용**: `role_cli_cwd`의 `Some` 분기가 역할별 리포-밖 git

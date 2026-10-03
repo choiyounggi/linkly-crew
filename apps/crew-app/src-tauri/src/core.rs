@@ -100,10 +100,11 @@ fn scripted_mode() -> RunMode {
 
 /// Builds the `RunConfig` literal `start_run_core` passes to
 /// `RunController::start` (plan D9, task 02): extracted out of
-/// `start_run_core` so a dedicated regression test can construct the shipped
-/// defaults and assert `dev_cmd_checks` is still the empty vector (함정 29 /
-/// issue #5 — must stay unarmed) from the same place `project_root` is now
-/// threaded through.
+/// `start_run_core` so dedicated regression tests can construct the shipped
+/// defaults: without a `project_root`, `dev_cmd_checks` stays the empty
+/// vector (함정 29 / issue #5 — must stay unarmed); with one in `RealCli`
+/// mode, it is auto-detected from the root's markers (issue #33). Scripted
+/// runs never arm it.
 pub(crate) fn build_run_config(
     goal: String,
     mode: RunMode,
@@ -111,6 +112,12 @@ pub(crate) fn build_run_config(
     roster: Roster,
     project_root: Option<PathBuf>,
 ) -> RunConfig {
+    // Scripted demo runs never arm: a demo must not run real cargo/npm on the
+    // user's project (issue #33 rework N4).
+    let dev_cmd_checks = match (&mode, project_root.as_deref()) {
+        (RunMode::RealCli, Some(root)) => crew_run::detect_dev_cmd_checks(root),
+        _ => Vec::new(),
+    };
     RunConfig {
         goal,
         mode,
@@ -121,9 +128,12 @@ pub(crate) fn build_run_config(
         max_per_sprint: 0,
         escalation_timeout_ms: 0,
         roster: Some(roster),
-        // contracts-m10.md §H1g / D8: cmd DoD emission is off by default.
-        // To turn it on, pass crew_run::default_dev_cmd_checks_rust() etc.
-        dev_cmd_checks: Vec::new(),
+        // issue #33: auto-detected from the human-designated project_root
+        // (Cargo.toml -> cargo test, package.json scripts.test/build -> npm
+        // test / npm run build) so the Completed gate can be met — RealCli
+        // only. Without a project_root, or in scripted mode, it stays empty —
+        // unarmed (함정 29 / issue #5).
+        dev_cmd_checks,
         project_root,
         // t3 / 함정 29 / issue #5: the browser DoD ships UNARMED — no binary
         // configured and no injected checks, so nothing is ever spawned.
@@ -131,6 +141,31 @@ pub(crate) fn build_run_config(
         dev_browser_checks: Vec::new(),
         // M13 turn-recovery fix D3: = task deadline_ms / 1000.
         turn_timeout_secs: 900,
+    }
+}
+
+/// One auto-detected DoD check as shown in the new-task modal before a run
+/// starts (issue #33) — `RunCheckPreview` in `src/lib/types.ts`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RunCheckPreview {
+    pub run: String,
+    pub expect: String,
+}
+
+/// `preview_run_checks` command body (issue #33): the `dev_cmd_checks`
+/// `build_run_config` would arm for a `RealCli` run on this raw
+/// `project_root` (scripted runs arm nothing), computed the same way (`resolve_project_root` + `crew_run::detect_dev_cmd_checks`).
+/// Read-only — never starts a run or spawns anything. `None`, an empty
+/// string, or a value `resolve_project_root` rejects (which `start_run`
+/// would refuse anyway) all yield an empty list.
+pub fn preview_run_checks_core(project_root: Option<&str>) -> Vec<RunCheckPreview> {
+    match resolve_project_root(project_root) {
+        Ok(Some(root)) => crew_run::detect_dev_cmd_checks(&root)
+            .into_iter()
+            .map(|c| RunCheckPreview { run: c.run, expect: c.expect })
+            .collect(),
+        Ok(None) | Err(_) => Vec::new(),
     }
 }
 
@@ -1252,14 +1287,90 @@ mod tests {
 
     // -- build_run_config: boundary/regression (R9, D9 — DoD injection knob guard) --
 
-    #[test]
-    fn building_a_run_config_keeps_dod_injection_knobs_unarmed_and_carries_project_root_through() {
-        let project_root = Some(PathBuf::from("/abs/project"));
-        let cfg = build_run_config("goal".to_string(), RunMode::RealCli, PathBuf::from("/abs/data"), claude_five_team(), project_root.clone());
-        assert!(cfg.dev_cmd_checks.is_empty(), "dev_cmd_checks must stay unarmed (함정 29 / issue #5)");
+    fn assert_browser_dod_unarmed(cfg: &RunConfig) {
         assert!(cfg.dev_browser_checks.is_empty() && cfg.browser_binary.is_none(), "browser DoD knobs must stay unarmed (함정 29 / issue #5): dev_browser_checks={:?} browser_binary={:?}", cfg.dev_browser_checks, cfg.browser_binary);
-        assert_eq!(cfg.project_root, project_root, "build_run_config must forward project_root unchanged");
+    }
+
+    #[test]
+    fn building_a_run_config_without_a_project_root_keeps_every_dod_injection_knob_unarmed() {
+        let cfg = build_run_config("goal".to_string(), RunMode::RealCli, PathBuf::from("/abs/data"), claude_five_team(), None);
+        assert!(cfg.dev_cmd_checks.is_empty(), "without a project_root dev_cmd_checks must stay unarmed (함정 29 / issue #5)");
+        assert_browser_dod_unarmed(&cfg);
+        assert_eq!(cfg.project_root, None);
         assert_eq!(cfg.turn_timeout_secs, 900, "M13 turn-recovery fix D3: default must match the task deadline");
+    }
+
+    #[test]
+    fn building_a_run_config_with_a_cargo_project_root_arms_cargo_test() {
+        let root = TestDataRoot::new("build-cfg-rust");
+        std::fs::write(root.0.join("Cargo.toml"), "").unwrap();
+        let project_root = Some(root.0.clone());
+        let cfg = build_run_config("goal".to_string(), RunMode::RealCli, PathBuf::from("/abs/data"), claude_five_team(), project_root.clone());
+        assert_eq!(cfg.dev_cmd_checks, crew_run::default_dev_cmd_checks_rust(), "issue #33: a Cargo.toml project_root must arm the rust preset");
+        assert_browser_dod_unarmed(&cfg);
+        assert_eq!(cfg.project_root, project_root, "build_run_config must forward project_root unchanged");
+    }
+
+    #[test]
+    fn building_a_scripted_run_config_never_arms_cmd_checks_even_with_a_cargo_project_root() {
+        let root = TestDataRoot::new("build-cfg-scripted");
+        std::fs::write(root.0.join("Cargo.toml"), "").unwrap();
+        let cfg = build_run_config("goal".to_string(), scripted_mode(), PathBuf::from("/abs/data"), claude_five_team(), Some(root.0.clone()));
+        assert!(cfg.dev_cmd_checks.is_empty(), "a scripted demo must never run real cargo/npm on the user's project, got {:?}", cfg.dev_cmd_checks);
+        assert_browser_dod_unarmed(&cfg);
+        assert_eq!(cfg.project_root, Some(root.0.clone()));
+    }
+
+    #[test]
+    fn building_a_run_config_with_a_marker_less_project_root_arms_nothing() {
+        let root = TestDataRoot::new("build-cfg-bare");
+        let project_root = Some(root.0.clone());
+        let cfg = build_run_config("goal".to_string(), RunMode::RealCli, PathBuf::from("/abs/data"), claude_five_team(), project_root.clone());
+        assert!(cfg.dev_cmd_checks.is_empty(), "no Cargo.toml/package.json -> nothing detected, got {:?}", cfg.dev_cmd_checks);
+        assert_browser_dod_unarmed(&cfg);
+        assert_eq!(cfg.project_root, project_root);
+    }
+
+    // -- preview_run_checks_core (issue #33) ----------------------------------
+
+    fn preview_pairs(previews: &[RunCheckPreview]) -> Vec<(&str, &str)> {
+        previews.iter().map(|p| (p.run.as_str(), p.expect.as_str())).collect()
+    }
+
+    #[test]
+    fn previewing_a_cargo_root_lists_cargo_test() {
+        let root = TestDataRoot::new("preview-rust");
+        std::fs::write(root.0.join("Cargo.toml"), "").unwrap();
+        let previews = preview_run_checks_core(Some(root.0.to_str().unwrap()));
+        assert_eq!(preview_pairs(&previews), vec![("cargo test", "exit 0")]);
+    }
+
+    #[test]
+    fn previewing_a_node_root_lists_npm_test_and_build() {
+        let root = TestDataRoot::new("preview-node");
+        std::fs::write(root.0.join("package.json"), r#"{"scripts":{"test":"vitest run","build":"vite build"}}"#).unwrap();
+        let previews = preview_run_checks_core(Some(root.0.to_str().unwrap()));
+        assert_eq!(preview_pairs(&previews), vec![("npm test", "exit 0"), ("npm run build", "exit 0")]);
+    }
+
+    #[test]
+    fn previewing_a_node_root_without_scripts_lists_nothing() {
+        let root = TestDataRoot::new("preview-node-empty");
+        std::fs::write(root.0.join("package.json"), "{}").unwrap();
+        assert!(preview_run_checks_core(Some(root.0.to_str().unwrap())).is_empty(), "package.json {{}} declares no test/build script");
+    }
+
+    #[test]
+    fn previewing_without_a_root_or_with_an_invalid_one_lists_nothing() {
+        assert!(preview_run_checks_core(None).is_empty(), "None -> no checks");
+        assert!(preview_run_checks_core(Some("")).is_empty(), "empty string -> no checks");
+        assert!(preview_run_checks_core(Some("relative/dir")).is_empty(), "relative path -> no checks");
+    }
+
+    #[test]
+    fn a_run_check_preview_serializes_with_run_and_expect_keys() {
+        let json = serde_json::to_value(RunCheckPreview { run: "cargo test".to_string(), expect: "exit 0".to_string() }).unwrap();
+        assert_eq!(json, serde_json::json!({"run": "cargo test", "expect": "exit 0"}));
     }
 
     /// A real, minimal git repo (`git init` + one commit so `HEAD` resolves)

@@ -343,7 +343,8 @@ Lead는 `task.result`를 받으면 위 예시의 `kind:"cmd"` 체크를 셸을 �
 - **기본 상수**: `crew_run::default_dev_cmd_checks_rust()`/`_node()`가 위치별 허용목록
   (§5 함정 27)을 통과하는 문자열(`cargo test` / `npm test`·`npm run build`)을 제공한다.
   이는 **기본값이 아니라 호출부가 골라 쓰는 상수**다 — `RunConfig.dev_cmd_checks`의 실제
-  기본값은 여전히 빈 벡터.
+  기본값은 여전히 빈 벡터. 앱은 issue #33(2026-10-03 결정)부터 RealCli + `project_root` 런에
+  한해 이를 자동 감지로 채운다 — 아래 "GUI 배선" 문단.
 
 **신뢰 경계 (M11 신설, contracts-m11.md §I6)**: `cmd` DoD는 설계상 **에이전트 산출물의 코드
 실행**이다 — Developer 에이전트가 실행 트리에 쓴 파일(빌드 스크립트, `package.json` 등)을
@@ -374,8 +375,23 @@ tauri-source.ts`의 `invoke("start_run", { goal, scripted, projectRoot })`). 그
 기존 프로젝트를 다시 여는 경로는 인자 없는 `list_projects` 커맨드다 — 워크스페이스 루트
 바로 아래의 git 레포만 이름순으로 돌려주고, 루트 자체가 없으면 빈 목록이 아니라
 `workspace_missing: <path>` 에러로 구분된다(`apps/crew-app/src-tauri/src/project.rs`의
-`list_projects_core`). **단, `dev_cmd_checks`는 이번 배선으로도 여전히 빈 벡터다** —
-함정 29(위 문단)는 이 GUI 배선으로 무장되지 않으며, 켜는 것은 별도 판단이다.
+`list_projects_core`). 이 배선 시점(issue #13)에는 `dev_cmd_checks`가 여전히 빈 벡터였고,
+켜는 것은 별도 판단으로 남겨 뒀다.
+
+**DoD 체크 자동 감지 (issue #33, 2026-10-03 사용자 결정)**: 그 별도 판단이 내려졌다. 빈
+벡터로는 Completed 게이트(실행되고 통과한 Cmd/Browser DoD를 가진 Accepted 태스크 요구)를
+영영 못 채워 `project_root` 런이 전부 Failed로 끝나고 푸시하지 않았기 때문이다. 이제
+`build_run_config`(`apps/crew-app/src-tauri/src/core.rs`)는 **RealCli 모드 + `project_root`
+지정** 런에서만 `crew_run::detect_dev_cmd_checks`로 루트의 마커를 읽어 Developer 태스크의
+Cmd DoD를 채운다 — `Cargo.toml`(일반 파일) → `cargo test`, `package.json`의
+`scripts.test`/`scripts.build`(비어 있지 않은 문자열) → `npm test`/`npm run build`. 프로세스
+실행 없는 파일 읽기이고 하위 디렉토리는 보지 않는다. **사용자는 `project_root` 런에 한해
+함정 29 / issue #5 노출을 수용했다** — 에이전트가 쓴 스크립트가 CI처럼 체크 아래에서
+실행된다. 함정 29 자체는 여전히 닫히지 않았다. **scripted 모드와 `project_root` 없는 런은
+계속 비무장**(빈 벡터)이고, 브라우저 DoD(`browser_binary`/`dev_browser_checks`)도 비무장
+그대로다. 새 작업 모달은 시작 전에 `preview_run_checks`로 감지 결과를 미리 보여 주고, 0개면
+(그리고 마커가 아직 없는 "새로 만들기" 모드에서는 항상) Completed/푸시에 도달할 수 없다고
+경고한다 — 시작 자체는 막지 않는다.
 
 ### 4.3 Lead 에이전트의 실제 구현
 - Lead도 LLM 세션이지만, **출력은 반드시 구조화 JSON** (툴 스키마 강제).

@@ -434,3 +434,20 @@ describe("MockEventSource + RunState integration", () => {
     expect(s.roster.find((a) => a.role === "designer")?.harness).toBe("opencode");
   });
 });
+
+describe("MockEventSource.previewRunChecks (issue #33)", () => {
+  it("returns the node preset for an ordinary root", async () => {
+    await expect(new MockEventSource(0).previewRunChecks("/mock/alpha")).resolves.toEqual([
+      { run: "npm test", expect: "exit 0" },
+      { run: "npm run build", expect: "exit 0" },
+    ]);
+  });
+
+  it("returns [] for a null root (boundary)", async () => {
+    await expect(new MockEventSource(0).previewRunChecks(null)).resolves.toEqual([]);
+  });
+
+  it("returns [] for a root containing no-checks, so the warning path is demoable", async () => {
+    await expect(new MockEventSource(0).previewRunChecks("/mock/no-checks")).resolves.toEqual([]);
+  });
+});
